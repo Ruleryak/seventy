@@ -277,8 +277,10 @@ class Drafter:
     def _candidates(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Global top-k (values, token ids) of the target LM head for rows of h."""
         k = self.cfg.top_k
-        head = self.target.lm_head
-        logits = torch.mm(h, head.T, out_dtype=torch.float32) if h.is_cuda else h.float() @ head.float().T
+        if self.target.lm_head_packed is not None:
+            logits = self.target.head(h)
+        else:
+            logits = h.float() @ self.target.lm_head.float().T
         values, ids = torch.topk(logits, k, dim=-1)
         ids = ids + self.target.vocab_span[0]
         if self.par.size > 1:

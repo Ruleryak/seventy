@@ -23,6 +23,8 @@ class Parallel:
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         if self.size == 1:
             return x
+        if self.custom is not None and x.dim() == 2 and self.custom.fits(x):
+            return self.custom.reduce(x)
         torch.distributed.all_reduce(x)
         return x
 

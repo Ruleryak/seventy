@@ -101,7 +101,7 @@ def nvfp4_gemm(x: torch.Tensor, w: GemmWeight, splits: int | None = None, warps:
     warps = auto_warps if warps is None else warps
     need = lib().seventy_nvfp4_gemm_workspace(m, w.n_padded, splits)
     if need and (workspace is None or workspace.numel() * workspace.element_size() < need):
-        workspace = torch.zeros(need // 4 + 1, dtype=torch.float32, device=x.device)
+        workspace = torch.empty(need // 4 + 1, dtype=torch.float32, device=x.device)
     out = torch.empty(m, w.n, dtype=torch.float16, device=x.device) if out is None else out
     code = lib().seventy_nvfp4_gemm(
         out.data_ptr(), x.data_ptr(), w.wpk.data_ptr(), w.wsc.data_ptr(), w.alpha.data_ptr(), m, w.n, w.n_padded,

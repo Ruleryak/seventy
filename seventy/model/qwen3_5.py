@@ -200,6 +200,13 @@ class Qwen35TextModel:
         self.final_norm = _norm_weight(ckpt, f"{p}norm.weight", device, 1.0)
         head = "lm_head.weight" if not t.tie_word_embeddings else f"{p}embed_tokens.weight"
         self.lm_head = _to_dtype(ckpt.rows(head, v0, v1), dtype).to(device)
+        self.lm_head_packed = None
+        if self.device.type == "cuda" and dtype == torch.float16:
+            from ..ops.kernels import DenseWeight
+
+            self.lm_head_packed = DenseWeight(self.lm_head)
+            self.lm_head = None
+            torch.cuda.empty_cache()
         half = t.rotary_dim // 2
         self.inv_freq = 1.0 / (t.rope_theta ** (torch.arange(0, half, dtype=torch.float64) * 2 / t.rotary_dim))
         self.inv_freq = self.inv_freq.float().to(device)
@@ -212,10 +219,18 @@ class Qwen35TextModel:
         rows = self.embed[(ids - v0).clamp(0, v1 - v0 - 1)] * inside[:, None].to(self.dtype)
         return self.par.all_reduce(rows)
 
+    def head(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's FP32 logits [rows, vocab shard] of hidden states x."""
+        from ..ops.kernels import dense_gemm
+
+        x = x.contiguous()
+        return torch.cat([dense_gemm(x[i : i + 64], self.lm_head_packed) for i in range(0, x.shape[0], 64)]) \
+            if x.shape[0] else torch.empty(0, self.lm_head_packed.n, dtype=torch.float32, device=x.device)
+
     def logits(self, x: torch.Tensor) -> torch.Tensor:
         """FP32 logits [rows, vocab] of final hidden states (FP16 products, FP32 accumulation and output)."""
-        if x.is_cuda and x.dtype == torch.float16:
-            out = torch.mm(x, self.lm_head.T, out_dtype=torch.float32)
+        if self.lm_head_packed is not None:
+            out = self.head(x)
         else:
             out = torch.empty(x.shape[0], self.lm_head.shape[0], dtype=torch.float32, device=x.device)
             xf = x.float()

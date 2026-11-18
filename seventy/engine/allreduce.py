@@ -48,3 +48,12 @@ class CustomAllReduce:
                                      torch.cuda.current_stream(x.device).cuda_stream)
         check("ar_norm", code)
         return out, residual
+
+    def reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """all_reduce(x) (FP16, FP32 sum rounded once)."""
+        x = x.contiguous()
+        out = torch.empty_like(x)
+        code = lib().seventy_ar_norm(self.ctx, out.data_ptr(), None, x.data_ptr(), None, x.shape[0], x.shape[1], 0.0,
+                                     torch.cuda.current_stream(x.device).cuda_stream)
+        check("ar_reduce", code)
+        return out
