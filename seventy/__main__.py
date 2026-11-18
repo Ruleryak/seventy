@@ -71,6 +71,7 @@ def cmd_engine(args: argparse.Namespace) -> int:
         max_model_len=min(args.max_model_len or cfg.text.max_position_embeddings, cfg.text.max_position_embeddings),
         gpu_memory_utilization=args.gpu_memory_utilization, prefill_budget=args.prefill_budget,
         kv_dtype=args.kv_cache_dtype, tensor_parallel=tp, cuda_graphs=not args.no_cuda_graphs,
+        draft_model=args.draft_model, prefix_cache=not args.no_prefix_cache,
     )
     server = ServerConfig(
         engine=engine, served_model_name=args.served_model_name or os.path.basename(os.path.normpath(args.model)),
@@ -104,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     eng.add_argument("--prefill-budget", type=int, default=4096, help="prompt tokens per engine step")
     eng.add_argument("--kv-cache-dtype", choices=("int8", "fp16"), default="int8")
     eng.add_argument("--no-cuda-graphs", action="store_true")
+    eng.add_argument("--draft-model", help="DFlash2 drafter checkpoint folder for speculative decoding")
+    eng.add_argument("--no-prefix-cache", action="store_true")
     eng.add_argument("--default-chat-template-kwargs", help='JSON, for example {"enable_thinking": false}')
     eng.add_argument("--max-tokens-default", type=int)
     eng.set_defaults(fn=cmd_engine)
