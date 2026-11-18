@@ -34,6 +34,8 @@ class EngineConfig:
     activation_reserve_gib: float = 3.0
     tensor_parallel: int = 1
     cuda_graphs: bool = True
+    prefix_cache: bool = True
+    cache_entries: int = 0
 
 
 @dataclass
@@ -97,17 +99,19 @@ class Engine:
         for conn, proc in zip(peers, self.workers):
             budgets.append(_expect(conn, "ready", proc))
         slots = config.max_num_seqs
+        entries = (config.cache_entries or config.max_num_seqs) if config.prefix_cache else 0
+        total_slots = slots + entries
         per_block = bytes_per_block(self.model_config, config.block_size, kv_dtype, tp)
-        state = slots * bytes_per_slot(self.model_config, tp)
+        state = total_slots * bytes_per_slot(self.model_config, tp)
         num_blocks = (min(budgets) - state) // per_block
         need = -(-config.max_model_len // config.block_size)
         if num_blocks < min(need, 64):
             raise RuntimeError(f"not enough GPU memory for the KV cache ({num_blocks} blocks)")
-        num_blocks = min(num_blocks, need * slots)
+        num_blocks = min(num_blocks, need * total_slots)
         kv_name = "int8" if kv_dtype == torch.int8 else "float16"
         for conn in peers:
-            conn.send(("init", num_blocks, config.block_size, slots, kv_name))
-        self.cache = ModelCache(self.model_config.text, num_blocks, config.block_size, slots, torch.float16,
+            conn.send(("init", num_blocks, config.block_size, total_slots, kv_name))
+        self.cache = ModelCache(self.model_config.text, num_blocks, config.block_size, total_slots, torch.float16,
                                 self.device, par=Parallel(0, tp), kv_dtype=kv_dtype)
         for conn, proc in zip(peers, self.workers):
             _expect(conn, "ok", proc)
@@ -119,12 +123,13 @@ class Engine:
             if slots not in buckets and slots <= 64:
                 buckets += (slots,)
             self.runner.capture(need, buckets)
-        self.scheduler = Scheduler(num_blocks, config.block_size, slots, config.max_model_len,
-                                   prefill_budget=config.prefill_budget)
+        self.scheduler = Scheduler(num_blocks, config.block_size, total_slots, config.max_model_len,
+                                   prefill_budget=config.prefill_budget, max_running=slots, cache_entries=entries)
         self.eos = tuple(self.model_config.text.eos_token_ids)
         self._ids = itertools.count()
         self.requests: dict[str, Request] = {}
-        self.stats = {"steps": 0, "prompt_tokens": 0, "generated_tokens": 0, "preemptions": 0}
+        self.stats = {"steps": 0, "prompt_tokens": 0, "generated_tokens": 0, "preemptions": 0, "cache_hits": 0,
+                      "cache_hit_tokens": 0}
 
     @property
     def kv_capacity_tokens(self) -> int:
@@ -200,12 +205,17 @@ class Engine:
     def step(self) -> list[RequestOutput]:
         plan: Plan = self.scheduler.schedule()
         outputs: dict[str, RequestOutput] = {}
+        if plan.copies:
+            self.runner.copy(plan.copies)
         if plan.decode:
             self._sample(plan.decode, self.runner.run_decode(plan.decode), outputs)
         if plan.prefill:
             self.stats["prompt_tokens"] += sum(w.count for w in plan.prefill)
             self._sample(plan.prefill, self.runner.run(plan.prefill), outputs)
         self.stats["steps"] += 1
+        self.stats["cache_hits"] = self.scheduler.cache.hits
+        self.stats["cache_hit_tokens"] = self.scheduler.cache.hit_tokens
+        self.stats["preemptions"] = self.scheduler.preempted
         result = []
         for rid, out in outputs.items():
             r = self.requests[rid]

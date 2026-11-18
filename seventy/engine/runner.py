@@ -34,6 +34,14 @@ class ModelRunner:
             if reply[0] != "captured":
                 raise RuntimeError(f"a worker failed to capture CUDA graphs: {reply}")
 
+    def copy(self, copies: list[tuple[str, int, int]]) -> None:
+        """Make the plan's cache copies (prefix cache) on every rank before the step."""
+        if self.peers:
+            msg = pickle.dumps(("copy", copies))
+            for p in self.peers:
+                p.send_bytes(msg)
+        self.cache.apply(copies)
+
     def run_decode(self, work: list[Work]) -> torch.Tensor:
         """Decode work (one new token per sequence) through the CUDA graphs when a bucket fits."""
         if self.graphs is None or self.graphs.bucket(len(work)) is None:

@@ -62,6 +62,8 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
                 model.forward(build_step(msg[1], block_size, device), cache)
             elif msg[0] == "decode":
                 graphs.run(msg[1])
+            elif msg[0] == "copy":
+                cache.apply(msg[1])
             elif msg[0] == "capture":
                 graphs = DecodeGraphs(model, cache, device, msg[1], tuple(msg[2]))
                 graphs.capture()

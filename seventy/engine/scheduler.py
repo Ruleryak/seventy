@@ -2,8 +2,14 @@
 
 Each engine iteration runs up to two model steps: one decode step with one new token for every running sequence,
 and one prefill step with prompt chunks of waiting sequences, up to a token budget. A sequence holds KV cache
-blocks for all of its tokens and one Gated DeltaNet state slot. When blocks run out, the newest running sequence
-is preempted: its blocks and slot are freed and it starts again from its prompt and the tokens it has generated.
+blocks for all of its tokens and one Gated DeltaNet state slot. When blocks run out, the least recently used
+prefix-cache entries are evicted first; then the newest running sequence is preempted: its blocks and slot are
+freed and it starts again from its prompt and the tokens it has generated.
+
+Prefix cache: when a sequence finishes, its KV blocks and state slot (the state after its last computed token)
+become a cache entry instead of being freed. A new request whose tokens start with an entry's tokens shares the
+entry's full KV blocks (reference counted), gets a copy of the entry's partly filled last block and of its state
+slot, and computes only the rest. The copies are part of the plan; the runner makes them before the step.
 """
 
 from __future__ import annotations
@@ -51,17 +57,30 @@ class Request:
 
 
 class BlockAllocator:
+    """KV blocks with reference counts: a block returns to the free list when its last user gives it back."""
+
     def __init__(self, num_blocks: int):
         self.free = deque(range(num_blocks))
         self.total = num_blocks
+        self.refs = [0] * num_blocks
 
     def take(self, n: int) -> list[int] | None:
         if n > len(self.free):
             return None
-        return [self.free.popleft() for _ in range(n)]
+        out = [self.free.popleft() for _ in range(n)]
+        for b in out:
+            self.refs[b] = 1
+        return out
+
+    def share(self, blocks: list[int]) -> None:
+        for b in blocks:
+            self.refs[b] += 1
 
     def give(self, blocks: list[int]) -> None:
-        self.free.extend(blocks)
+        for b in blocks:
+            self.refs[b] -= 1
+            if self.refs[b] == 0:
+                self.free.append(b)
 
 
 class SlotAllocator:
@@ -74,6 +93,58 @@ class SlotAllocator:
 
     def give(self, slot: int) -> None:
         self.free.append(slot)
+
+
+@dataclass
+class CacheEntry:
+    tokens: list[int]
+    blocks: list[int]
+    slot: int
+    used: int
+
+
+class PrefixCache:
+    def __init__(self, blocks: BlockAllocator, slots: SlotAllocator, max_entries: int):
+        self.blocks = blocks
+        self.slots = slots
+        self.max_entries = max_entries
+        self.entries: list[CacheEntry] = []
+        self.clock = itertools.count()
+        self.hits = 0
+        self.hit_tokens = 0
+
+    def lookup(self, tokens: list[int]) -> CacheEntry | None:
+        """The entry with the longest token prefix of `tokens` (leaving at least one token to compute)."""
+        best = None
+        for e in self.entries:
+            n = len(e.tokens)
+            if n < len(tokens) and (best is None or n > len(best.tokens)) and tokens[:n] == e.tokens:
+                best = e
+        if best is not None:
+            best.used = next(self.clock)
+        return best
+
+    def add(self, tokens: list[int], blocks: list[int], slot: int) -> None:
+        while self.max_entries and len(self.entries) >= self.max_entries:
+            self.evict()
+        if not self.max_entries:
+            self.blocks.give(blocks)
+            self.slots.give(slot)
+            return
+        self.entries.append(CacheEntry(tokens, blocks, slot, next(self.clock)))
+
+    def evict(self) -> bool:
+        if not self.entries:
+            return False
+        e = min(self.entries, key=lambda x: x.used)
+        self.entries.remove(e)
+        self.blocks.give(e.blocks)
+        self.slots.give(e.slot)
+        return True
+
+    def clear(self) -> None:
+        while self.evict():
+            pass
 
 
 @dataclass
@@ -91,6 +162,7 @@ class Plan:
     decode: list[Work] = field(default_factory=list)
     prefill: list[Work] = field(default_factory=list)
     finished: list[Request] = field(default_factory=list)
+    copies: list[tuple[str, int, int]] = field(default_factory=list)
 
     def empty(self) -> bool:
         return not self.decode and not self.prefill
@@ -98,13 +170,15 @@ class Plan:
 
 class Scheduler:
     def __init__(self, num_blocks: int, block_size: int, num_slots: int, max_model_len: int,
-                 prefill_budget: int = 4096, max_running: int | None = None):
+                 prefill_budget: int = 4096, max_running: int | None = None, cache_entries: int = 0):
         self.blocks = BlockAllocator(num_blocks)
         self.slots = SlotAllocator(num_slots)
         self.block_size = block_size
         self.max_model_len = max_model_len
         self.prefill_budget = prefill_budget
         self.max_running = max_running or num_slots
+        self.cache = PrefixCache(self.blocks, self.slots, cache_entries)
+        self.preempted = 0
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self._arrivals = itertools.count()
@@ -121,13 +195,16 @@ class Scheduler:
         self.waiting.append(request)
 
     def abort(self, request_id: str) -> Request | None:
-        for queue in (self.waiting, self.running):
-            for r in list(queue):
-                if r.id == request_id:
-                    self._release(r)
-                    queue.remove(r)
-                    r.status, r.finish_reason = Status.FINISHED, "abort"
-                    return r
+        for r in list(self.running):
+            if r.id == request_id:
+                self.finish(r, "abort")
+                return r
+        for r in list(self.waiting):
+            if r.id == request_id:
+                self._release(r)
+                self.waiting.remove(r)
+                r.status, r.finish_reason = Status.FINISHED, "abort"
+                return r
         return None
 
     def _release(self, r: Request) -> None:
@@ -137,15 +214,51 @@ class Scheduler:
             self.slots.give(r.slot)
             r.slot = None
 
+    def _take_blocks(self, n: int) -> list[int] | None:
+        got = self.blocks.take(n)
+        while got is None and self.cache.evict():
+            got = self.blocks.take(n)
+        return got
+
+    def _take_slot(self) -> int | None:
+        slot = self.slots.take()
+        while slot is None and self.cache.evict():
+            slot = self.slots.take()
+        return slot
+
     def _grow(self, r: Request, tokens: int) -> bool:
         need = -(-tokens // self.block_size) - len(r.blocks)
         if need <= 0:
             return True
-        got = self.blocks.take(need)
+        got = self._take_blocks(need)
         if got is None:
             return False
         r.blocks += got
         return True
+
+    def _reuse(self, r: Request) -> list[tuple[str, int, int]]:
+        """Start a fresh request from the longest matching prefix-cache entry, if any. Returns the copies to make."""
+        entry = self.cache.lookup(r.tokens)
+        if entry is None:
+            return []
+        n = len(entry.tokens)
+        full = n // self.block_size
+        copies = []
+        self.blocks.share(entry.blocks[:full])
+        r.blocks = list(entry.blocks[:full])
+        if n % self.block_size:
+            extra = self._take_blocks(1)
+            if extra is None:
+                self.blocks.give(r.blocks)
+                r.blocks = []
+                return []
+            copies.append(("block", entry.blocks[full], extra[0]))
+            r.blocks.append(extra[0])
+        copies.append(("slot", entry.slot, r.slot))
+        r.computed = n
+        self.cache.hits += 1
+        self.cache.hit_tokens += n
+        return copies
 
     def _preempt(self, r: Request) -> None:
         self._release(r)
@@ -153,6 +266,7 @@ class Scheduler:
         r.computed = 0
         r.status = Status.WAITING
         r.preemptions += 1
+        self.preempted += 1
         self.waiting.appendleft(r)
 
     def schedule(self) -> Plan:
@@ -175,14 +289,16 @@ class Scheduler:
             budget = self._plan_prefill(plan, r, budget)
         while self.waiting and budget > 0 and len(self.running) < self.max_running:
             r = self.waiting[0]
-            slot = self.slots.take()
+            slot = self._take_slot()
             if slot is None:
                 break
             r.slot = slot
+            copies = self._reuse(r) if r.computed == 0 and self.cache.max_entries else []
             if not self._grow(r, min(r.length, r.computed + budget)):
-                self.slots.give(slot)
-                r.slot = None
+                self._release(r)
+                r.computed = 0
                 break
+            plan.copies += copies
             self.waiting.popleft()
             r.status = Status.RUNNING
             self.running.append(r)
@@ -200,7 +316,13 @@ class Scheduler:
         return budget - count
 
     def finish(self, r: Request, reason: str) -> None:
-        self._release(r)
+        if self.cache.max_entries and r.slot is not None and r.computed > 0:
+            keep = -(-r.computed // self.block_size)
+            self.blocks.give(r.blocks[keep:])
+            self.cache.add(r.tokens[: r.computed], r.blocks[:keep], r.slot)
+            r.blocks, r.slot = [], None
+        else:
+            self._release(r)
         if r in self.running:
             self.running.remove(r)
         r.status, r.finish_reason = Status.FINISHED, reason
