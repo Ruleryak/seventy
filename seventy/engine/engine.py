@@ -116,7 +116,7 @@ class Engine:
         for conn, proc in zip(peers, self.workers):
             budgets.append(_expect(conn, "ready", proc))
         slots = config.max_num_seqs
-        entries = (config.cache_entries or config.max_num_seqs) if config.prefix_cache else 0
+        entries = (config.cache_entries or 3 * config.max_num_seqs) if config.prefix_cache else 0
         total_slots = slots + entries
         kv_name = "int8" if kv_dtype == torch.int8 else "fp16"
         per_block = memory.kv_bytes_per_block(self.model_config, config.block_size, kv_name, tp)

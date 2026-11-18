@@ -11,6 +11,11 @@ become a cache entry instead of being freed. A new request whose tokens start wi
 entry's full KV blocks (reference counted), gets a copy of the entry's partly filled last block and of its state
 slot, and computes only the rest. The copies are part of the plan; the runner makes them before the step. Entries
 are matched on key_tokens, where image tokens stand for the image's content (seventy.multimodal).
+
+Prompt snapshots: for prompts of SNAPSHOT_MIN tokens or more, prefill stops one token before the end of the prompt;
+the state at that point becomes an entry too, so the same prompt sent again computes only its last token (and a
+request that diverges inside its output still reuses its prompt). Eviction takes snapshots and entries that a newer
+entry extends (a conversation's earlier turns) first, then the least recently used.
 """
 
 from __future__ import annotations
@@ -53,6 +58,7 @@ class Request:
     cacheable: bool = True
     images: object | None = None
     cache_key: list[int] | None = None
+    snapshot_done: bool = False
 
     @property
     def tokens(self) -> list[int]:
@@ -138,12 +144,21 @@ class SlotAllocator:
         self.free.append(slot)
 
 
+SNAPSHOT_MIN = 512
+
+
 @dataclass
 class CacheEntry:
     tokens: list[int]
     blocks: list[int]
     slot: int
     used: int
+    snapshot: bool = False
+    superseded: bool = False
+
+    @property
+    def spare(self) -> bool:
+        return self.snapshot or self.superseded
 
 
 class PrefixCache:
@@ -167,19 +182,35 @@ class PrefixCache:
             best.used = next(self.clock)
         return best
 
-    def add(self, tokens: list[int], blocks: list[int], slot: int) -> None:
-        while self.max_entries and len(self.entries) >= self.max_entries:
-            self.evict()
+    def find(self, tokens: list[int]) -> CacheEntry | None:
+        """The entry with exactly these tokens."""
+        n = len(tokens)
+        return next((e for e in self.entries if len(e.tokens) == n and e.tokens == tokens), None)
+
+    def add(self, tokens: list[int], blocks: list[int], slot: int, snapshot: bool = False) -> None:
         if not self.max_entries:
             self.blocks.give(blocks)
             self.slots.give(slot)
             return
-        self.entries.append(CacheEntry(tokens, blocks, slot, next(self.clock)))
+        n = len(tokens)
+        for e in self.entries:
+            if len(e.tokens) == n and e.tokens == tokens:
+                e.used = next(self.clock)
+                e.snapshot = e.snapshot and snapshot
+                self.blocks.give(blocks)
+                self.slots.give(slot)
+                return
+        for e in self.entries:
+            if len(e.tokens) < n and tokens[: len(e.tokens)] == e.tokens:
+                e.superseded = True
+        while len(self.entries) >= self.max_entries:
+            self.evict()
+        self.entries.append(CacheEntry(tokens, blocks, slot, next(self.clock), snapshot))
 
     def evict(self) -> bool:
         if not self.entries:
             return False
-        e = min(self.entries, key=lambda x: x.used)
+        e = min(self.entries, key=lambda x: (not x.spare, x.used))
         self.entries.remove(e)
         self.blocks.give(e.blocks)
         self.slots.give(e.slot)
@@ -324,6 +355,8 @@ class Scheduler:
         for r in sorted(decoders, key=lambda x: x.arrival):
             if r.status is not Status.RUNNING:
                 continue
+            if self._snapshot_point(r) == r.computed:
+                self._take_snapshot(plan, r)
             if r.draft and r.computed + 1 + len(r.draft) > self.max_model_len:
                 r.draft, r.draft_q, r.draft_cand = [], None, None
             count = 1 + len(r.draft)
@@ -360,8 +393,37 @@ class Scheduler:
             budget = self._plan_prefill(plan, r, budget)
         return plan
 
+    def _snapshot_point(self, r: Request) -> int | None:
+        """Where this request's prompt snapshot goes (one token before the end of the prompt), if it gets one."""
+        if not self.cache.max_entries or r.snapshot_done or not r.cacheable or len(r.prompt) < SNAPSHOT_MIN:
+            return None
+        return len(r.prompt) - 1
+
+    def _take_snapshot(self, plan: Plan, r: Request) -> None:
+        r.snapshot_done = True
+        key = r.key_tokens[: r.computed]
+        same = self.cache.find(key)
+        if same is not None:
+            same.used = next(self.cache.clock)
+            return
+        slot = self.slots.take()
+        while slot is None and any(e.spare for e in self.cache.entries) and self.cache.evict():
+            slot = self.slots.take()
+        if slot is None:
+            return
+        n = r.computed
+        keep = -(-n // self.block_size)
+        self.blocks.share(r.blocks[:keep])
+        plan.copies.append(("slot", r.slot, slot))
+        self.cache.add(key, list(r.blocks[:keep]), slot, snapshot=True)
+
     def _plan_prefill(self, plan: Plan, r: Request, budget: int) -> int:
+        point = self._snapshot_point(r)
+        if point is not None and r.computed == point:
+            self._take_snapshot(plan, r)
         remaining = r.length - r.computed
+        if point is not None and r.computed < point:
+            remaining = point - r.computed
         count = min(remaining, budget)
         if count <= 0 or not self._grow(r, r.computed + count):
             return budget

@@ -140,3 +140,59 @@ def test_request_image_rows_rope_and_cache_key():
     assert r.key_tokens[:2] == [1, 2] and r.key_tokens[2] < 0 and r.key_tokens[-2:] == [7, 8]
     plain = Request("p", [1, 2, 3], SamplingParams())
     assert plain.rope(0, 3) == 0 and plain.image_rows(0, 3) == [] and plain.key_tokens == [1, 2, 3]
+
+
+def run_to_end(s, r):
+    while r.status is not Status.FINISHED:
+        run_step(s, s.schedule())
+
+
+def test_prompt_snapshot_lets_the_same_prompt_compute_one_token():
+    s = Scheduler(num_blocks=400, block_size=16, num_slots=6, max_model_len=8192, prefill_budget=4096, cache_entries=4)
+    prompt = list(range(1000, 1900))
+    a = Request("a", prompt, SamplingParams(max_tokens=1))
+    s.add(a)
+    plan = s.schedule()
+    assert [w.count for w in plan.prefill] == [899]
+    run_step(s, plan)
+    plan = s.schedule()
+    assert plan.copies and plan.copies[0][0] == "slot"
+    assert [w.count for w in plan.decode] == [1]
+    run_step(s, plan)
+    assert a.status is Status.FINISHED
+    assert sorted((len(e.tokens), e.snapshot) for e in s.cache.entries) == [(899, True), (900, False)]
+    b = Request("b", list(prompt), SamplingParams(max_tokens=1))
+    s.add(b)
+    plan = s.schedule()
+    assert b.computed == 899 and s.cache.hit_tokens == 899
+    assert [w.count for w in plan.decode + plan.prefill] == [1]
+    run_step(s, plan)
+    run_to_end(s, b)
+    assert len(s.cache.entries) == 2
+    short = Request("c", list(range(100)), SamplingParams(max_tokens=1))
+    s.add(short)
+    run_to_end(s, short)
+    assert not any(e.snapshot and len(e.tokens) == 99 for e in s.cache.entries)
+
+
+def test_eviction_keeps_the_newest_turn_of_each_conversation():
+    s = Scheduler(num_blocks=2000, block_size=16, num_slots=8, max_model_len=8192, prefill_budget=4096, cache_entries=3)
+    conv = {}
+    for name, base in (("x", 10_000), ("y", 20_000), ("z", 30_000)):
+        r = Request(name, list(range(base, base + 600)), SamplingParams(max_tokens=3))
+        s.add(r)
+        run_to_end(s, r)
+        conv[name] = r.tokens[: r.computed]
+    finals = [e for e in s.cache.entries if not e.snapshot]
+    assert len(s.cache.entries) == 3 and len(finals) >= 2
+    nxt = Request("x2", conv["x"] + [7, 7, 5, 5], SamplingParams(max_tokens=3))
+    s.add(nxt)
+    run_step(s, s.schedule())
+    assert nxt.computed > 600
+    run_to_end(s, nxt)
+    old_x = [e for e in s.cache.entries if e.tokens == conv["x"]]
+    assert not old_x or old_x[0].superseded
+    assert any(len(e.tokens) > len(conv["x"]) for e in s.cache.entries)
+    free_blocks = len(s.blocks.free)
+    s.cache.clear()
+    assert len(s.slots.free) == 8 and len(s.blocks.free) == 2000 and free_blocks < 2000
