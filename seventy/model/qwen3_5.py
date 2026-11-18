@@ -117,14 +117,16 @@ class GatedDeltaNetLayer:
         self.eps = cfg.rms_norm_eps
         self.par = par
 
-    def __call__(self, x, step: StepInput, cache: ModelCache, layer: int, rope, slots):
+    def __call__(self, x, step: StepInput, cache: ModelCache, layer: int, rope, slots, stash=None):
         t = x.shape[0]
         key, val = self.hk * self.dk, self.hv * self.dv
         y = self.in_proj(x)
         if y.is_cuda and step.max_query_len <= RECURRENT_MAX_TOKENS:
             o = kernels.gdn_recurrent(y, self.conv_weight, cache.conv[layer], cache.state[layer], self.a_log,
                                       self.dt_bias, self.norm, step.query_start_t, step.context_lens_t,
-                                      step.state_slots_t, self.hk, self.hv, self.eps)
+                                      step.state_slots_t, self.hk, self.hv, self.eps, commit=stash is None)
+            if stash is not None:
+                stash[layer] = y
             return self.par.all_reduce(self.out_proj(o))
         conv_dim = 2 * key + val
         qkv = ops.causal_conv1d(y[:, :conv_dim].contiguous(), self.conv_weight, cache.conv[layer],
@@ -227,10 +229,13 @@ class Qwen35TextModel:
 
     @torch.inference_mode()
     def forward(
-        self, step: StepInput, cache: ModelCache, capture: tuple[int, ...] = ()
+        self, step: StepInput, cache: ModelCache, capture: tuple[int, ...] = (), stash: dict | None = None
     ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
         """Run one step. Returns the logits of step.logit_rows, and the output hidden states (all rows) of the
-        layers listed in capture."""
+        layers listed in capture.
+
+        With stash (a dict, speculative verify): Gated DeltaNet layers leave their state unchanged and keep their
+        in_proj outputs in stash; commit() then writes the state for the accepted rows."""
         t = self.cfg
         h = self.embed_tokens(step.token_ids)
         for start, rows in step.embeds.items():
@@ -244,7 +249,10 @@ class Qwen35TextModel:
         x = ops.rms_norm(h, self.layers[0].input_norm, t.rms_norm_eps)[0]
         captured = {}
         for i, layer in enumerate(self.layers):
-            x = layer.mixer(x, step, cache, i, rope, slots)
+            if stash is not None and layer.kind != "full_attention":
+                x = layer.mixer(x, step, cache, i, rope, slots, stash)
+            else:
+                x = layer.mixer(x, step, cache, i, rope, slots)
             x, residual = ops.rms_norm(x, layer.post_norm, t.rms_norm_eps, residual)
             x = layer.mlp(x)
             nxt = self.layers[i + 1].input_norm if i + 1 < len(self.layers) else self.final_norm
@@ -252,3 +260,15 @@ class Qwen35TextModel:
             if i in capture:
                 captured[i] = residual.clone()
         return self.logits(x[step.logit_rows]), captured
+
+    @torch.inference_mode()
+    def commit(self, step: StepInput, cache: ModelCache, stash: dict, commit_lens: torch.Tensor) -> None:
+        """After a speculative verify step: write each Gated DeltaNet layer's state as if only the first
+        commit_lens[b] new tokens of every sequence had run."""
+        for i, layer in enumerate(self.layers):
+            if layer.kind == "full_attention":
+                continue
+            m = layer.mixer
+            kernels.gdn_recurrent(stash[i], m.conv_weight, cache.conv[i], cache.state[i], m.a_log, m.dt_bias, m.norm,
+                                  step.query_start_t, step.context_lens_t, step.state_slots_t, m.hk, m.hv, m.eps,
+                                  commit_lens=commit_lens)

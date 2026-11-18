@@ -75,12 +75,14 @@ SEVENTY_API int seventy_nvfp4_gemm_dequantize(void *out, const void *wpk, const 
  * conv_w: FP32 [conv_dim, taps]. a_log, dt_bias: FP32 [hv]. norm_w: FP32 [dv].
  * query_start: int32 [num_seqs + 1], context_lens and state_slots: int32 [num_seqs], all on the device.
  * dk = dv = 128, 2 <= taps <= 4, hv a multiple of hk.
+ * commit = 0 leaves the state and history unchanged (speculative verify). commit_lens (int32 [num_seqs], may be
+ * null) limits each sequence to its first commit_lens[b] rows (the commit pass after acceptance; out may be null).
  */
 SEVENTY_API int seventy_gdn_recurrent(void *out, void *conv_state, float *state, const void *y, int ld,
                                       const float *conv_w, const float *a_log, const float *dt_bias,
                                       const float *norm_w, const int *query_start, const int *context_lens,
-                                      const int *state_slots, int num_seqs, int hk, int hv, int dk, int dv, int taps,
-                                      float eps, cudaStream_t stream);
+                                      const int *state_slots, const int *commit_lens, int commit, int num_seqs,
+                                      int hk, int hv, int dk, int dv, int taps, float eps, cudaStream_t stream);
 
 /*
  * Attention prep for full-attention layers (head size 256), one launch per layer step: RMS norm of each query and

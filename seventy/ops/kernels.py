@@ -137,8 +137,11 @@ def gdn_recurrent(
     hv: int,
     eps: float,
     out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Fused Gated DeltaNet decode/verify step; see seventy_gdn_recurrent in csrc/seventy.h."""
+    commit: bool = True,
+    commit_lens: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Fused Gated DeltaNet decode/verify step; see seventy_gdn_recurrent in csrc/seventy.h. With commit_lens, the
+    commit pass of speculative decoding: no outputs, the state takes the first commit_lens[b] rows."""
     _expect(y, "y", torch.float16)
     _expect(conv_state, "conv_state", torch.float16)
     _expect(state, "state", torch.float32)
@@ -147,11 +150,16 @@ def gdn_recurrent(
     for name, t in (("query_start", query_start), ("context_lens", context_lens), ("state_slots", state_slots)):
         _expect(t, name, torch.int32)
     dk, dv = state.shape[2], state.shape[3]
-    out = torch.empty(y.shape[0], hv * dv, dtype=torch.float16, device=y.device) if out is None else out
+    if commit_lens is None:
+        out = torch.empty(y.shape[0], hv * dv, dtype=torch.float16, device=y.device) if out is None else out
+    else:
+        _expect(commit_lens, "commit_lens", torch.int32)
     code = lib().seventy_gdn_recurrent(
-        out.data_ptr(), conv_state.data_ptr(), state.data_ptr(), y.data_ptr(), y.shape[1], conv_weight.data_ptr(),
-        a_log.data_ptr(), dt_bias.data_ptr(), norm_weight.data_ptr(), query_start.data_ptr(), context_lens.data_ptr(),
-        state_slots.data_ptr(), context_lens.numel(), hk, hv, dk, dv, conv_weight.shape[1], eps, _stream(y),
+        out.data_ptr() if out is not None else None, conv_state.data_ptr(), state.data_ptr(), y.data_ptr(),
+        y.shape[1], conv_weight.data_ptr(), a_log.data_ptr(), dt_bias.data_ptr(), norm_weight.data_ptr(),
+        query_start.data_ptr(), context_lens.data_ptr(), state_slots.data_ptr(),
+        commit_lens.data_ptr() if commit_lens is not None else None, 1 if (commit or commit_lens is not None) else 0,
+        context_lens.numel(), hk, hv, dk, dv, conv_weight.shape[1], eps, _stream(y),
     )
     check("gdn_recurrent", code)
     return out

@@ -16,6 +16,10 @@
  * Inputs come straight from the in_proj output y [T, ld]: q, k, v (the convolution channels: key heads, key
  * heads, value heads), then z [Hv * Dv], b [Hv], a [Hv]. Value head h reads key head h / (Hv / Hk). The q and k
  * convolution history is written back by the first value head of each key head only.
+ *
+ * Speculative decoding runs the kernel twice. The verify pass (commit = 0) computes the outputs of all drafted
+ * tokens and leaves the state and convolution history untouched. After acceptance, the commit pass (commit = 1,
+ * out may be null) replays only the first commit_lens[b] rows of each sequence and writes the state back.
  */
 
 namespace seventy {
@@ -35,7 +39,7 @@ __device__ __forceinline__ float block_sum256(float v, float *scratch) { return 
 __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
     half *out, half *conv_state, float *state, const half *y, int ld, const float *conv_w, const float *a_log,
     const float *dt_bias, const float *norm_w, const int *query_start, const int *context_lens,
-    const int *state_slots, int hk, int hv, int taps, float eps) {
+    const int *state_slots, const int *commit_lens, int commit, int hk, int hv, int taps, float eps) {
   __shared__ float qs[kD], ks[kD], vs[kD];
   __shared__ float pair[2][kD];
   __shared__ float scratch[32];
@@ -43,7 +47,7 @@ __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
   const int b = blockIdx.x / hv;
   const int h = blockIdx.x % hv;
   const int t0 = query_start[b];
-  const int tokens = query_start[b + 1] - t0;
+  const int tokens = commit_lens != nullptr ? commit_lens[b] : query_start[b + 1] - t0;
   if (tokens <= 0) return;
   const bool fresh = context_lens[b] == 0;
   const int slot = state_slots[b];
@@ -135,7 +139,7 @@ __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
     __syncthreads();
     const float o = round_half(qn * (pair[0][v] + pair[1][v]));
     const float sq_o = block_sum256(half_idx == 0 ? o * o : 0.0f, scratch);
-    if (half_idx == 0) {
+    if (half_idx == 0 && out != nullptr) {
       const float z = __half2float(row[conv_dim + h * kD + v]);
       const float r = o * rsqrtf(sq_o / kD + eps) * nw * (z / (1.0f + expf(-z)));
       out[static_cast<int64_t>(t0 + t) * hv * kD + h * kD + v] = __float2half_rn(r);
@@ -143,6 +147,7 @@ __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
     __syncthreads();
   }
 
+  if (!commit) return;
 #pragma unroll
   for (int r = 0; r < kRows; ++r) sp[(half_idx * kRows + r) * kD + v] = S[r];
 #pragma unroll
@@ -161,10 +166,10 @@ __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
 SEVENTY_API int seventy_gdn_recurrent(void *out, void *conv_state, float *state, const void *y, int ld,
                                       const float *conv_w, const float *a_log, const float *dt_bias,
                                       const float *norm_w, const int *query_start, const int *context_lens,
-                                      const int *state_slots, int num_seqs, int hk, int hv, int dk, int dv, int taps,
-                                      float eps, cudaStream_t stream) {
+                                      const int *state_slots, const int *commit_lens, int commit, int num_seqs,
+                                      int hk, int hv, int dk, int dv, int taps, float eps, cudaStream_t stream) {
   using namespace seventy;
-  if (out == nullptr || conv_state == nullptr || state == nullptr || y == nullptr || conv_w == nullptr ||
+  if ((out == nullptr && commit_lens == nullptr) || conv_state == nullptr || state == nullptr || y == nullptr || conv_w == nullptr ||
       a_log == nullptr || dt_bias == nullptr || norm_w == nullptr || query_start == nullptr ||
       context_lens == nullptr || state_slots == nullptr)
     return SEVENTY_ERR_INVALID_ARGUMENT;
@@ -173,6 +178,6 @@ SEVENTY_API int seventy_gdn_recurrent(void *out, void *conv_state, float *state,
   if (num_seqs == 0) return SEVENTY_OK;
   gdn_recurrent_kernel<<<static_cast<unsigned>(num_seqs * hv), kThreads, 0, stream>>>(
       static_cast<half *>(out), static_cast<half *>(conv_state), state, static_cast<const half *>(y), ld, conv_w,
-      a_log, dt_bias, norm_w, query_start, context_lens, state_slots, hk, hv, taps, eps);
+      a_log, dt_bias, norm_w, query_start, context_lens, state_slots, commit_lens, commit, hk, hv, taps, eps);
   return launch_status();
 }

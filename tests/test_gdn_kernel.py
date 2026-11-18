@@ -56,3 +56,37 @@ def test_gdn_recurrent_matches_reference(lengths, ctx):
     used = sorted(set(slots))
     torch.testing.assert_close(k_state.cpu()[used], ref_state[used], rtol=2e-3, atol=2e-4)
     torch.testing.assert_close(k_conv.cpu()[used].float(), ref_conv[used].float(), rtol=0, atol=0)
+
+
+def test_verify_then_commit_equals_running_accepted_rows():
+    torch.manual_seed(9)
+    hk, hv, d, taps, eps = 2, 6, 128, 4, 1e-6
+    conv_dim = 2 * hk * d + hv * d
+    width = conv_dim + hv * d + 2 * hv
+    lengths, ctx, accepted = [8, 8, 8], [10, 3, 0], [3, 8, 1]
+    starts = [0, 8, 16, 24]
+    y = (torch.randn(24, width) * 0.5).half()
+    conv_w = torch.randn(conv_dim, taps) * 0.3
+    a_log, dt_bias = torch.randn(hv) * 0.5, torch.randn(hv) * 0.5
+    norm_w = 1.0 + torch.randn(d) * 0.1
+    conv_state = (torch.randn(3, conv_dim, taps - 1) * 0.5).half()
+    state = torch.randn(3, hv, d, d) * 0.05
+    dev = "cuda"
+    i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=dev)
+    args = (conv_w.to(dev), None, None, a_log.to(dev), dt_bias.to(dev), norm_w.to(dev))
+    cs, st = conv_state.to(dev), state.to(dev)
+    full = kernels.gdn_recurrent(y.to(dev), conv_w.to(dev), cs, st, a_log.to(dev), dt_bias.to(dev), norm_w.to(dev),
+                                 i32(starts), i32(ctx), i32([0, 1, 2]), hk, hv, eps, commit=False)
+    assert torch.equal(cs.cpu(), conv_state) and torch.equal(st.cpu(), state)
+    kernels.gdn_recurrent(y.to(dev), conv_w.to(dev), cs, st, a_log.to(dev), dt_bias.to(dev), norm_w.to(dev),
+                          i32(starts), i32(ctx), i32([0, 1, 2]), hk, hv, eps, commit_lens=i32(accepted))
+    rows = torch.cat([y[s : s + n] for s, n in zip(starts, accepted)])
+    acc_starts = [0]
+    for n in accepted:
+        acc_starts.append(acc_starts[-1] + n)
+    cs2, st2 = conv_state.to(dev), state.to(dev)
+    ref = kernels.gdn_recurrent(rows.to(dev), conv_w.to(dev), cs2, st2, a_log.to(dev), dt_bias.to(dev),
+                                norm_w.to(dev), i32(acc_starts), i32(ctx), i32([0, 1, 2]), hk, hv, eps)
+    assert torch.equal(st.cpu(), st2.cpu()) and torch.equal(cs.cpu(), cs2.cpu())
+    for s, a, n in zip(starts, acc_starts, accepted):
+        assert torch.equal(full[s : s + n].cpu(), ref[a : a + n].cpu())

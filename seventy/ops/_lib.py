@@ -30,8 +30,8 @@ SIGNATURES = {
     "seventy_flash_attention": (_I32, [_P, _P, _P, _P, _P, _P, _I32, _P, _I32, _P, _I32, _P, _I32, _P, _P, _I32,
                                        _I32, _I32, _I32, _F32, _P]),
     "seventy_gdn_chunk_scan": (_I32, [_P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _P, _I32, _I32, _I64, _P]),
-    "seventy_gdn_recurrent": (_I32, [_P, _P, _P, _P, _I32, _P, _P, _P, _P, _P, _P, _P, _I32, _I32, _I32, _I32,
-                                     _I32, _I32, _F32, _P]),
+    "seventy_gdn_recurrent": (_I32, [_P, _P, _P, _P, _I32, _P, _P, _P, _P, _P, _P, _P, _P, _I32, _I32, _I32, _I32,
+                                     _I32, _I32, _I32, _F32, _P]),
     "seventy_nvfp4_gemm": (_I32, [_P, _P, _P, _P, _P, _I32, _I32, _I32, _I32, _I32, _I32, _P, _I64, _P]),
 }
 
