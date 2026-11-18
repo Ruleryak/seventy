@@ -1,0 +1,28 @@
+"""The operations the models use. CUDA tensors run our kernels where one exists; CPU tensors and operations
+without a kernel yet run the PyTorch reference in reference.py."""
+
+from __future__ import annotations
+
+import torch
+
+from ..nvfp4 import Nvfp4Weight
+from . import kernels, reference
+from ._lib import KernelError
+from ._lib import available as kernels_available
+
+__all__ = ["KernelError", "kernels_available", "nvfp4_dequantize", "rms_norm"]
+
+
+def rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, residual: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """RMS norm of the last dimension. With a residual, the norm is of x + residual, which is also returned."""
+    if x.is_cuda:
+        return kernels.rms_norm(x, weight, eps, residual)
+    return reference.rms_norm(x, weight, eps, residual)
+
+
+def nvfp4_dequantize(w: Nvfp4Weight) -> torch.Tensor:
+    if w.packed.is_cuda:
+        return kernels.nvfp4_dequantize(w)
+    return reference.nvfp4_dequantize(w)

@@ -1,0 +1,55 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "cmake>=3.26", "ninja"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "seventy"
+version = "0.1.0.dev0"
+description = "Inference engine for Qwen3.5-family models on NVIDIA V100 (sm70) GPUs"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch==2.10.0",
+    "numpy>=2.0",
+    "safetensors>=0.5",
+    "tokenizers>=0.22",
+    "huggingface-hub>=0.34",
+    "jinja2>=3.1",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "pydantic>=2.9",
+    "pillow>=11.0",
+    "nvidia-ml-py>=12.570",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3"]
+reference = ["transformers==5.16.1", "compressed-tensors>=0.15"]
+
+[project.scripts]
+seventy = "seventy.__main__:main"
+
+[tool.scikit-build]
+wheel.py-api = "py3"
+wheel.packages = ["seventy"]
+cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+sdist.include = ["csrc", "CMakeLists.txt"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: needs a CUDA GPU and the kernel library; uses little GPU memory",
+    "model: needs the model checkpoint on disk",
+    "slow: runs for minutes",
+]
