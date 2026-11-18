@@ -214,3 +214,28 @@ def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, 
     )
     check("decode_attention", code)
     return out
+
+
+def prefill_tiles(query_start: list[int], device) -> torch.Tensor:
+    """(sequence, first new token) of every 64-token query tile, int32 [tiles, 2]."""
+    tiles = [(b, q0) for b in range(len(query_start) - 1) for q0 in range(0, query_start[b + 1] - query_start[b], 64)]
+    return torch.tensor(tiles, dtype=torch.int32, device=device).view(-1, 2)
+
+
+def flash_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                    block_tables: torch.Tensor, query_start: list[int], query_start_t: torch.Tensor,
+                    context_lens_t: torch.Tensor, scale: float, k_scale: torch.Tensor | None = None,
+                    v_scale: torch.Tensor | None = None) -> torch.Tensor:
+    """Gated causal attention output [T, hq * 256] for prefill steps."""
+    t, hq, _ = q.shape
+    hkv, block_size = k_cache.shape[2], k_cache.shape[1]
+    tiles = prefill_tiles(query_start, q.device)
+    out = torch.empty(t, hq * 256, dtype=torch.float16, device=q.device)
+    ks, vs, kind = _kv_args(k_cache, v_cache, k_scale, v_scale)
+    code = lib().seventy_flash_attention(
+        out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), ks, vs, kind, qkv.data_ptr(),
+        qkv.shape[1], tiles.data_ptr(), tiles.shape[0], block_tables.data_ptr(), block_tables.shape[1],
+        query_start_t.data_ptr(), context_lens_t.data_ptr(), block_size, hq, hkv, 256, scale, _stream(q),
+    )
+    check("flash_attention", code)
+    return out

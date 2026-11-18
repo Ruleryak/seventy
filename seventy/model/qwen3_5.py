@@ -19,7 +19,7 @@ from ..checkpoint import Checkpoint
 from ..config import ModelConfig, TextConfig
 from ..engine.cache import ModelCache
 from ..engine.step import StepInput
-from ..ops import kernels
+from ..ops import gdn_prefill, kernels
 from ..parallel import SINGLE, Parallel
 
 RECURRENT_MAX_TOKENS = 32
@@ -67,10 +67,9 @@ class AttentionLayer:
                                              step.query_start_t, step.context_lens_t, step.max_query_len,
                                              step.max_blocks, self.scale, ks, vs)
             else:
-                o = ops.paged_attention(q, cache.k[layer], cache.v[layer], step.query_start, step.context_lens,
-                                        step.block_tables, self.scale, ks, vs)
-                o = ops.sigmoid_gate(o.reshape(t, self.heads * d), qkv[:, : 2 * d * self.heads].view(
-                    t, self.heads, 2, d)[:, :, 1].reshape(t, self.heads * d))
+                o = kernels.flash_attention(q, qkv, cache.k[layer], cache.v[layer], step.block_tables,
+                                            step.query_start, step.query_start_t, step.context_lens_t, self.scale,
+                                            ks, vs)
             return self.par.all_reduce(self.o_proj(o))
         qg = qkv[:, : 2 * d * self.heads].view(t, self.heads, 2, d)
         q = qg[:, :, 0].contiguous()
@@ -137,8 +136,12 @@ class GatedDeltaNetLayer:
         k = qkv[:, key : 2 * key].view(t, self.hk, self.dk)
         v = qkv[:, 2 * key :].view(t, self.hv, self.dv)
         g, beta = ops.gdn_gates(a, b, self.a_log, self.dt_bias)
-        o = ops.gated_delta_rule(q, k, v, g, beta, cache.state[layer], step.query_start, step.context_lens,
-                                 step.state_slots)
+        if v.is_cuda:
+            o = gdn_prefill.gated_delta_rule(q, k, v, g, beta, cache.state[layer], step.query_start,
+                                             step.query_start_t, step.context_lens_t, step.state_slots_t)
+        else:
+            o = ops.gated_delta_rule(q, k, v, g, beta, cache.state[layer], step.query_start, step.context_lens,
+                                     step.state_slots)
         o = ops.gated_rms_norm(o.reshape(t * self.hv, self.dv), z.reshape(t * self.hv, self.dv), self.norm, self.eps)
         return self.par.all_reduce(self.out_proj(o.view(t, val)))
 

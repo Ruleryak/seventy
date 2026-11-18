@@ -85,3 +85,25 @@ def test_prep_and_attention_match_reference(lengths, ctx, kv):
                                    bt.shape[1], 1 / math.sqrt(d), dks, dvs)
     err = (out.cpu().float() - ref.float()).abs().max().item()
     assert err < 3e-3, err
+
+
+@pytest.mark.parametrize("kv", ["fp16", "int8"])
+@pytest.mark.parametrize("lengths, ctx", [([64], [0]), ([100, 37], [0, 130]), ([200], [70])])
+def test_flash_attention_matches_reference(lengths, ctx, kv):
+    hq, hkv, d, bs = 6, 2, 256, 16
+    qkv, starts, bt, k_cache, v_cache, positions = setup(lengths, ctx, hq, hkv, bs, seed=3)
+    t = qkv.shape[0]
+    ks = vs = None
+    if kv == "int8":
+        k_cache, ks = R.quantize_int8(k_cache)
+        v_cache, vs = R.quantize_int8(v_cache)
+    q = (torch.randn(t, hq, d) * 0.7).half()
+    ref = R.paged_attention(q, k_cache, v_cache, starts, ctx, bt.long(), 1 / math.sqrt(d), ks, vs)
+    ref = R.sigmoid_gate(ref.reshape(t, hq * d), qkv[:, : 2 * d * hq].view(t, hq, 2, d)[:, :, 1].reshape(t, hq * d))
+    dev = "cuda"
+    i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=dev)
+    out = kernels.flash_attention(q.to(dev), qkv.to(dev), k_cache.to(dev), v_cache.to(dev), bt.to(dev), starts,
+                                  i32(starts), i32(ctx), 1 / math.sqrt(d), None if ks is None else ks.to(dev),
+                                  None if vs is None else vs.to(dev))
+    err = (out.cpu().float() - ref.float()).abs().max().item()
+    assert err < 4e-3, err

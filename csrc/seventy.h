@@ -113,3 +113,27 @@ SEVENTY_API int seventy_decode_attention(void *out, const void *q, const void *k
                                          int max_query_len, int block_size, int hq, int hkv, int head_dim, int splits,
                                          int blocks_per_split, float scale, void *workspace, int64_t workspace_bytes,
                                          cudaStream_t stream);
+
+/*
+ * Gated DeltaNet prefill, sequential part (see csrc/gdn_chunk.cu): one block per (sequence, value head) walks the
+ * sequence's chunks of 64 tokens with the FP32 state, from inputs prepared per chunk by seventy.ops.gdn_prefill.
+ * out: FP16 [T, hv, 128]. state: FP32 [slots, hv, 128, 128]. w, u, gq: FP16 [hv, total_chunks, 64, 128];
+ * p: FP16 [hv, total_chunks, 64, 64]; klt: FP16 [hv, total_chunks, 128, 64]; eg: FP32 [hv, total_chunks].
+ * chunk_start: int32 [num_seqs], the index of each sequence's first chunk.
+ */
+SEVENTY_API int seventy_gdn_chunk_scan(void *out, float *state, const void *w, const void *u, const void *gq,
+                                       const void *p, const void *klt, const float *eg, const int *chunk_start,
+                                       const int *query_start, const int *context_lens, const int *state_slots,
+                                       int num_seqs, int hv, int64_t total_chunks, cudaStream_t stream);
+
+/*
+ * Prefill attention (head size 256) over the paged caches (kv_type as in seventy_attn_prep), causal, with the
+ * output gate (see csrc/flash_attention.cu). tiles: int32 [num_tiles, 2] = (sequence, first new token of a
+ * 64-token query tile). out: FP16 [T, hq * 256].
+ */
+SEVENTY_API int seventy_flash_attention(void *out, const void *q, const void *k_cache, const void *v_cache,
+                                        const float *k_scale, const float *v_scale, int kv_type, const void *qkv,
+                                        int ld, const int *tiles, int num_tiles, const int *block_tables,
+                                        int table_width, const int *query_start, const int *context_lens,
+                                        int block_size, int hq, int hkv, int head_dim, float scale,
+                                        cudaStream_t stream);
