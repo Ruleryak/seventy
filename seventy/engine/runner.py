@@ -13,13 +13,33 @@ from .scheduler import Work
 from .step import SequenceChunk, StepInput
 
 
+def build_step(payload, block_size: int, device) -> StepInput:
+    chunks = [SequenceChunk(list(ids), ctx, list(table), slot, logits=mode) for ids, ctx, table, slot, mode in payload]
+    return StepInput.build(chunks, block_size, device)
+
+
 class ModelRunner:
-    def __init__(self, model, cache: ModelCache, device: torch.device, peers=()):
+    def __init__(self, model, cache: ModelCache, device: torch.device, peers=(), drafter=None):
         self.model = model
         self.cache = cache
         self.device = device
         self.peers = list(peers)
         self.graphs: DecodeGraphs | None = None
+        self.drafter = drafter
+        self.layers = drafter.cfg.target_layers if drafter is not None else ()
+        self._feats = None
+        self._stash = None
+        self._step = None
+
+    def _send(self, msg) -> None:
+        if self.peers:
+            data = pickle.dumps(msg)
+            for p in self.peers:
+                p.send_bytes(data)
+
+    @staticmethod
+    def payload(work: list[Work]) -> list[tuple]:
+        return [(w.ids(), w.start, w.request.blocks, w.request.slot, w.logits) for w in work]
 
     def capture(self, max_blocks_per_seq: int, buckets: tuple[int, ...]) -> None:
         msg = pickle.dumps(("capture", max_blocks_per_seq, list(buckets)))
@@ -36,10 +56,7 @@ class ModelRunner:
 
     def copy(self, copies: list[tuple[str, int, int]]) -> None:
         """Make the plan's cache copies (prefix cache) on every rank before the step."""
-        if self.peers:
-            msg = pickle.dumps(("copy", copies))
-            for p in self.peers:
-                p.send_bytes(msg)
+        self._send(("copy", copies))
         self.cache.apply(copies)
 
     def run_decode(self, work: list[Work]) -> torch.Tensor:
@@ -48,32 +65,64 @@ class ModelRunner:
             return self.run(work)
         payload = [(w.request.tokens[w.start : w.start + 1], w.start, w.request.blocks, w.request.slot, "last")
                    for w in work]
-        if self.peers:
-            msg = pickle.dumps(("decode", payload))
-            for p in self.peers:
-                p.send_bytes(msg)
+        self._send(("decode", payload))
         return self.graphs.run(payload)
 
-    def run(self, work: list[Work]) -> torch.Tensor:
-        """FP32 logits for the rows each work item asked for ("last": its last token, "all": every token), in order."""
-        chunks = [
-            SequenceChunk(
-                token_ids=w.request.tokens[w.start : w.start + w.count],
-                context_len=w.start,
-                block_table=w.request.blocks,
-                state_slot=w.request.slot,
-                logits=w.logits,
-            )
-            for w in work
-        ]
-        if self.peers:
-            payload = pickle.dumps(("step", [(c.token_ids, c.context_len, c.block_table, c.state_slot, c.logits)
-                                             for c in chunks]))
-            for p in self.peers:
-                p.send_bytes(payload)
-        step = StepInput.build(chunks, self.cache.block_size, self.device)
-        logits, _ = self.model.forward(step, self.cache)
+    def run(self, work: list[Work], capture: bool = False) -> torch.Tensor:
+        """FP32 logits for the rows each work item asked for ("last": its last token, "all": every token), in order.
+        With capture (speculative decoding), the drafter's context features of every row are kept."""
+        payload = self.payload(work)
+        self._send(("step", payload, capture))
+        step = build_step(payload, self.cache.block_size, self.device)
+        logits, cap = self.model.forward(step, self.cache, capture=self.layers if capture else ())
+        self._feats = torch.cat([cap[i] for i in self.layers], dim=-1) if capture else None
         return logits
+
+    def run_payload(self, payload, capture: bool) -> None:
+        step = build_step(payload, self.cache.block_size, self.device)
+        _, cap = self.model.forward(step, self.cache, capture=self.layers if capture else ())
+        self._feats = torch.cat([cap[i] for i in self.layers], dim=-1) if capture else None
+
+    def verify_payload(self, payload) -> None:
+        self._step = build_step(payload, self.cache.block_size, self.device)
+        self._stash = {}
+        _, cap = self.model.forward(self._step, self.cache, capture=self.layers, stash=self._stash)
+        self._feats = torch.cat([cap[i] for i in self.layers], dim=-1)
+
+    def verify(self, work: list[Work]) -> torch.Tensor:
+        """Speculative verify step: logits of every row; state commits wait for accept()."""
+        payload = self.payload(work)
+        self._send(("verify", payload))
+        self._step = build_step(payload, self.cache.block_size, self.device)
+        self._stash = {}
+        logits, cap = self.model.forward(self._step, self.cache, capture=self.layers, stash=self._stash)
+        self._feats = torch.cat([cap[i] for i in self.layers], dim=-1)
+        return logits
+
+    def accept(self, commit_lens: list[int], rows: list[int], positions: list[int], slots: list[int]) -> None:
+        """Commit the accepted rows of the last verify step and add their context to the drafter."""
+        self._send(("accept", commit_lens, rows, positions, slots))
+        lens = torch.tensor(commit_lens, dtype=torch.int32, device=self.device)
+        self.model.commit(self._step, self.cache, self._stash, lens)
+        self._stash = None
+        self.context(rows, positions, slots, send=False)
+
+    def context(self, rows: list[int], positions: list[int], slots: list[int], send: bool = True) -> None:
+        """Write the drafter context of rows of the last step's features."""
+        if send:
+            self._send(("context", rows, positions, slots))
+        if not rows:
+            return
+        dev = self.device
+        r = torch.tensor(rows, dtype=torch.long, device=dev)
+        self.drafter.write_context(self._feats[r], torch.tensor(positions, dtype=torch.long, device=dev),
+                                   torch.tensor(slots, dtype=torch.long, device=dev))
+
+    def draft(self, anchors: list[int], starts: list[int], slots: list[int], temperatures: list[float], generators):
+        self._send(("draft", anchors, starts, slots))
+        dev = self.device
+        return self.drafter.draft(torch.tensor(anchors, device=dev), torch.tensor(starts, device=dev),
+                                  torch.tensor(slots, device=dev), temperatures, generators)
 
     def close(self) -> None:
         for p in self.peers:

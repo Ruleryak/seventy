@@ -46,6 +46,10 @@ class Request:
     logprobs: list[TokenLogprobs] = field(default_factory=list)
     prompt_logprobs: list[TokenLogprobs | None] = field(default_factory=list)
     preemptions: int = 0
+    draft: list[int] = field(default_factory=list)
+    draft_q: torch.Tensor | None = None
+    draft_cand: torch.Tensor | None = None
+    cacheable: bool = True
 
     @property
     def tokens(self) -> list[int]:
@@ -149,12 +153,17 @@ class PrefixCache:
 
 @dataclass
 class Work:
-    """One sequence's part of a model step: tokens [start, start + count) of request.tokens."""
+    """One sequence's part of a model step: tokens [start, start + count) of request.tokens, or `tokens` (a
+    speculative verify: the newest token and the drafts)."""
 
     request: Request
     start: int
     count: int
     logits: str
+    tokens: list[int] | None = None
+
+    def ids(self) -> list[int]:
+        return self.tokens if self.tokens is not None else self.request.tokens[self.start : self.start + self.count]
 
 
 @dataclass
@@ -262,6 +271,7 @@ class Scheduler:
 
     def _preempt(self, r: Request) -> None:
         self._release(r)
+        r.draft, r.draft_q, r.draft_cand = [], None, None
         self.running.remove(r)
         r.computed = 0
         r.status = Status.WAITING
@@ -275,7 +285,10 @@ class Scheduler:
         for r in sorted(decoders, key=lambda x: x.arrival):
             if r.status is not Status.RUNNING:
                 continue
-            while not self._grow(r, r.length):
+            if r.draft and r.computed + 1 + len(r.draft) > self.max_model_len:
+                r.draft, r.draft_q, r.draft_cand = [], None, None
+            count = 1 + len(r.draft)
+            while not self._grow(r, r.computed + count):
                 victim = max((x for x in self.running if x is not r), key=lambda x: x.arrival, default=None)
                 if victim is None or victim.arrival < r.arrival:
                     victim = r
@@ -283,7 +296,10 @@ class Scheduler:
                 if victim is r:
                     break
             if r.status is Status.RUNNING:
-                plan.decode.append(Work(r, r.computed, 1, "last"))
+                if r.draft:
+                    plan.decode.append(Work(r, r.computed, count, "all", tokens=[r.tokens[-1]] + r.draft))
+                else:
+                    plan.decode.append(Work(r, r.computed, 1, "last"))
         budget = self.prefill_budget
         for r in [x for x in self.running if x.computed < x.length - 1]:
             budget = self._plan_prefill(plan, r, budget)
@@ -316,7 +332,7 @@ class Scheduler:
         return budget - count
 
     def finish(self, r: Request, reason: str) -> None:
-        if self.cache.max_entries and r.slot is not None and r.computed > 0:
+        if self.cache.max_entries and r.slot is not None and r.computed > 0 and r.cacheable:
             keep = -(-r.computed // self.block_size)
             self.blocks.give(r.blocks[keep:])
             self.cache.add(r.tokens[: r.computed], r.blocks[:keep], r.slot)

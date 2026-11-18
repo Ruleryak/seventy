@@ -128,14 +128,24 @@ class Drafter:
             self.pred = _to_dtype(ckpt.tensor("candidate_selector.predecessor_codebook"), dtype).to(device)
             self.succ = _to_dtype(ckpt.tensor("candidate_selector.successor_codebook"), dtype).to(device)
         self.kv_all = torch.cat([layer.kv_w for layer in self.layers])
-        kv = self.layers[0].kv
-        shape = (cfg.layers, num_slots + 1, cfg.ring, kv, cfg.head_dim)
-        self.k_ring = torch.zeros(shape, dtype=dtype, device=device)
-        self.v_ring = torch.zeros(shape, dtype=dtype, device=device)
+        self.k_ring = self.v_ring = None
+        if num_slots:
+            self.allocate(num_slots)
         half = cfg.head_dim // 2
         self.inv_freq = (1.0 / (cfg.rope_theta ** (torch.arange(0, half, dtype=torch.float64) * 2 / cfg.head_dim))
                          ).float().to(device)
         self.groups = cfg.hidden // cfg.group_size
+
+    def ring_bytes_per_slot(self) -> int:
+        cfg = self.cfg
+        return 2 * cfg.layers * cfg.ring * self.layers[0].kv * cfg.head_dim * torch.finfo(self.dtype).bits // 8
+
+    def allocate(self, num_slots: int) -> None:
+        """The context rings for num_slots state slots (plus the scratch slot)."""
+        cfg = self.cfg
+        shape = (cfg.layers, num_slots + 1, cfg.ring, self.layers[0].kv, cfg.head_dim)
+        self.k_ring = torch.zeros(shape, dtype=self.dtype, device=self.device)
+        self.v_ring = torch.zeros(shape, dtype=self.dtype, device=self.device)
 
     def _rope(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         ang = positions.float()[:, None] * self.inv_freq

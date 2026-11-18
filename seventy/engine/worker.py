@@ -19,12 +19,7 @@ from ..parallel import Parallel
 from . import distributed
 from .cache import ModelCache
 from .graphs import DecodeGraphs
-from .step import SequenceChunk, StepInput
-
-
-def build_step(payload, block_size: int, device) -> StepInput:
-    chunks = [SequenceChunk(list(ids), ctx, list(table), slot, logits=mode) for ids, ctx, table, slot, mode in payload]
-    return StepInput.build(chunks, block_size, device)
+from .runner import ModelRunner, build_step
 
 
 def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None):
@@ -35,7 +30,7 @@ def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None
 
 
 def worker_main(rank: int, size: int, port: int, backend: str, device_name: str, model_path: str, dtype_name: str,
-                utilization: float, reserve_bytes: int, conn, layers=None) -> None:
+                utilization: float, reserve_bytes: int, conn, layers=None, draft_path: str | None = None) -> None:
     faulthandler.register(signal.SIGUSR1, all_threads=True)
     try:
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
@@ -45,12 +40,21 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
         distributed.init(rank, size, port, backend)
         dtype = getattr(torch, dtype_name)
         cfg, model = load_shard(model_path, rank, size, device, dtype, layers)
+        drafter = None
+        if draft_path:
+            from ..model.dflash2 import Drafter
+
+            drafter = Drafter(draft_path, model, device, dtype, par=Parallel(rank, size))
         budget = distributed.memory_budget(device, utilization, reserve_bytes) if device.type == "cuda" else 1 << 40
         conn.send(("ready", budget))
         kind, num_blocks, block_size, slots, kv_name = conn.recv()
         kv_dtype = getattr(torch, kv_name)
         cache = ModelCache(cfg.text, num_blocks, block_size, slots, dtype, device, par=Parallel(rank, size),
                            kv_dtype=kv_dtype)
+        if drafter is not None:
+            drafter.allocate(slots)
+            cache.slot_peers.append(drafter)
+        runner = ModelRunner(model, cache, device, (), drafter)
         conn.send(("ok", None))
         graphs = None
         while True:
@@ -59,7 +63,15 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
                 graphs = None
                 break
             if msg[0] == "step":
-                model.forward(build_step(msg[1], block_size, device), cache)
+                runner.run_payload(msg[1], msg[2])
+            elif msg[0] == "verify":
+                runner.verify_payload(msg[1])
+            elif msg[0] == "accept":
+                runner.accept(*msg[1:])
+            elif msg[0] == "context":
+                runner.context(*msg[1:], send=False)
+            elif msg[0] == "draft":
+                runner.draft(msg[1], msg[2], msg[3], [0.0] * len(msg[1]), [None] * len(msg[1]))
             elif msg[0] == "decode":
                 graphs.run(msg[1])
             elif msg[0] == "copy":

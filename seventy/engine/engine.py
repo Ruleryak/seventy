@@ -36,6 +36,7 @@ class EngineConfig:
     cuda_graphs: bool = True
     prefix_cache: bool = True
     cache_entries: int = 0
+    draft_model: str | None = None
 
 
 @dataclass
@@ -85,7 +86,7 @@ class Engine:
                 parent, child = ctx.Pipe()
                 p = ctx.Process(target=_worker_entry, daemon=True,
                                 args=(rank, tp, port, "nccl", f"cuda:{rank}", str(path), "float16",
-                                      config.gpu_memory_utilization, reserve, child))
+                                      config.gpu_memory_utilization, reserve, child, None, config.draft_model))
                 p.start()
                 child.close()
                 self.workers.append(p)
@@ -94,6 +95,11 @@ class Engine:
         from .worker import load_shard
 
         _, self.model = load_shard(str(path), 0, tp, self.device, torch.float16)
+        self.drafter = None
+        if config.draft_model:
+            from ..model.dflash2 import Drafter
+
+            self.drafter = Drafter(config.draft_model, self.model, self.device, torch.float16, par=Parallel(0, tp))
         torch.cuda.synchronize()
         budgets = [distributed.memory_budget(self.device, config.gpu_memory_utilization, reserve)]
         for conn, proc in zip(peers, self.workers):
@@ -102,7 +108,8 @@ class Engine:
         entries = (config.cache_entries or config.max_num_seqs) if config.prefix_cache else 0
         total_slots = slots + entries
         per_block = bytes_per_block(self.model_config, config.block_size, kv_dtype, tp)
-        state = total_slots * bytes_per_slot(self.model_config, tp)
+        ring = self.drafter.ring_bytes_per_slot() if self.drafter is not None else 0
+        state = (total_slots + 1) * (bytes_per_slot(self.model_config, tp) + ring)
         num_blocks = (min(budgets) - state) // per_block
         need = -(-config.max_model_len // config.block_size)
         if num_blocks < min(need, 64):
@@ -113,10 +120,13 @@ class Engine:
             conn.send(("init", num_blocks, config.block_size, total_slots, kv_name))
         self.cache = ModelCache(self.model_config.text, num_blocks, config.block_size, total_slots, torch.float16,
                                 self.device, par=Parallel(0, tp), kv_dtype=kv_dtype)
+        if self.drafter is not None:
+            self.drafter.allocate(total_slots)
+            self.cache.slot_peers.append(self.drafter)
         for conn, proc in zip(peers, self.workers):
             _expect(conn, "ok", proc)
-        self.runner = ModelRunner(self.model, self.cache, self.device, peers)
-        if config.cuda_graphs:
+        self.runner = ModelRunner(self.model, self.cache, self.device, peers, self.drafter)
+        if config.cuda_graphs and self.drafter is None:
             from .graphs import BUCKETS
 
             buckets = tuple(b for b in BUCKETS if b <= max(1, slots))
@@ -129,7 +139,7 @@ class Engine:
         self._ids = itertools.count()
         self.requests: dict[str, Request] = {}
         self.stats = {"steps": 0, "prompt_tokens": 0, "generated_tokens": 0, "preemptions": 0, "cache_hits": 0,
-                      "cache_hit_tokens": 0}
+                      "cache_hit_tokens": 0, "verify_steps": 0, "drafted_tokens": 0, "accepted_tokens": 0}
 
     @property
     def kv_capacity_tokens(self) -> int:
@@ -208,10 +218,19 @@ class Engine:
         if plan.copies:
             self.runner.copy(plan.copies)
         if plan.decode:
-            self._sample(plan.decode, self.runner.run_decode(plan.decode), outputs)
+            if self.drafter is not None:
+                self._spec_decode(plan.decode, outputs)
+            else:
+                self._sample(plan.decode, self.runner.run_decode(plan.decode), outputs)
         if plan.prefill:
             self.stats["prompt_tokens"] += sum(w.count for w in plan.prefill)
-            self._sample(plan.prefill, self.runner.run(plan.prefill), outputs)
+            logits = self.runner.run(plan.prefill, capture=self.drafter is not None)
+            if self.drafter is not None:
+                self._prefill_context(plan.prefill)
+            self._sample(plan.prefill, logits, outputs)
+            if self.drafter is not None:
+                self._draft([w.request for w in plan.prefill
+                             if w.request.status is Status.RUNNING and w.request.computed == w.request.length - 1])
         self.stats["steps"] += 1
         self.stats["cache_hits"] = self.scheduler.cache.hits
         self.stats["cache_hit_tokens"] = self.scheduler.cache.hit_tokens
@@ -228,6 +247,81 @@ class Engine:
                 self.requests.pop(rid, None)
             result.append(out)
         return result
+
+    def _prefill_context(self, work: list[Work]) -> None:
+        """Drafter context for the prefill rows within the drafter's window of the sequence end."""
+        window = self.drafter.cfg.window
+        rows, positions, slots, row = [], [], [], 0
+        for w in work:
+            first = max(w.start, w.request.length - window)
+            for i in range(w.count):
+                if w.start + i >= first:
+                    rows.append(row + i)
+                    positions.append(w.start + i)
+                    slots.append(w.request.slot)
+            row += w.count
+        self.runner.context(rows, positions, slots)
+
+    def _draft(self, requests: list[Request]) -> None:
+        if not requests:
+            return
+        d = self.runner.draft([r.tokens[-1] for r in requests], [r.computed for r in requests],
+                              [r.slot for r in requests], [r.params.temperature for r in requests],
+                              [r.generator for r in requests])
+        tokens = d.tokens.tolist()
+        for i, r in enumerate(requests):
+            r.draft, r.draft_q, r.draft_cand = tokens[i], d.probs[i], d.candidates[i]
+        self.stats["drafted_tokens"] += sum(len(t) for t in tokens)
+
+    def _spec_decode(self, work: list[Work], outputs: dict[str, RequestOutput]) -> None:
+        from .spec import accept
+
+        logits = self.runner.verify(work)
+        lens, rows, positions, slots, results, row = [], [], [], [], [], 0
+        for w in work:
+            r = w.request
+            n_rows = w.count if w.logits == "all" else 1
+            L = logits[row : row + n_rows]
+            state = RowState(r.params, r.prompt, r.output, r.generator)
+            if r.draft and n_rows == 1 + len(r.draft):
+                n, new = accept(L, r.draft, r.draft_q, r.draft_cand, state, self.eos)
+            else:
+                n, new = 0, sample(L[-1:], [state], self.eos)[0]
+            results.append((w, n, new, L))
+            lens.append(n + 1)
+            rows += list(range(row, row + n + 1))
+            positions += list(range(w.start, w.start + n + 1))
+            slots += [r.slot] * (n + 1)
+            row += n_rows
+        self.runner.accept(lens, rows, positions, slots)
+        self.stats["verify_steps"] += len(work)
+        survivors = []
+        for w, n, new, L in results:
+            r = w.request
+            self.stats["accepted_tokens"] += n
+            r.computed = w.start + n + 1
+            r.draft, r.draft_q, r.draft_cand = [], None, None
+            out = outputs.setdefault(r.id, RequestOutput(r.id, [], False, None))
+            lp_rows = logprobs_of(L[: len(new)], torch.tensor(new, device=L.device), r.params.logprobs or 0) \
+                if r.params.logprobs is not None else [None] * len(new)
+            reason = None
+            for i, (t, lp) in enumerate(zip(new, lp_rows)):
+                r.output.append(t)
+                out.new_tokens.append(t)
+                if lp is not None:
+                    lp.top = lp.top[: r.params.logprobs]
+                    r.logprobs.append(lp)
+                    out.new_logprobs.append(lp)
+                reason = self._stop_reason(r, t)
+                if reason:
+                    if i < n:
+                        r.cacheable = False
+                    break
+            if reason:
+                self.scheduler.finish(r, reason)
+            else:
+                survivors.append(r)
+        self._draft(survivors)
 
     def close(self) -> None:
         """Stop the workers. Every rank tears its process group down at the same time (NCCL needs that)."""

@@ -61,11 +61,14 @@ class ModelCache:
             self.v_scale = {layer: self.v_scale_all[i] for i, layer in enumerate(cfg.attention_layers)}
         self.conv = {layer: self.conv_all[i] for i, layer in enumerate(cfg.linear_layers)}
         self.state = {layer: self.state_all[i] for i, layer in enumerate(cfg.linear_layers)}
+        self.slot_peers: list = []
 
     def copy_slot(self, src: int, dst: int) -> None:
         """Copy the Gated DeltaNet state and convolution history of every layer from one slot to another."""
         self.state_all[:, dst].copy_(self.state_all[:, src])
         self.conv_all[:, dst].copy_(self.conv_all[:, src])
+        for peer in self.slot_peers:
+            peer.copy_slot(src, dst)
 
     def copy_block(self, src: int, dst: int) -> None:
         """Copy one KV block (all attention layers, keys, values and scales)."""
