@@ -157,17 +157,29 @@ def gdn_recurrent(
     return out
 
 
+def _kv_args(k_cache, v_cache, k_scale, v_scale):
+    if k_cache.dtype == torch.int8:
+        if k_scale is None or v_scale is None:
+            raise ValueError("int8 KV caches need their scales")
+        return k_scale.data_ptr(), v_scale.data_ptr(), 1
+    if k_cache.dtype != torch.float16:
+        raise ValueError(f"KV caches must be float16 or int8, not {k_cache.dtype}")
+    return None, None, 0
+
+
 def attn_prep(qkv: torch.Tensor, q_norm: torch.Tensor, k_norm: torch.Tensor, positions: torch.Tensor,
               inv_freq: torch.Tensor, section: tuple[int, int, int], slots: torch.Tensor, k_cache: torch.Tensor,
-              v_cache: torch.Tensor, hq: int, hkv: int, eps: float) -> torch.Tensor:
+              v_cache: torch.Tensor, hq: int, hkv: int, eps: float, k_scale: torch.Tensor | None = None,
+              v_scale: torch.Tensor | None = None) -> torch.Tensor:
     """Normed, rotated queries [T, hq, 256]; keys and values written to the caches at `slots` (int32 [T])."""
     _expect(qkv, "qkv", torch.float16)
     _expect(positions, "positions", torch.int64)
     _expect(slots, "slots", torch.int32)
     t = qkv.shape[0]
     q = torch.empty(t, hq, 256, dtype=torch.float16, device=qkv.device)
+    ks, vs, kind = _kv_args(k_cache, v_cache, k_scale, v_scale)
     code = lib().seventy_attn_prep(
-        q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), qkv.data_ptr(), qkv.shape[1], q_norm.data_ptr(),
+        q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), ks, vs, kind, qkv.data_ptr(), qkv.shape[1], q_norm.data_ptr(),
         k_norm.data_ptr(), positions.data_ptr(), positions.shape[1], inv_freq.data_ptr(), section[1], section[2],
         2 * inv_freq.numel(), slots.data_ptr(), t, hq, hkv, 256, eps, _stream(qkv),
     )
@@ -184,7 +196,8 @@ def decode_attention_splits(max_blocks: int, num_seqs: int, hkv: int, device: to
 
 def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                      block_tables: torch.Tensor, query_start: torch.Tensor, context_lens: torch.Tensor,
-                     max_query_len: int, max_blocks: int, scale: float) -> torch.Tensor:
+                     max_query_len: int, max_blocks: int, scale: float, k_scale: torch.Tensor | None = None,
+                     v_scale: torch.Tensor | None = None) -> torch.Tensor:
     """Gated attention output [T, hq * 256] for steps with few new tokens per sequence."""
     t, hq, _ = q.shape
     hkv, block_size = k_cache.shape[2], k_cache.shape[1]
@@ -192,8 +205,9 @@ def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, 
     need = lib().seventy_decode_attention_workspace(t, hq, splits)
     ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=q.device)
     out = torch.empty(t, hq * 256, dtype=torch.float16, device=q.device)
+    ks, vs, kind = _kv_args(k_cache, v_cache, k_scale, v_scale)
     code = lib().seventy_decode_attention(
-        out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), qkv.data_ptr(), qkv.shape[1],
+        out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), ks, vs, kind, qkv.data_ptr(), qkv.shape[1],
         block_tables.data_ptr(), block_tables.shape[1], query_start.data_ptr(), context_lens.data_ptr(),
         context_lens.numel(), t, max_query_len, block_size, hq, hkv, 256, splits, per, scale, ws.data_ptr(),
         ws.numel() * 4, _stream(q),

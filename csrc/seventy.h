@@ -86,25 +86,29 @@ SEVENTY_API int seventy_gdn_recurrent(void *out, void *conv_state, float *state,
  * Attention prep for full-attention layers (head size 256), one launch per layer step: RMS norm of each query and
  * key head (weights with the 1 + w offset in them), multimodal rotary on the first rotary_dim values, queries to
  * q_out [T, hq, 256], keys and raw values to the paged caches [blocks, block_size, hkv, 256] at slots[t].
+ * kv_type 0: FP16 caches. kv_type 1: int8 caches with FP32 scales [blocks, block_size, hkv] (k_scale, v_scale):
+ * scale = max |x| / 127 over the head's 256 values, value = round(x / scale).
  * qkv: FP16 [T, ld] = [q_proj (per head: query 256 | gate 256) | k_proj | v_proj]. positions: int64 [3, T]
  * (row stride pos_stride). inv_freq: FP32 [rotary_dim / 2]. section1, section2: the height and width sections of
  * the interleaved multimodal rotary.
  */
-SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, const void *qkv, int ld,
-                                  const float *q_norm, const float *k_norm, const int64_t *positions,
-                                  int64_t pos_stride, const float *inv_freq, int section1, int section2,
-                                  int rotary_dim, const int *slots, int tokens, int hq, int hkv, int head_dim,
-                                  float eps, cudaStream_t stream);
+SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, float *k_scale, float *v_scale,
+                                  int kv_type, const void *qkv, int ld, const float *q_norm, const float *k_norm,
+                                  const int64_t *positions, int64_t pos_stride, const float *inv_freq, int section1,
+                                  int section2, int rotary_dim, const int *slots, int tokens, int hq, int hkv,
+                                  int head_dim, float eps, cudaStream_t stream);
 
 SEVENTY_API int64_t seventy_decode_attention_workspace(int tokens, int hq, int splits);
 
 /*
  * Causal attention for steps with few new tokens per sequence ((hq / hkv) * max_query_len <= 64), over the paged
- * FP16 caches, split over cache ranges of blocks_per_split blocks, then merged and multiplied by sigmoid(gate)
- * (the gate half of each query head in qkv). out: FP16 [T, hq * 256]. block_tables: int32 [num_seqs, table_width].
+ * caches (kv_type as in seventy_attn_prep), split over cache ranges of blocks_per_split blocks, then merged and
+ * multiplied by sigmoid(gate) (the gate half of each query head in qkv). out: FP16 [T, hq * 256]. block_tables:
+ * int32 [num_seqs, table_width].
  */
 SEVENTY_API int seventy_decode_attention(void *out, const void *q, const void *k_cache, const void *v_cache,
-                                         const void *qkv, int ld, const int *block_tables, int table_width,
+                                         const float *k_scale, const float *v_scale, int kv_type, const void *qkv,
+                                         int ld, const int *block_tables, int table_width,
                                          const int *query_start, const int *context_lens, int num_seqs, int tokens,
                                          int max_query_len, int block_size, int hq, int hkv, int head_dim, int splits,
                                          int blocks_per_split, float scale, void *workspace, int64_t workspace_bytes,

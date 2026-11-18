@@ -24,8 +24,42 @@ constexpr int kHead = 256;
 constexpr int kChunk = 16;
 constexpr int kMaxRows = 64;
 
-__global__ void __launch_bounds__(kHead) attn_prep_kernel(half *q_out, half *k_cache, half *v_cache, const half *qkv,
-                                                          int ld, const float *q_norm, const float *k_norm,
+__device__ __forceinline__ float block_max(float v, float *scratch) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int warps = (blockDim.x + 31) >> 5;
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  __syncthreads();
+  if (lane == 0) scratch[warp] = v;
+  __syncthreads();
+  v = (lane < warps) ? scratch[lane] : 0.0f;
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+  return v;
+}
+
+template <typename T>
+__device__ __forceinline__ void store_kv(T *cache, float *scales, int64_t vec, float x, float *scratch);
+
+template <>
+__device__ __forceinline__ void store_kv<half>(half *cache, float *, int64_t vec, float x, float *) {
+  cache[vec * kHead + threadIdx.x] = __float2half_rn(x);
+}
+
+template <>
+__device__ __forceinline__ void store_kv<int8_t>(int8_t *cache, float *scales, int64_t vec, float x, float *scratch) {
+  const float amax = block_max(fabsf(x), scratch);
+  const float scale = amax / 127.0f;
+  const float q = scale > 0.0f ? fminf(fmaxf(rintf(x / scale), -127.0f), 127.0f) : 0.0f;
+  cache[vec * kHead + threadIdx.x] = static_cast<int8_t>(q);
+  if (threadIdx.x == 0) scales[vec] = scale;
+}
+
+template <typename T>
+__global__ void __launch_bounds__(kHead) attn_prep_kernel(half *q_out, T *k_cache, T *v_cache, float *k_scale,
+                                                          float *v_scale, const half *qkv, int ld,
+                                                          const float *q_norm, const float *k_norm,
                                                           const int64_t *positions, int64_t pos_stride,
                                                           const float *inv_freq, int s1, int s2, int rotary_dim,
                                                           const int *slots, int hq, int hkv, float eps) {
@@ -58,16 +92,62 @@ __global__ void __launch_bounds__(kHead) attn_prep_kernel(half *q_out, half *k_c
   if (is_q) {
     q_out[(static_cast<int64_t>(t) * hq + head) * kHead + d] = out;
   } else {
-    const int64_t base = (static_cast<int64_t>(slots[t]) * hkv + kv) * kHead + d;
-    k_cache[base] = out;
-    v_cache[base] = row[2 * hq * kHead + hkv * kHead + kv * kHead + d];
+    const int64_t vec = static_cast<int64_t>(slots[t]) * hkv + kv;
+    store_kv<T>(k_cache, k_scale, vec, __half2float(out), scratch);
+    store_kv<T>(v_cache, v_scale, vec, __half2float(row[2 * hq * kHead + hkv * kHead + kv * kHead + d]), scratch);
   }
 }
 
+template <typename T>
+__device__ __forceinline__ void load_chunk(half (*dst)[kHead + 8], const T *cache, const float *scales,
+                                           const int *table, int c0, int n, int block_size, int hkv, int kh);
+
+template <>
+__device__ __forceinline__ void load_chunk<half>(half (*dst)[kHead + 8], const half *cache, const float *,
+                                                 const int *table, int c0, int n, int block_size, int hkv, int kh) {
+  for (int e = threadIdx.x; e < n * (kHead / 8); e += kHead) {
+    const int j = e / (kHead / 8);
+    const int part = e % (kHead / 8);
+    const int pos = c0 + j;
+    const int64_t slot = static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
+    *reinterpret_cast<uint4 *>(&dst[j][part * 8]) =
+        *reinterpret_cast<const uint4 *>(cache + (slot * hkv + kh) * kHead + part * 8);
+  }
+}
+
+template <>
+__device__ __forceinline__ void load_chunk<int8_t>(half (*dst)[kHead + 8], const int8_t *cache, const float *scales,
+                                                   const int *table, int c0, int n, int block_size, int hkv,
+                                                   int kh) {
+  for (int e = threadIdx.x; e < n * (kHead / 16); e += kHead) {
+    const int j = e / (kHead / 16);
+    const int part = e % (kHead / 16);
+    const int pos = c0 + j;
+    const int64_t slot = static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
+    const int64_t vec = slot * hkv + kh;
+    const float s = scales[vec];
+    const uint4 raw = *reinterpret_cast<const uint4 *>(cache + vec * kHead + part * 16);
+    const uint32_t w[4] = {raw.x, raw.y, raw.z, raw.w};
+    uint32_t h[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const half2 lo = __floats2half2_rn(static_cast<float>(static_cast<int8_t>(w[i] & 0xff)) * s,
+                                         static_cast<float>(static_cast<int8_t>((w[i] >> 8) & 0xff)) * s);
+      const half2 hi = __floats2half2_rn(static_cast<float>(static_cast<int8_t>((w[i] >> 16) & 0xff)) * s,
+                                         static_cast<float>(static_cast<int8_t>(w[i] >> 24)) * s);
+      h[2 * i] = *reinterpret_cast<const uint32_t *>(&lo);
+      h[2 * i + 1] = *reinterpret_cast<const uint32_t *>(&hi);
+    }
+    *reinterpret_cast<uint4 *>(&dst[j][part * 16]) = make_uint4(h[0], h[1], h[2], h[3]);
+    *reinterpret_cast<uint4 *>(&dst[j][part * 16 + 8]) = make_uint4(h[4], h[5], h[6], h[7]);
+  }
+}
+
+template <typename T>
 __global__ void __launch_bounds__(kHead) decode_attention_kernel(
-    float *partial_o, float *partial_ml, const half *q, const half *k_cache, const half *v_cache,
-    const int *block_tables, int table_width, const int *query_start, const int *context_lens, int block_size,
-    int hq, int hkv, int blocks_per_split, int max_splits, float scale) {
+    float *partial_o, float *partial_ml, const half *q, const T *k_cache, const T *v_cache, const float *k_scale,
+    const float *v_scale, const int *block_tables, int table_width, const int *query_start, const int *context_lens,
+    int block_size, int hq, int hkv, int blocks_per_split, int max_splits, float scale) {
   __shared__ half qs[kMaxRows][kHead];
   __shared__ half kvs[kChunk][kHead + 8];
   __shared__ float p[kMaxRows][kChunk];
@@ -113,14 +193,7 @@ __global__ void __launch_bounds__(kHead) decode_attention_kernel(
 
   for (int c0 = first; c0 < last; c0 += kChunk) {
     const int n = min(kChunk, last - c0);
-    for (int e = tid; e < n * (kHead / 8); e += kHead) {
-      const int j = e / (kHead / 8);
-      const int part = e % (kHead / 8);
-      const int pos = c0 + j;
-      const int64_t slot = static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
-      *reinterpret_cast<uint4 *>(&kvs[j][part * 8]) =
-          *reinterpret_cast<const uint4 *>(k_cache + (slot * hkv + kh) * kHead + part * 8);
-    }
+    load_chunk<T>(kvs, k_cache, k_scale, table, c0, n, block_size, hkv, kh);
     __syncthreads();
     for (int e = tid; e < rows * kChunk; e += kHead) {
       const int r = e / kChunk;
@@ -154,14 +227,7 @@ __global__ void __launch_bounds__(kHead) decode_attention_kernel(
       row_l[r] = l;
       row_scale[r] = corr;
     }
-    for (int e = tid; e < n * (kHead / 8); e += kHead) {
-      const int j = e / (kHead / 8);
-      const int part = e % (kHead / 8);
-      const int pos = c0 + j;
-      const int64_t slot = static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
-      *reinterpret_cast<uint4 *>(&kvs[j][part * 8]) =
-          *reinterpret_cast<const uint4 *>(v_cache + (slot * hkv + kh) * kHead + part * 8);
-    }
+    load_chunk<T>(kvs, v_cache, v_scale, table, c0, n, block_size, hkv, kh);
     __syncthreads();
 #pragma unroll
     for (int r = 0; r < kMaxRows; ++r) {
@@ -209,23 +275,31 @@ __global__ void __launch_bounds__(kHead) attention_combine_kernel(half *out, con
 }  // namespace
 }  // namespace seventy
 
-SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, const void *qkv, int ld,
-                                  const float *q_norm, const float *k_norm, const int64_t *positions,
-                                  int64_t pos_stride, const float *inv_freq, int section1, int section2,
-                                  int rotary_dim, const int *slots, int tokens, int hq, int hkv, int head_dim,
-                                  float eps, cudaStream_t stream) {
+SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, float *k_scale, float *v_scale,
+                                  int kv_type, const void *qkv, int ld, const float *q_norm, const float *k_norm,
+                                  const int64_t *positions, int64_t pos_stride, const float *inv_freq, int section1,
+                                  int section2, int rotary_dim, const int *slots, int tokens, int hq, int hkv,
+                                  int head_dim, float eps, cudaStream_t stream) {
   using namespace seventy;
   if (q_out == nullptr || k_cache == nullptr || v_cache == nullptr || qkv == nullptr || q_norm == nullptr ||
       k_norm == nullptr || positions == nullptr || inv_freq == nullptr || slots == nullptr)
     return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (kv_type != 0 && (kv_type != 1 || k_scale == nullptr || v_scale == nullptr)) return SEVENTY_ERR_INVALID_ARGUMENT;
   if (head_dim != kHead || rotary_dim <= 0 || rotary_dim > kHead || rotary_dim % 2 || hq <= 0 || hkv <= 0 ||
       tokens < 0)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (tokens == 0) return SEVENTY_OK;
-  attn_prep_kernel<<<dim3(tokens, hq + hkv), kHead, 0, stream>>>(
-      static_cast<half *>(q_out), static_cast<half *>(k_cache), static_cast<half *>(v_cache),
-      static_cast<const half *>(qkv), ld, q_norm, k_norm, positions, pos_stride, inv_freq, section1, section2,
-      rotary_dim, slots, hq, hkv, eps);
+  if (kv_type == 1) {
+    attn_prep_kernel<int8_t><<<dim3(tokens, hq + hkv), kHead, 0, stream>>>(
+        static_cast<half *>(q_out), static_cast<int8_t *>(k_cache), static_cast<int8_t *>(v_cache), k_scale, v_scale,
+        static_cast<const half *>(qkv), ld, q_norm, k_norm, positions, pos_stride, inv_freq, section1, section2,
+        rotary_dim, slots, hq, hkv, eps);
+  } else {
+    attn_prep_kernel<half><<<dim3(tokens, hq + hkv), kHead, 0, stream>>>(
+        static_cast<half *>(q_out), static_cast<half *>(k_cache), static_cast<half *>(v_cache), nullptr, nullptr,
+        static_cast<const half *>(qkv), ld, q_norm, k_norm, positions, pos_stride, inv_freq, section1, section2,
+        rotary_dim, slots, hq, hkv, eps);
+  }
   return launch_status();
 }
 
@@ -234,7 +308,8 @@ SEVENTY_API int64_t seventy_decode_attention_workspace(int tokens, int hq, int s
 }
 
 SEVENTY_API int seventy_decode_attention(void *out, const void *q, const void *k_cache, const void *v_cache,
-                                         const void *qkv, int ld, const int *block_tables, int table_width,
+                                         const float *k_scale, const float *v_scale, int kv_type, const void *qkv,
+                                         int ld, const int *block_tables, int table_width,
                                          const int *query_start, const int *context_lens, int num_seqs, int tokens,
                                          int max_query_len, int block_size, int hq, int hkv, int head_dim, int splits,
                                          int blocks_per_split, float scale, void *workspace, int64_t workspace_bytes,
@@ -247,12 +322,22 @@ SEVENTY_API int seventy_decode_attention(void *out, const void *q, const void *k
       block_size < 1)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (workspace_bytes < seventy_decode_attention_workspace(tokens, hq, splits)) return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (kv_type != 0 && (kv_type != 1 || k_scale == nullptr || v_scale == nullptr)) return SEVENTY_ERR_INVALID_ARGUMENT;
   if (num_seqs == 0 || tokens == 0) return SEVENTY_OK;
   auto *po = static_cast<float *>(workspace);
   auto *pml = po + static_cast<int64_t>(tokens) * hq * splits * kHead;
-  decode_attention_kernel<<<dim3(splits, num_seqs, hkv), kHead, 0, stream>>>(
-      po, pml, static_cast<const half *>(q), static_cast<const half *>(k_cache), static_cast<const half *>(v_cache),
-      block_tables, table_width, query_start, context_lens, block_size, hq, hkv, blocks_per_split, splits, scale);
+  const dim3 grid(splits, num_seqs, hkv);
+  if (kv_type == 1) {
+    decode_attention_kernel<int8_t><<<grid, kHead, 0, stream>>>(
+        po, pml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
+        static_cast<const int8_t *>(v_cache), k_scale, v_scale, block_tables, table_width, query_start, context_lens,
+        block_size, hq, hkv, blocks_per_split, splits, scale);
+  } else {
+    decode_attention_kernel<half><<<grid, kHead, 0, stream>>>(
+        po, pml, static_cast<const half *>(q), static_cast<const half *>(k_cache), static_cast<const half *>(v_cache),
+        nullptr, nullptr, block_tables, table_width, query_start, context_lens, block_size, hq, hkv, blocks_per_split,
+        splits, scale);
+  }
   attention_combine_kernel<<<dim3(tokens, hq), kHead, 0, stream>>>(static_cast<half *>(out), po, pml,
                                                                    static_cast<const half *>(qkv), ld, hq, splits);
   return launch_status();

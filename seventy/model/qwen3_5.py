@@ -58,15 +58,17 @@ class AttentionLayer:
         t, d = x.shape[0], self.head_dim
         qkv = self.qkv(x)
         if qkv.is_cuda and d == 256:
+            ks, vs = cache.k_scale.get(layer), cache.v_scale.get(layer)
             q = kernels.attn_prep(qkv, self.q_norm, self.k_norm, step.positions, self.inv_freq, self.section,
-                                  step.kv_slots_t, cache.k[layer], cache.v[layer], self.heads, self.kv_heads, self.eps)
+                                  step.kv_slots_t, cache.k[layer], cache.v[layer], self.heads, self.kv_heads, self.eps,
+                                  ks, vs)
             if (self.heads // self.kv_heads) * step.max_query_len <= 64:
                 o = kernels.decode_attention(q, qkv, cache.k[layer], cache.v[layer], step.block_tables,
                                              step.query_start_t, step.context_lens_t, step.max_query_len,
-                                             step.max_blocks, self.scale)
+                                             step.max_blocks, self.scale, ks, vs)
             else:
                 o = ops.paged_attention(q, cache.k[layer], cache.v[layer], step.query_start, step.context_lens,
-                                        step.block_tables, self.scale)
+                                        step.block_tables, self.scale, ks, vs)
                 o = ops.sigmoid_gate(o.reshape(t, self.heads * d), qkv[:, : 2 * d * self.heads].view(
                     t, self.heads, 2, d)[:, :, 1].reshape(t, self.heads * d))
             return self.par.all_reduce(self.o_proj(o))
@@ -80,9 +82,10 @@ class AttentionLayer:
         cos, sin = rope
         q = ops.apply_rotary(q, cos, sin)
         k = ops.apply_rotary(k, cos, sin)
-        ops.write_kv(cache.k[layer], cache.v[layer], k, v, slots)
+        ks, vs = cache.k_scale.get(layer), cache.v_scale.get(layer)
+        ops.write_kv(cache.k[layer], cache.v[layer], k, v, slots, ks, vs)
         o = ops.paged_attention(q, cache.k[layer], cache.v[layer], step.query_start, step.context_lens,
-                                step.block_tables, self.scale)
+                                step.block_tables, self.scale, ks, vs)
         o = ops.sigmoid_gate(o.reshape(t, self.heads * d), gate)
         return self.par.all_reduce(self.o_proj(o))
 

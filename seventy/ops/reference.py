@@ -85,8 +85,24 @@ def kv_slots(
     return torch.cat(slots) if slots else torch.empty(0, dtype=torch.long, device=block_tables.device)
 
 
-def write_kv(k_cache: torch.Tensor, v_cache: torch.Tensor, k: torch.Tensor, v: torch.Tensor, slots: torch.Tensor):
-    """Store k and v [T, Hkv, D] in the paged caches [blocks, block_size, Hkv, D]."""
+def quantize_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """int8 values and FP32 scales of the vectors in the last dimension: scale = max |x| / 127, q = round(x / scale)."""
+    f = x.float()
+    scale = f.abs().amax(-1) / 127.0
+    q = torch.where(scale[..., None] > 0, torch.round(f / scale[..., None].clamp(min=1e-38)), torch.zeros_like(f))
+    return q.clamp(-127, 127).to(torch.int8), scale
+
+
+def write_kv(k_cache: torch.Tensor, v_cache: torch.Tensor, k: torch.Tensor, v: torch.Tensor, slots: torch.Tensor,
+             k_scale: torch.Tensor | None = None, v_scale: torch.Tensor | None = None):
+    """Store k and v [T, Hkv, D] in the paged caches [blocks, block_size, Hkv, D]. int8 caches also take the
+    scales [blocks, block_size, Hkv]."""
+    if k_cache.dtype == torch.int8:
+        for cache, scales, x in ((k_cache, k_scale, k), (v_cache, v_scale, v)):
+            q, s = quantize_int8(x)
+            cache.view(-1, *cache.shape[2:])[slots] = q
+            scales.view(-1, scales.shape[-1])[slots] = s
+        return
     k_cache.view(-1, *k_cache.shape[2:])[slots] = k.to(k_cache.dtype)
     v_cache.view(-1, *v_cache.shape[2:])[slots] = v.to(v_cache.dtype)
 
@@ -99,6 +115,8 @@ def paged_attention(
     context_lens: list[int],
     block_tables: torch.Tensor,
     scale: float,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Causal attention of q [T, Hq, D] over each sequence's cached tokens, which include the new tokens."""
     block_size = k_cache.shape[1]
@@ -112,8 +130,13 @@ def paged_attention(
         total = context_lens[b] + n
         pos = torch.arange(total, device=q.device)
         slots = block_tables[b, pos // block_size].long() * block_size + pos % block_size
-        k = k_cache.view(-1, hkv, k_cache.shape[-1])[slots].float().repeat_interleave(hq // hkv, dim=1)
-        v = v_cache.view(-1, hkv, v_cache.shape[-1])[slots].float().repeat_interleave(hq // hkv, dim=1)
+        k = k_cache.view(-1, hkv, k_cache.shape[-1])[slots].float()
+        v = v_cache.view(-1, hkv, v_cache.shape[-1])[slots].float()
+        if k_cache.dtype == torch.int8:
+            k = k * k_scale.view(-1, hkv)[slots][..., None]
+            v = v * v_scale.view(-1, hkv)[slots][..., None]
+        k = k.repeat_interleave(hq // hkv, dim=1)
+        v = v.repeat_interleave(hq // hkv, dim=1)
         scores = torch.einsum("thd,shd->hts", q[s:e].float(), k) * scale
         qpos = torch.arange(context_lens[b], total, device=q.device)
         scores.masked_fill_(pos[None, None, :] > qpos[None, :, None], float("-inf"))
