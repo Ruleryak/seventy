@@ -9,8 +9,37 @@ from ..nvfp4 import Nvfp4Weight
 from . import kernels, reference
 from ._lib import KernelError
 from ._lib import available as kernels_available
+from .reference import (
+    apply_rotary,
+    causal_conv1d,
+    gated_delta_rule,
+    gated_rms_norm,
+    gdn_gates,
+    kv_slots,
+    paged_attention,
+    rotary_cos_sin,
+    sigmoid_gate,
+    silu_mul,
+    write_kv,
+)
 
-__all__ = ["KernelError", "kernels_available", "nvfp4_dequantize", "rms_norm"]
+__all__ = [
+    "KernelError",
+    "apply_rotary",
+    "causal_conv1d",
+    "gated_delta_rule",
+    "gated_rms_norm",
+    "gdn_gates",
+    "kernels_available",
+    "kv_slots",
+    "nvfp4_dequantize",
+    "paged_attention",
+    "rms_norm",
+    "rotary_cos_sin",
+    "sigmoid_gate",
+    "silu_mul",
+    "write_kv",
+]
 
 
 def rms_norm(

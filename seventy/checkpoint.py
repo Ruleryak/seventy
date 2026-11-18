@@ -78,6 +78,32 @@ class Checkpoint:
             global_scale=float(self.tensor(f"{module}.weight_global_scale").reshape(-1)[0]),
         )
 
+    def nvfp4_part(
+        self, module: str, rows: tuple[int, int] | None = None, cols: tuple[int, int] | None = None
+    ) -> Nvfp4Weight:
+        """Rows and columns [start, stop) of an NVFP4 weight, read without loading the rest of it."""
+        n, half_k = self.shape(f"{module}.weight_packed")
+        r0, r1 = rows if rows is not None else (0, n)
+        c0, c1 = cols if cols is not None else (0, 2 * half_k)
+        if c0 % 16 or c1 % 16:
+            raise ValueError(f"column slice [{c0}, {c1}) of {module} is not aligned to groups of 16")
+        packed = self._handle(f"{module}.weight_packed").get_slice(f"{module}.weight_packed")[r0:r1, c0 // 2 : c1 // 2]
+        scales = self._handle(f"{module}.weight_scale").get_slice(f"{module}.weight_scale")[r0:r1, c0 // 16 : c1 // 16]
+        return Nvfp4Weight(
+            packed=packed.contiguous(),
+            scales=scales.contiguous().view(torch.uint8),
+            global_scale=float(self.tensor(f"{module}.weight_global_scale").reshape(-1)[0]),
+        )
+
+    def dense_part(
+        self, name: str, rows: tuple[int, int] | None = None, cols: tuple[int, int] | None = None
+    ) -> torch.Tensor:
+        """Rows and columns [start, stop) of a dense tensor of two or more dimensions."""
+        shape = self.shape(name)
+        r0, r1 = rows if rows is not None else (0, shape[0])
+        c0, c1 = cols if cols is not None else (0, shape[1])
+        return self._handle(name).get_slice(name)[r0:r1, c0:c1]
+
     def close(self) -> None:
         self._handles.clear()
 
