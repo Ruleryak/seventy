@@ -11,6 +11,7 @@ import torch
 class Parallel:
     rank: int = 0
     size: int = 1
+    custom: object = None
 
     def span(self, total: int) -> tuple[int, int]:
         """This rank's [start, stop) of `total` items split evenly over the ranks."""
@@ -24,6 +25,15 @@ class Parallel:
             return x
         torch.distributed.all_reduce(x)
         return x
+
+
+    def reduce_norm(self, x: torch.Tensor, weight: torch.Tensor, eps: float, residual: torch.Tensor | None):
+        """(rms_norm(residual + all_reduce(x)) * weight, new residual): x holds this rank's partial sums."""
+        from . import ops
+
+        if self.size > 1 and self.custom is not None and residual is not None and self.custom.fits(x):
+            return self.custom.norm(x, residual, weight, eps)
+        return ops.rms_norm(self.all_reduce(x), weight, eps, residual)
 
 
 SINGLE = Parallel()

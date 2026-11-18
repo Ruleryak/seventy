@@ -26,6 +26,13 @@ def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None
     cfg = load_config(Path(model_path))
     with Checkpoint(Path(model_path)) as ckpt:
         model = Qwen35TextModel(cfg, ckpt, device, dtype, par=Parallel(rank, size), layers=layers)
+    if size > 1 and torch.device(device).type == "cuda" and os.environ.get("SEVENTY_CUSTOM_ALLREDUCE", "1") != "0":
+        import dataclasses
+
+        from .allreduce import CustomAllReduce
+
+        model.par = dataclasses.replace(model.par, custom=CustomAllReduce(rank, size, torch.device(device),
+                                                                          dim=cfg.text.hidden_size))
     return cfg, model
 
 

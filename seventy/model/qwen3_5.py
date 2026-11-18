@@ -70,7 +70,7 @@ class AttentionLayer:
                 o = kernels.flash_attention(q, qkv, cache.k[layer], cache.v[layer], step.block_tables,
                                             step.query_start, step.query_start_t, step.context_lens_t, self.scale,
                                             ks, vs)
-            return self.par.all_reduce(self.o_proj(o))
+            return self.o_proj(o)
         qg = qkv[:, : 2 * d * self.heads].view(t, self.heads, 2, d)
         q = qg[:, :, 0].contiguous()
         gate = qg[:, :, 1].reshape(t, self.heads * d)
@@ -86,7 +86,7 @@ class AttentionLayer:
         o = ops.paged_attention(q, cache.k[layer], cache.v[layer], step.query_start, step.context_lens,
                                 step.block_tables, self.scale, ks, vs)
         o = ops.sigmoid_gate(o.reshape(t, self.heads * d), gate)
-        return self.par.all_reduce(self.o_proj(o))
+        return self.o_proj(o)
 
 
 class GatedDeltaNetLayer:
@@ -127,7 +127,7 @@ class GatedDeltaNetLayer:
                                       step.state_slots_t, self.hk, self.hv, self.eps, commit=stash is None)
             if stash is not None:
                 stash[layer] = y
-            return self.par.all_reduce(self.out_proj(o))
+            return self.out_proj(o)
         conv_dim = 2 * key + val
         qkv = ops.causal_conv1d(y[:, :conv_dim].contiguous(), self.conv_weight, cache.conv[layer],
                                 step.query_start, step.context_lens, step.state_slots)
@@ -145,7 +145,7 @@ class GatedDeltaNetLayer:
             o = ops.gated_delta_rule(q, k, v, g, beta, cache.state[layer], step.query_start, step.context_lens,
                                      step.state_slots)
         o = ops.gated_rms_norm(o.reshape(t * self.hv, self.dv), z.reshape(t * self.hv, self.dv), self.norm, self.eps)
-        return self.par.all_reduce(self.out_proj(o.view(t, val)))
+        return self.out_proj(o.view(t, val))
 
 
 class MLP:
@@ -157,7 +157,7 @@ class MLP:
         self.par = par
 
     def __call__(self, x):
-        return self.par.all_reduce(self.down(ops.silu_mul(self.gate_up(x))))
+        return self.down(ops.silu_mul(self.gate_up(x)))
 
 
 class Layer:
@@ -253,10 +253,10 @@ class Qwen35TextModel:
                 x = layer.mixer(x, step, cache, i, rope, slots, stash)
             else:
                 x = layer.mixer(x, step, cache, i, rope, slots)
-            x, residual = ops.rms_norm(x, layer.post_norm, t.rms_norm_eps, residual)
+            x, residual = self.par.reduce_norm(x, layer.post_norm, t.rms_norm_eps, residual)
             x = layer.mlp(x)
             nxt = self.layers[i + 1].input_norm if i + 1 < len(self.layers) else self.final_norm
-            x, residual = ops.rms_norm(x, nxt, t.rms_norm_eps, residual)
+            x, residual = self.par.reduce_norm(x, nxt, t.rms_norm_eps, residual)
             if i in capture:
                 captured[i] = residual.clone()
         return self.logits(x[step.logit_rows]), captured

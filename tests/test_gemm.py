@@ -67,3 +67,17 @@ def test_pack_blocks_agree():
     a = nvfp4.pack_for_gemm([p.to("cuda") for p in parts], block_rows=32)
     b = nvfp4.pack_for_gemm([p.to("cuda") for p in parts], block_rows=4096)
     assert torch.equal(a.wpk, b.wpk) and torch.equal(a.wsc, b.wsc) and torch.equal(a.alpha, b.alpha)
+
+
+@pytest.mark.parametrize("m", [1, 8, 13, 56])
+@pytest.mark.parametrize("n, k", [(100, 64), (1024, 5120), (5120, 1024)])
+def test_dense_gemm_matches_reference(m, n, k):
+    torch.manual_seed(m + n + k)
+    w = (torch.randn(n, k) * 0.05).half()
+    x = torch.randn(m, k).half()
+    packed = kernels.DenseWeight(w.cuda())
+    ref = x.float() @ w.float().T
+    out = kernels.dense_gemm(x.cuda(), packed).cpu()
+    assert (out - ref).abs().max().item() <= 1e-3 * ref.abs().max().item() + 1e-3
+    out16 = kernels.dense_gemm(x.cuda(), packed, out_fp32=False).cpu().float()
+    assert (out16 - ref).abs().max().item() <= 2e-3 * ref.abs().max().item() + 1e-3

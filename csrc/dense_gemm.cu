@@ -1,0 +1,190 @@
+#include "common.cuh"
+
+/*
+ * FP16 weight GEMM for small batches (1 to 64 rows): out[m, n] = sum_k x[m, k] * w[n, k], FP32 accumulation, FP32 or
+ * FP16 output. Same structure as csrc/nvfp4_gemm.cu: a warp owns 32 output columns (mma.m8n8k4 B fragments, layout
+ * there), the block stages 64-wide k steps of the activations in shared memory, and k splits go to an FP32
+ * workspace that a reduce kernel adds in split order.
+ *
+ * Weights are repacked at load (seventy.ops.kernels.pack_dense): [n_padded / 32, k / 64, 32 lanes, 64 halves]; a
+ * lane's 128 bytes are the 64 k values of its column, so a warp reads 4 KB of contiguous weights per step.
+ */
+
+namespace seventy {
+namespace {
+
+constexpr int kStepK = 64;
+constexpr int kRowStride = 9;
+
+__device__ __forceinline__ void mma_8x8x4(float (&c)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+
+template <int MT, int W>
+__global__ void __launch_bounds__(W * 32) dense_gemm_kernel(void *out, int out_fp32, float *ws, const half *x,
+                                                             const uint4 *wpk, int m, int n, int n_tiles, int k,
+                                                             int steps_per_split) {
+  __shared__ uint4 smem[2][MT * 8 * kRowStride];
+  constexpr int kRows = MT * 8;
+  constexpr int kLoads = (kRows * 8 + W * 32 - 1) / (W * 32);
+  const int lane = threadIdx.x & 31;
+  const int tile = blockIdx.x * W + (threadIdx.x >> 5);
+  const bool active = tile < n_tiles;
+  const int ksteps = k / kStepK;
+  const int s0 = blockIdx.y * steps_per_split;
+  const int s1 = min(ksteps, s0 + steps_per_split);
+  const int steps = s1 - s0;
+  const int quad = (lane >> 2) & 3;
+  const int idx = (lane & 3) + ((lane >> 4) << 2);
+  const uint4 *wp = wpk + (static_cast<int64_t>(active ? tile : 0) * ksteps + s0) * 32 * 8 + lane * 8;
+
+  float acc[MT][8];
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[t][j] = 0.0f;
+
+  auto load_a = [&](uint4 (&r)[kLoads], int kbase) {
+#pragma unroll
+    for (int l = 0; l < kLoads; ++l) {
+      const int e = threadIdx.x + l * W * 32;
+      const int row = e >> 3;
+      r[l] = make_uint4(0, 0, 0, 0);
+      if (row < m && e < kRows * 8)
+        r[l] = __ldg(reinterpret_cast<const uint4 *>(x + static_cast<int64_t>(row) * k + kbase + (e & 7) * 8));
+    }
+  };
+  auto store_a = [&](uint4 *stage, const uint4 (&r)[kLoads]) {
+#pragma unroll
+    for (int l = 0; l < kLoads; ++l) {
+      const int e = threadIdx.x + l * W * 32;
+      if (e < kRows * 8) stage[(e >> 3) * kRowStride + (e & 7)] = r[l];
+    }
+  };
+
+  uint4 ar[kLoads];
+  load_a(ar, s0 * kStepK);
+  store_a(smem[0], ar);
+  __syncthreads();
+  uint4 wb[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) wb[i] = active ? __ldg(wp + i) : make_uint4(0, 0, 0, 0);
+
+  for (int s = 0; s < steps; ++s) {
+    const bool more = s + 1 < steps;
+    if (more) load_a(ar, (s0 + s + 1) * kStepK);
+    uint4 cur[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) cur[i] = wb[i];
+    if (active && more) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) wb[i] = __ldg(wp + static_cast<int64_t>(s + 1) * 32 * 8 + i);
+    }
+    if (active) {
+      const uint4 *stage = smem[s & 1];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          const uint4 a = stage[(t * 8 + idx) * kRowStride + i];
+          mma_8x8x4(acc[t], a.x, a.y, cur[i].x, cur[i].y);
+          mma_8x8x4(acc[t], a.z, a.w, cur[i].z, cur[i].w);
+        }
+      }
+    }
+    if (more) store_a(smem[(s + 1) & 1], ar);
+    __syncthreads();
+  }
+  if (!active) return;
+  const int n_padded = n_tiles * 32;
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int row = t * 8 + (idx & 1) + 2 * ((j >> 1) & 1) + 4 * (idx >> 2);
+      const int col = tile * 32 + quad * 8 + (j & 1) + 2 * ((idx >> 1) & 1) + 4 * (j >> 2);
+      if (row >= m) continue;
+      if (gridDim.y == 1) {
+        if (col < n) {
+          if (out_fp32) static_cast<float *>(out)[static_cast<int64_t>(row) * n + col] = acc[t][j];
+          else static_cast<half *>(out)[static_cast<int64_t>(row) * n + col] = __float2half_rn(acc[t][j]);
+        }
+      } else {
+        ws[(static_cast<int64_t>(blockIdx.y) * m + row) * n_padded + col] = acc[t][j];
+      }
+    }
+}
+
+__global__ void dense_reduce_kernel(void *out, int out_fp32, const float *ws, int m, int n, int n_padded, int splits) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= static_cast<int64_t>(m) * n) return;
+  const int row = static_cast<int>(idx / n);
+  const int col = static_cast<int>(idx % n);
+  float s = 0.0f;
+  for (int p = 0; p < splits; ++p) s += ws[(static_cast<int64_t>(p) * m + row) * n_padded + col];
+  if (out_fp32) static_cast<float *>(out)[idx] = s;
+  else static_cast<half *>(out)[idx] = __float2half_rn(s);
+}
+
+template <int MT>
+int launch(int warps, void *out, int out_fp32, float *ws, const half *x, const uint4 *wpk, int m, int n, int n_tiles,
+           int k, int splits, cudaStream_t stream) {
+  const int ksteps = k / kStepK;
+  const int per = (ksteps + splits - 1) / splits;
+  const int used = (ksteps + per - 1) / per;
+  if (warps >= 8) {
+    dense_gemm_kernel<MT, 8><<<dim3((n_tiles + 7) / 8, used), 256, 0, stream>>>(out, out_fp32, ws, x, wpk, m, n,
+                                                                                  n_tiles, k, per);
+  } else {
+    dense_gemm_kernel<MT, 4><<<dim3((n_tiles + 3) / 4, used), 128, 0, stream>>>(out, out_fp32, ws, x, wpk, m, n,
+                                                                                  n_tiles, k, per);
+  }
+  return used;
+}
+
+}  // namespace
+}  // namespace seventy
+
+SEVENTY_API int64_t seventy_dense_gemm_workspace(int m, int n_padded, int splits) {
+  return splits > 1 ? static_cast<int64_t>(splits) * m * n_padded * static_cast<int64_t>(sizeof(float)) : 0;
+}
+
+SEVENTY_API int seventy_dense_gemm(void *out, int out_fp32, const void *x, const void *wpk, int m, int n, int n_padded,
+                                   int k, int splits, int warps, void *workspace, int64_t workspace_bytes,
+                                   cudaStream_t stream) {
+  using namespace seventy;
+  if (out == nullptr || x == nullptr || wpk == nullptr || m <= 0 || m > 64 || n <= 0 || n_padded < n ||
+      n_padded % 32 || k <= 0 || k % kStepK || splits < 1)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  const int ksteps = k / kStepK;
+  const int per = (ksteps + splits - 1) / splits;
+  const int used = (ksteps + per - 1) / per;
+  if (used > 1 && (workspace == nullptr || workspace_bytes < seventy_dense_gemm_workspace(m, n_padded, used)))
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (!aligned(x, 16) || !aligned(wpk, 16)) return SEVENTY_ERR_MISALIGNED;
+  const int n_tiles = n_padded / 32;
+  auto *ws = static_cast<float *>(workspace);
+  const auto *xh = static_cast<const half *>(x);
+  const auto *wp = static_cast<const uint4 *>(wpk);
+  int got = 0;
+  switch ((m + 7) / 8) {
+    case 1: got = launch<1>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
+    case 2: got = launch<2>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
+    case 3: got = launch<3>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
+    case 4: got = launch<4>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
+    case 5: got = launch<5>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
+    case 6: got = launch<6>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
+    case 7: got = launch<7>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
+    default: got = launch<8>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
+  }
+  if (got > 1) {
+    const int64_t total = static_cast<int64_t>(m) * n;
+    dense_reduce_kernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0, stream>>>(out, out_fp32, ws, m, n,
+                                                                                       n_padded, got);
+  }
+  return launch_status();
+}

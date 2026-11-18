@@ -152,3 +152,28 @@ SEVENTY_API int seventy_verify_attention(void *out, const void *q, const void *k
                                          int block_size, int hq, int hkv, int head_dim, int splits,
                                          int min_split_keys, float scale, void *workspace, int64_t workspace_bytes,
                                          cudaStream_t stream);
+
+/*
+ * Small-batch tensor-parallel all-reduce over peer GPU memory, fused with the residual add and RMS norm
+ * (see csrc/allreduce.cu). seventy_ar_alloc allocates this rank's buffer of seventy_ar_buffer_bytes() bytes and
+ * returns its 64-byte CUDA IPC handle; seventy_ar_open maps a peer's handle; seventy_ar_context builds the
+ * per-rank context from all ranks' buffer pointers (in rank order).
+ * seventy_ar_norm: s = all-reduce of x [rows, dim] (FP16, FP32 sum rounded once). With weight: residual += s
+ * (FP16), out = rms_norm(residual) * weight (residual may be null: out = rms_norm(s) * weight). Without weight:
+ * out = s. rows * dim * 2 must fit in slot_bytes. Every rank must make the same calls in the same order.
+ */
+SEVENTY_API int64_t seventy_ar_buffer_bytes(int world, int64_t slot_bytes);
+SEVENTY_API int seventy_ar_alloc(int64_t bytes, void **ptr, void *handle);
+SEVENTY_API int seventy_ar_open(const void *handle, void **ptr);
+SEVENTY_API int seventy_ar_context(int rank, int world, void *const *buffers, int64_t slot_bytes, void **ctx_out);
+SEVENTY_API int seventy_ar_norm(void *ctx, void *out, void *residual, const void *x, const float *weight, int rows,
+                                int dim, float eps, cudaStream_t stream);
+
+/*
+ * FP16 weight GEMM for 1 to 64 rows (see csrc/dense_gemm.cu): out[m, n] = x[m, k] w[n, k]^T, FP32 accumulation,
+ * FP32 output (out_fp32 = 1) or FP16. wpk: the weight repacked by seventy.ops.kernels.pack_dense.
+ */
+SEVENTY_API int64_t seventy_dense_gemm_workspace(int m, int n_padded, int splits);
+SEVENTY_API int seventy_dense_gemm(void *out, int out_fp32, const void *x, const void *wpk, int m, int n, int n_padded,
+                                   int k, int splits, int warps, void *workspace, int64_t workspace_bytes,
+                                   cudaStream_t stream);

@@ -128,6 +128,15 @@ class Drafter:
             self.pred = _to_dtype(ckpt.tensor("candidate_selector.predecessor_codebook"), dtype).to(device)
             self.succ = _to_dtype(ckpt.tensor("candidate_selector.successor_codebook"), dtype).to(device)
         self.kv_all = torch.cat([layer.kv_w for layer in self.layers])
+        if self.device.type == "cuda" and dtype == torch.float16:
+            from ..ops.kernels import DenseWeight
+
+            for layer in self.layers:
+                for name in ("q", "kv_w", "o", "gate_up", "down"):
+                    setattr(layer, name, DenseWeight(getattr(layer, name)))
+                layer.conv = {side: (base, DenseWeight(proj)) for side, (base, proj) in layer.conv.items()}
+            self.fc, self.kv_all, self.sel_hidden = DenseWeight(self.fc), DenseWeight(self.kv_all), DenseWeight(self.sel_hidden)
+            torch.cuda.empty_cache()
         self.k_ring = self.v_ring = None
         if num_slots:
             self.allocate(num_slots)
@@ -158,8 +167,15 @@ class Drafter:
         return out.to(self.dtype), (None if residual is None else s)
 
     @staticmethod
-    def _mm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """x (FP16) @ w^T with FP32 output."""
+    def _mm(x: torch.Tensor, w) -> torch.Tensor:
+        """x (FP16) @ w^T with FP32 output. Packed weights use the small-batch FP16 GEMM, 64 rows at a time."""
+        from ..ops.kernels import DenseWeight, dense_gemm
+
+        if isinstance(w, DenseWeight):
+            x = x.contiguous()
+            if x.shape[0] <= 64:
+                return dense_gemm(x, w)
+            return torch.cat([dense_gemm(x[i : i + 64], w) for i in range(0, x.shape[0], 64)])
         return torch.mm(x, w.T, out_dtype=torch.float32) if x.is_cuda else x.float() @ w.float().T
 
     def _mm_scaled(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:

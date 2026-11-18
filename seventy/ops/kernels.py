@@ -252,3 +252,37 @@ def flash_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v
     )
     check("flash_attention", code)
     return out
+
+
+class DenseWeight:
+    """An FP16 weight [n, k] repacked for seventy_dense_gemm: [n_padded / 32, k / 64, 32 lanes, 64 halves]."""
+
+    def __init__(self, w: torch.Tensor):
+        if w.dtype != torch.float16 or w.dim() != 2 or w.shape[1] % 64:
+            raise ValueError("dense GEMM weights must be FP16 [n, k] with k a multiple of 64")
+        n, k = w.shape
+        n_padded = -(-n // 32) * 32
+        padded = torch.zeros(n_padded, k, dtype=w.dtype, device=w.device)
+        padded[:n] = w
+        lanes = torch.tensor([8 * ((l >> 2) & 3) + (l & 3) + 4 * (l >= 16) for l in range(32)], device=w.device)
+        tiles = padded.view(n_padded // 32, 32, k // 64, 64)[:, lanes].permute(0, 2, 1, 3).contiguous()
+        self.wpk, self.n, self.k, self.n_padded = tiles, n, k, n_padded
+
+
+def dense_gemm(x: torch.Tensor, w: DenseWeight, out_fp32: bool = True) -> torch.Tensor:
+    _expect(x, "x", torch.float16)
+    m, k = x.shape
+    if k != w.k:
+        raise ValueError(f"x has k = {k}, the weight has k = {w.k}")
+    tiles = w.n_padded // 32
+    small = m <= 16
+    warps = 8 if small else 4
+    splits = max(1, min(round((1088 if small else 900) / tiles), max(1, (k // 64) // (4 if small else 8))))
+    need = lib().seventy_dense_gemm_workspace(m, w.n_padded, splits)
+    ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=x.device) if need else None
+    out = torch.empty(m, w.n, dtype=torch.float32 if out_fp32 else torch.float16, device=x.device)
+    code = lib().seventy_dense_gemm(out.data_ptr(), 1 if out_fp32 else 0, x.data_ptr(), w.wpk.data_ptr(), m, w.n,
+                                    w.n_padded, k, splits, warps, ws.data_ptr() if ws is not None else None,
+                                    need, _stream(x))
+    check("dense_gemm", code)
+    return out

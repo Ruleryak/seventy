@@ -127,6 +127,12 @@ __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
     __syncthreads();
     const float kv = decay * kn * (pair[0][v] + pair[1][v]);
     const float delta = beta * (vs[v] - kv);
+    if (out == nullptr) {
+#pragma unroll
+      for (int r = 0; r < kRows; ++r) S[r] = decay * S[r] + kn * ks[half_idx * kRows + r] * delta;
+      __syncthreads();
+      continue;
+    }
     float opart = 0.0f;
 #pragma unroll
     for (int r = 0; r < kRows; ++r) {
@@ -139,7 +145,7 @@ __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
     __syncthreads();
     const float o = round_half(qn * (pair[0][v] + pair[1][v]));
     const float sq_o = block_sum256(half_idx == 0 ? o * o : 0.0f, scratch);
-    if (half_idx == 0 && out != nullptr) {
+    if (half_idx == 0) {
       const float z = __half2float(row[conv_dim + h * kD + v]);
       const float r = o * rsqrtf(sq_o / kD + eps) * nw * (z / (1.0f + expf(-z)));
       out[static_cast<int64_t>(t0 + t) * hv * kD + h * kD + v] = __float2half_rn(r);
