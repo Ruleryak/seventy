@@ -76,7 +76,8 @@ def our_logprobs(model_path: Path, ids: list[int], device: str, dtype: torch.dty
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", required=True, type=Path)
-    ap.add_argument("--server", required=True)
+    ap.add_argument("--server", help="server URL; or use --reference")
+    ap.add_argument("--reference", type=Path, help="per-token JSON written earlier with --json (server values)")
     ap.add_argument("--served-name")
     ap.add_argument("--text-file", type=Path)
     ap.add_argument("--max-tokens", type=int, default=512)
@@ -88,9 +89,15 @@ def main() -> int:
     from tokenizers import Tokenizer
 
     text = a.text_file.read_text() if a.text_file else DEFAULT_TEXT
-    ids = Tokenizer.from_file(str(a.model / "tokenizer.json")).encode(text).ids[: a.max_tokens]
     dtype = getattr(torch, a.dtype) if a.dtype else (torch.float32 if a.device == "cpu" else torch.float16)
-    ref, ref_top = server_logprobs(a.server.rstrip("/"), a.served_name, ids)
+    if a.reference:
+        saved = json.loads(a.reference.read_text())
+        ids, ref, ref_top = saved["ids"], saved["server"], saved["server_top"]
+    elif a.server:
+        ids = Tokenizer.from_file(str(a.model / "tokenizer.json")).encode(text).ids[: a.max_tokens]
+        ref, ref_top = server_logprobs(a.server.rstrip("/"), a.served_name, ids)
+    else:
+        ap.error("give --server or --reference")
     ours, our_top, load_s, run_s = our_logprobs(a.model, ids, a.device, dtype, a.layers)
     diffs = [abs(x - y) for x, y in zip(ours, ref)]
     agree = sum(x == y for x, y in zip(our_top, ref_top)) / len(ref_top)
