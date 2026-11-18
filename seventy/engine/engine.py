@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import faulthandler
 import itertools
-import time
+import os
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+import torch.multiprocessing as mp
 
-from ..checkpoint import Checkpoint
 from ..config import ModelConfig, load_config
-from ..model.qwen3_5 import Qwen35TextModel
+from ..parallel import Parallel
+from . import distributed
 from .cache import ModelCache
 from .runner import ModelRunner
 from .sampling import RowState, SamplingParams, TokenLogprobs, logprobs_of, sample
@@ -29,6 +32,8 @@ class EngineConfig:
     prefill_budget: int = 4096
     kv_dtype: str = "int8"
     activation_reserve_gib: float = 3.0
+    tensor_parallel: int = 1
+    cuda_graphs: bool = True
 
 
 @dataclass
@@ -59,30 +64,61 @@ def bytes_per_slot(cfg: ModelConfig, tp: int = 1) -> int:
 class Engine:
     def __init__(self, config: EngineConfig):
         self.config = config
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+        tp = config.tensor_parallel
+        os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         self.device = torch.device(config.device)
         if self.device.type == "cuda" and self.device.index is None:
-            self.device = torch.device("cuda", torch.cuda.current_device())
+            self.device = torch.device("cuda", 0 if tp > 1 else torch.cuda.current_device())
         path = Path(config.model)
         self.model_config = load_config(path)
         torch.cuda.set_device(self.device)
-        with Checkpoint(path) as ckpt:
-            self.model = Qwen35TextModel(self.model_config, ckpt, self.device, torch.float16)
-        torch.cuda.synchronize()
+        reserve = int(config.activation_reserve_gib * 2**30)
         kv_dtype = torch.int8 if config.kv_dtype == "int8" else torch.float16
-        free, total = torch.cuda.mem_get_info(self.device)
-        budget = int(total * config.gpu_memory_utilization) - (total - free)
-        budget -= int(config.activation_reserve_gib * 2**30)
+        self.workers, peers = [], []
+        port = distributed.free_port()
+        if tp > 1:
+            ctx = mp.get_context("spawn")
+            for rank in range(1, tp):
+                parent, child = ctx.Pipe()
+                p = ctx.Process(target=_worker_entry, daemon=True,
+                                args=(rank, tp, port, "nccl", f"cuda:{rank}", str(path), "float16",
+                                      config.gpu_memory_utilization, reserve, child))
+                p.start()
+                child.close()
+                self.workers.append(p)
+                peers.append(parent)
+            distributed.init(0, tp, port, "nccl")
+        from .worker import load_shard
+
+        _, self.model = load_shard(str(path), 0, tp, self.device, torch.float16)
+        torch.cuda.synchronize()
+        budgets = [distributed.memory_budget(self.device, config.gpu_memory_utilization, reserve)]
+        for conn, proc in zip(peers, self.workers):
+            budgets.append(_expect(conn, "ready", proc))
         slots = config.max_num_seqs
-        per_block = bytes_per_block(self.model_config, config.block_size, kv_dtype)
-        state = slots * bytes_per_slot(self.model_config)
-        num_blocks = (budget - state) // per_block
+        per_block = bytes_per_block(self.model_config, config.block_size, kv_dtype, tp)
+        state = slots * bytes_per_slot(self.model_config, tp)
+        num_blocks = (min(budgets) - state) // per_block
         need = -(-config.max_model_len // config.block_size)
         if num_blocks < min(need, 64):
             raise RuntimeError(f"not enough GPU memory for the KV cache ({num_blocks} blocks)")
         num_blocks = min(num_blocks, need * slots)
+        kv_name = "int8" if kv_dtype == torch.int8 else "float16"
+        for conn in peers:
+            conn.send(("init", num_blocks, config.block_size, slots, kv_name))
         self.cache = ModelCache(self.model_config.text, num_blocks, config.block_size, slots, torch.float16,
-                                self.device, kv_dtype=kv_dtype)
-        self.runner = ModelRunner(self.model, self.cache, self.device)
+                                self.device, par=Parallel(0, tp), kv_dtype=kv_dtype)
+        for conn, proc in zip(peers, self.workers):
+            _expect(conn, "ok", proc)
+        self.runner = ModelRunner(self.model, self.cache, self.device, peers)
+        if config.cuda_graphs:
+            from .graphs import BUCKETS
+
+            buckets = tuple(b for b in BUCKETS if b <= max(1, slots))
+            if slots not in buckets and slots <= 64:
+                buckets += (slots,)
+            self.runner.capture(need, buckets)
         self.scheduler = Scheduler(num_blocks, config.block_size, slots, config.max_model_len,
                                    prefill_budget=config.prefill_budget)
         self.eos = tuple(self.model_config.text.eos_token_ids)
@@ -165,7 +201,7 @@ class Engine:
         plan: Plan = self.scheduler.schedule()
         outputs: dict[str, RequestOutput] = {}
         if plan.decode:
-            self._sample(plan.decode, self.runner.run(plan.decode), outputs)
+            self._sample(plan.decode, self.runner.run_decode(plan.decode), outputs)
         if plan.prefill:
             self.stats["prompt_tokens"] += sum(w.count for w in plan.prefill)
             self._sample(plan.prefill, self.runner.run(plan.prefill), outputs)
@@ -183,6 +219,17 @@ class Engine:
             result.append(out)
         return result
 
+    def close(self) -> None:
+        """Stop the workers. Every rank tears its process group down at the same time (NCCL needs that)."""
+        self.runner.close()
+        self.runner.graphs = None
+        distributed.shutdown()
+        for p in self.workers:
+            p.join(timeout=60)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=10)
+
     def generate(self, prompts: list[list[int]], params: SamplingParams) -> list[list[int]]:
         """Run prompts to completion (offline use and tests). Returns the generated tokens of each prompt."""
         ids = [self.add_request(p, SamplingParams(**vars(params))) for p in prompts]
@@ -191,3 +238,28 @@ class Engine:
             for out in self.step():
                 done[out.id] += out.new_tokens
         return [done[i] for i in ids]
+
+
+def _worker_entry(*args):
+    from .worker import worker_main
+
+    worker_main(*args)
+
+
+def _expect(conn, kind: str, proc=None, timeout: float = 900.0):
+    waited = 0.0
+    while not conn.poll(5.0):
+        waited += 5.0
+        if proc is not None and not proc.is_alive():
+            raise RuntimeError(f"tensor-parallel worker {proc.name} exited with code {proc.exitcode}")
+        if waited >= timeout:
+            raise RuntimeError(f"no {kind!r} message from a tensor-parallel worker after {timeout:.0f} s")
+    try:
+        msg = conn.recv()
+    except EOFError:
+        raise RuntimeError("a tensor-parallel worker closed its pipe") from None
+    if msg[0] == "error":
+        raise RuntimeError(f"a tensor-parallel worker failed:\n{msg[1]}")
+    if msg[0] != kind:
+        raise RuntimeError(f"unexpected worker message {msg[0]!r}, wanted {kind!r}")
+    return msg[1]

@@ -187,11 +187,9 @@ def attn_prep(qkv: torch.Tensor, q_norm: torch.Tensor, k_norm: torch.Tensor, pos
     return q
 
 
-def decode_attention_splits(max_blocks: int, num_seqs: int, hkv: int, device: torch.device) -> tuple[int, int]:
-    """(splits, blocks per split): about two blocks per SM, at least 4 cache blocks per split."""
-    want = max(1, round(2 * _sm_count(device) / max(1, num_seqs * hkv)))
-    per = max(4, -(-max_blocks // want))
-    return max(1, -(-max_blocks // per)), per
+def decode_attention_splits(num_seqs: int, hkv: int, device: torch.device) -> int:
+    """Context splits per sequence: about two blocks per SM in total."""
+    return max(1, min(256, round(2 * _sm_count(device) / max(1, num_seqs * hkv))))
 
 
 def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
@@ -201,7 +199,9 @@ def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, 
     """Gated attention output [T, hq * 256] for steps with few new tokens per sequence."""
     t, hq, _ = q.shape
     hkv, block_size = k_cache.shape[2], k_cache.shape[1]
-    splits, per = decode_attention_splits(max_blocks, context_lens.numel(), hkv, q.device)
+    splits = decode_attention_splits(context_lens.numel(), hkv, q.device)
+    if max_blocks:
+        splits = max(1, min(splits, max_blocks // 2))
     need = lib().seventy_decode_attention_workspace(t, hq, splits)
     ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=q.device)
     out = torch.empty(t, hq * 256, dtype=torch.float16, device=q.device)
@@ -209,7 +209,7 @@ def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, 
     code = lib().seventy_decode_attention(
         out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), ks, vs, kind, qkv.data_ptr(), qkv.shape[1],
         block_tables.data_ptr(), block_tables.shape[1], query_start.data_ptr(), context_lens.data_ptr(),
-        context_lens.numel(), t, max_query_len, block_size, hq, hkv, 256, splits, per, scale, ws.data_ptr(),
+        context_lens.numel(), t, max_query_len, block_size, hq, hkv, 256, splits, scale, ws.data_ptr(),
         ws.numel() * 4, _stream(q),
     )
     check("decode_attention", code)

@@ -102,7 +102,8 @@ SEVENTY_API int64_t seventy_decode_attention_workspace(int tokens, int hq, int s
 
 /*
  * Causal attention for steps with few new tokens per sequence ((hq / hkv) * max_query_len <= 64), over the paged
- * caches (kv_type as in seventy_attn_prep), split over cache ranges of blocks_per_split blocks, then merged and
+ * caches (kv_type as in seventy_attn_prep), each sequence's cache split into `splits` equal ranges of blocks (so
+ * the launch does not depend on context lengths and can be captured in a CUDA graph), then merged and
  * multiplied by sigmoid(gate) (the gate half of each query head in qkv). out: FP16 [T, hq * 256]. block_tables:
  * int32 [num_seqs, table_width].
  */
@@ -111,8 +112,7 @@ SEVENTY_API int seventy_decode_attention(void *out, const void *q, const void *k
                                          int ld, const int *block_tables, int table_width,
                                          const int *query_start, const int *context_lens, int num_seqs, int tokens,
                                          int max_query_len, int block_size, int hq, int hkv, int head_dim, int splits,
-                                         int blocks_per_split, float scale, void *workspace, int64_t workspace_bytes,
-                                         cudaStream_t stream);
+                                         float scale, void *workspace, int64_t workspace_bytes, cudaStream_t stream);
 
 /*
  * Gated DeltaNet prefill, sequential part (see csrc/gdn_chunk.cu): one block per (sequence, value head) walks the

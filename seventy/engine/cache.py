@@ -22,7 +22,10 @@ class ModelCache:
         kv_dtype: torch.dtype | None = None,
     ):
         """kv_dtype: the attention KV cache format, torch.int8 (with per-token, per-head FP32 scales) or the activation
-        dtype. Default: int8 on CUDA, the activation dtype elsewhere."""
+        dtype. Default: int8 on CUDA, the activation dtype elsewhere.
+
+        One extra block (index num_blocks) and one extra state slot (index num_slots) take the writes of padding
+        rows in CUDA-graph steps."""
         self.block_size = block_size
         self.num_blocks = num_blocks
         self.num_slots = num_slots
@@ -38,16 +41,18 @@ class ModelCache:
         self.v_scale: dict[int, torch.Tensor] = {}
         self.conv: dict[int, torch.Tensor] = {}
         self.state: dict[int, torch.Tensor] = {}
+        self.scratch_block = num_blocks
+        self.scratch_slot = num_slots
         for layer in cfg.attention_layers:
-            shape = (num_blocks, block_size, kv_heads, cfg.head_dim)
+            shape = (num_blocks + 1, block_size, kv_heads, cfg.head_dim)
             self.k[layer] = torch.zeros(shape, dtype=self.kv_dtype, device=device)
             self.v[layer] = torch.zeros(shape, dtype=self.kv_dtype, device=device)
             if self.kv_dtype == torch.int8:
                 self.k_scale[layer] = torch.zeros(shape[:-1], dtype=torch.float32, device=device)
                 self.v_scale[layer] = torch.zeros(shape[:-1], dtype=torch.float32, device=device)
         for layer in cfg.linear_layers:
-            self.conv[layer] = torch.zeros(num_slots, conv_dim, cfg.conv_kernel - 1, dtype=dtype, device=device)
-            self.state[layer] = torch.zeros(num_slots, hv, cfg.gdn_k_dim, cfg.gdn_v_dim, dtype=torch.float32,
+            self.conv[layer] = torch.zeros(num_slots + 1, conv_dim, cfg.conv_kernel - 1, dtype=dtype, device=device)
+            self.state[layer] = torch.zeros(num_slots + 1, hv, cfg.gdn_k_dim, cfg.gdn_v_dim, dtype=torch.float32,
                                             device=device)
 
     def nbytes(self) -> int:

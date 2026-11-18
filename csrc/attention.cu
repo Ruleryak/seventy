@@ -147,7 +147,7 @@ template <typename T>
 __global__ void __launch_bounds__(kHead) decode_attention_kernel(
     float *partial_o, float *partial_ml, const half *q, const T *k_cache, const T *v_cache, const float *k_scale,
     const float *v_scale, const int *block_tables, int table_width, const int *query_start, const int *context_lens,
-    int block_size, int hq, int hkv, int blocks_per_split, int max_splits, float scale) {
+    int block_size, int hq, int hkv, int max_splits, float scale) {
   __shared__ half qs[kMaxRows][kHead];
   __shared__ half kvs[kChunk][kHead + 8];
   __shared__ float p[kMaxRows][kChunk];
@@ -160,6 +160,8 @@ __global__ void __launch_bounds__(kHead) decode_attention_kernel(
   const int tokens = query_start[b + 1] - t0;
   const int rows = group * tokens;
   const int total = context_lens[b] + tokens;
+  const int seq_blocks = (total + block_size - 1) / block_size;
+  const int blocks_per_split = (seq_blocks + max_splits - 1) / max_splits;
   const int first = split * blocks_per_split * block_size;
   const int last = min(total, first + blocks_per_split * block_size);
   const int tid = threadIdx.x;
@@ -312,14 +314,12 @@ SEVENTY_API int seventy_decode_attention(void *out, const void *q, const void *k
                                          int ld, const int *block_tables, int table_width,
                                          const int *query_start, const int *context_lens, int num_seqs, int tokens,
                                          int max_query_len, int block_size, int hq, int hkv, int head_dim, int splits,
-                                         int blocks_per_split, float scale, void *workspace, int64_t workspace_bytes,
-                                         cudaStream_t stream) {
+                                         float scale, void *workspace, int64_t workspace_bytes, cudaStream_t stream) {
   using namespace seventy;
   if (out == nullptr || q == nullptr || k_cache == nullptr || v_cache == nullptr || qkv == nullptr ||
       block_tables == nullptr || query_start == nullptr || context_lens == nullptr || workspace == nullptr)
     return SEVENTY_ERR_INVALID_ARGUMENT;
-  if (head_dim != kHead || hq % hkv || (hq / hkv) * max_query_len > kMaxRows || splits < 1 || blocks_per_split < 1 ||
-      block_size < 1)
+  if (head_dim != kHead || hq % hkv || (hq / hkv) * max_query_len > kMaxRows || splits < 1 || block_size < 1)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (workspace_bytes < seventy_decode_attention_workspace(tokens, hq, splits)) return SEVENTY_ERR_INVALID_ARGUMENT;
   if (kv_type != 0 && (kv_type != 1 || k_scale == nullptr || v_scale == nullptr)) return SEVENTY_ERR_INVALID_ARGUMENT;
@@ -331,12 +331,11 @@ SEVENTY_API int seventy_decode_attention(void *out, const void *q, const void *k
     decode_attention_kernel<int8_t><<<grid, kHead, 0, stream>>>(
         po, pml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
         static_cast<const int8_t *>(v_cache), k_scale, v_scale, block_tables, table_width, query_start, context_lens,
-        block_size, hq, hkv, blocks_per_split, splits, scale);
+        block_size, hq, hkv, splits, scale);
   } else {
     decode_attention_kernel<half><<<grid, kHead, 0, stream>>>(
         po, pml, static_cast<const half *>(q), static_cast<const half *>(k_cache), static_cast<const half *>(v_cache),
-        nullptr, nullptr, block_tables, table_width, query_start, context_lens, block_size, hq, hkv, blocks_per_split,
-        splits, scale);
+        nullptr, nullptr, block_tables, table_width, query_start, context_lens, block_size, hq, hkv, splits, scale);
   }
   attention_combine_kernel<<<dim3(tokens, hq), kHead, 0, stream>>>(static_cast<half *>(out), po, pml,
                                                                    static_cast<const half *>(qkv), ld, hq, splits);

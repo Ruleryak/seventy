@@ -235,8 +235,11 @@ class Qwen35TextModel:
         h = self.embed_tokens(step.token_ids)
         for start, rows in step.embeds.items():
             h[start : start + rows.shape[0]] = rows.to(h.dtype)
-        rope = ops.rotary_cos_sin(step.positions, self.inv_freq, t.mrope_section)
-        slots = ops.kv_slots(step.query_start, step.context_lens, step.block_tables, step.block_size)
+        if h.is_cuda:
+            rope = slots = None
+        else:
+            rope = ops.rotary_cos_sin(step.positions, self.inv_freq, t.mrope_section)
+            slots = ops.kv_slots(step.query_start, step.context_lens, step.block_tables, step.block_size)
         residual = h
         x = ops.rms_norm(h, self.layers[0].input_norm, t.rms_norm_eps)[0]
         captured = {}
