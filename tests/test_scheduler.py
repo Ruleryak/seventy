@@ -115,3 +115,28 @@ def test_no_match_no_reuse():
     s.add(b)
     plan = s.schedule()
     assert not plan.copies and plan.prefill[0].start == 0
+
+
+def test_request_image_rows_rope_and_cache_key():
+    import numpy as np
+
+    from seventy import multimodal as mm
+
+    pad = 248056
+    grids = [(1, 4, 6)]
+    img = mm.ImageInput(np.zeros((64, 96, 3), np.uint8), grids[0], "ab" * 32)
+    ids, info = mm.expand_prompt([1, 2, pad, 3, 4], [img], pad, 2)
+    r = Request("r", ids, SamplingParams(), images=info, cache_key=info.cache_key(ids))
+    assert info.spans == [(2, 6)] and len(ids) == 10
+    assert r.image_rows(0, 4) == [(2, 0, 0, 2)]
+    assert r.image_rows(4, 6) == [(0, 0, 2, 4)]
+    assert r.image_rows(8, 2) == []
+    assert r.rope_delta == info.delta == int(info.positions.max()) + 1 - 10
+    assert r.rope(0, 3) == [list(map(int, a)) for a in info.positions[:, :3]]
+    r.output = [7, 8]
+    assert r.rope(10, 2) == info.delta
+    tail = r.rope(9, 2)
+    assert tail[0] == [int(info.positions[0, 9]), 10 + info.delta] and tail[0] == tail[1] == tail[2]
+    assert r.key_tokens[:2] == [1, 2] and r.key_tokens[2] < 0 and r.key_tokens[-2:] == [7, 8]
+    plain = Request("p", [1, 2, 3], SamplingParams())
+    assert plain.rope(0, 3) == 0 and plain.image_rows(0, 3) == [] and plain.key_tokens == [1, 2, 3]

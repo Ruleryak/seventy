@@ -149,3 +149,23 @@ def test_gated_rms_norm_and_gates():
     g, beta = R.gdn_gates(a, b, a_log, dt)
     torch.testing.assert_close(g, -a_log.exp() * F.softplus(a + dt))
     torch.testing.assert_close(beta, torch.sigmoid(b))
+
+
+def test_multimodal_rotary_matches_transformers():
+    hf = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    cfg = Qwen3_5TextConfig(hidden_size=256, num_attention_heads=1, num_key_value_heads=1, head_dim=256,
+                            num_hidden_layers=1, vocab_size=32,
+                            rope_parameters={"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25,
+                                             "mrope_section": [11, 11, 10], "mrope_interleaved": True})
+    rot = hf.Qwen3_5TextRotaryEmbedding(cfg)
+    g = torch.Generator().manual_seed(0)
+    pos = torch.stack([torch.full((50,), 3), 3 + torch.randint(0, 30, (50,), generator=g),
+                       3 + torch.randint(0, 70, (50,), generator=g)])
+    cos_ref, sin_ref = rot(torch.zeros(1, 50, 256), pos[:, None])
+    inv = 1.0 / (1e7 ** (torch.arange(0, 32).float() * 2 / 64))
+    cos, sin = R.rotary_cos_sin(pos, inv, (11, 11, 10))
+    torch.testing.assert_close(cos, cos_ref[0, :, :32].float(), rtol=0, atol=1e-5)
+    torch.testing.assert_close(sin, sin_ref[0, :, :32].float(), rtol=0, atol=1e-5)
+    torch.testing.assert_close(cos_ref[0, :, 32:], cos_ref[0, :, :32])

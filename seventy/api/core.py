@@ -31,7 +31,7 @@ def engine_process_main(config: dict, req_addr: str, out_addr: str, ready) -> No
     except Exception:
         ready.send(("error", traceback.format_exc()))
         raise
-    ready.send(("ready", {"kv_tokens": engine.kv_capacity_tokens, "pid": os.getpid()}))
+    ready.send(("ready", {"kv_tokens": engine.kv_capacity_tokens, "pid": os.getpid(), "vision": engine.vision}))
     ctx = zmq.Context()
     pull = ctx.socket(zmq.PULL)
     pull.connect(req_addr)
@@ -44,9 +44,9 @@ def engine_process_main(config: dict, req_addr: str, out_addr: str, ready) -> No
     def handle(msg) -> bool:
         kind = msg[0]
         if kind == "add":
-            _, rid, prompt, params = msg
+            _, rid, prompt, params, images = msg
             try:
-                engine.add_request(prompt, SamplingParams(**params), request_id=rid)
+                engine.add_request(prompt, SamplingParams(**params), request_id=rid, images=images)
                 counters["requests"] += 1
             except ValueError as e:
                 counters["errors"] += 1
@@ -149,14 +149,15 @@ class EngineClient:
                     q.put_nowait(RuntimeError(self.dead))
                 os._exit(1)
 
-    async def generate(self, prompt: list[int], params: SamplingParams, request_id: str | None = None):
-        """Yields RequestOutput objects (new tokens per step) until the request finishes."""
+    async def generate(self, prompt: list[int], params: SamplingParams, request_id: str | None = None, images=None):
+        """Yields RequestOutput objects (new tokens per step) until the request finishes. images: the
+        seventy.multimodal.PromptImages of an expanded prompt."""
         if self.dead:
             raise RuntimeError(self.dead)
         rid = request_id or uuid.uuid4().hex
         q: asyncio.Queue = asyncio.Queue()
         self.queues[rid] = q
-        await self.push.send(pickle.dumps(("add", rid, list(prompt), asdict(params))))
+        await self.push.send(pickle.dumps(("add", rid, list(prompt), asdict(params), images)))
         try:
             while True:
                 item = await q.get()

@@ -26,6 +26,12 @@ def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None
     cfg = load_config(Path(model_path))
     with Checkpoint(Path(model_path)) as ckpt:
         model = Qwen35TextModel(cfg, ckpt, device, dtype, par=Parallel(rank, size), layers=layers)
+        model.vision = None
+        prefix = "model.visual."
+        if cfg.vision is not None and torch.device(device).type == "cuda" and ckpt.names(prefix):
+            from ..model.vision import VisionTower
+
+            model.vision = VisionTower(cfg.vision, ckpt, device, par=Parallel(rank, size), prefix=prefix)
     if size > 1 and torch.device(device).type == "cuda" and os.environ.get("SEVENTY_CUSTOM_ALLREDUCE", "1") != "0":
         import dataclasses
 
@@ -84,6 +90,10 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
                 graphs.run(msg[1])
             elif msg[0] == "copy":
                 cache.apply(msg[1])
+            elif msg[0] == "encode":
+                runner.encode_local(msg[1], msg[2])
+            elif msg[0] == "release":
+                runner.release_local(msg[1])
             elif msg[0] == "spec":
                 runner.spec_graphs.run(msg[1])
             elif msg[0] == "capture_spec":

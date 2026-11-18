@@ -22,8 +22,8 @@ def run_rank(rank, size, port, path, queue):
         distributed.init(rank, size, port, "gloo")
     cfg, model = load_shard(path, rank, size, "cpu", torch.float32, layers=4)
     cache = ModelCache(cfg.text, 4, 16, 1, torch.float32, "cpu", par=Parallel(rank, size))
-    first, _ = model.forward(build_step([(PROMPT[:12], 0, [2, 0], 0, "all")], 16, "cpu"), cache)
-    second, _ = model.forward(build_step([(PROMPT[12:], 12, [2, 0], 0, "all")], 16, "cpu"), cache)
+    first, _ = model.forward(build_step([(PROMPT[:12], 0, [2, 0], 0, "all", 0, ())], 16, "cpu"), cache)
+    second, _ = model.forward(build_step([(PROMPT[12:], 12, [2, 0], 0, "all", 0, ())], 16, "cpu"), cache)
     if rank == 0:
         queue.put(torch.cat((first, second)).numpy())
     distributed.shutdown()

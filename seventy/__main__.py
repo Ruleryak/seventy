@@ -77,7 +77,8 @@ def cmd_engine(args: argparse.Namespace) -> int:
         engine=engine, served_model_name=args.served_model_name or os.path.basename(os.path.normpath(args.model)),
         api_key=args.api_key or os.environ.get("SEVENTY_API_KEY") or None,
         default_chat_template_kwargs=json.loads(args.default_chat_template_kwargs or "{}"),
-        max_tokens_default=args.max_tokens_default,
+        max_tokens_default=args.max_tokens_default, max_image_pixels=args.max_image_pixels,
+        max_images_per_request=args.max_images_per_request,
     )
     run(server, args.host, args.port)
     return 0
@@ -109,6 +110,9 @@ def main(argv: list[str] | None = None) -> int:
     eng.add_argument("--no-prefix-cache", action="store_true")
     eng.add_argument("--default-chat-template-kwargs", help='JSON, for example {"enable_thinking": false}')
     eng.add_argument("--max-tokens-default", type=int)
+    eng.add_argument("--max-image-pixels", type=int,
+                     help="resize larger images down to this many pixels (default: the checkpoint's limit)")
+    eng.add_argument("--max-images-per-request", type=int, default=20)
     eng.set_defaults(fn=cmd_engine)
     args = parser.parse_args(argv)
     return args.fn(args)

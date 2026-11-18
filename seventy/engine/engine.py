@@ -1,4 +1,8 @@
-"""The engine: requests in, tokens out. One process, one GPU (tensor parallel comes later)."""
+"""The engine: requests in, tokens out. Rank 0 of tensor parallel runs here and drives the other ranks' worker
+processes.
+
+Images: a request's images (seventy.multimodal.PromptImages) are encoded by the vision tower on every rank just
+before the first prefill chunk that reaches their tokens, and released once prefill has passed them."""
 
 from __future__ import annotations
 
@@ -147,25 +151,67 @@ class Engine:
         self._ids = itertools.count()
         self.requests: dict[str, Request] = {}
         self.stats = {"steps": 0, "prompt_tokens": 0, "generated_tokens": 0, "preemptions": 0, "cache_hits": 0,
-                      "cache_hit_tokens": 0, "verify_steps": 0, "drafted_tokens": 0, "accepted_tokens": 0}
+                      "cache_hit_tokens": 0, "verify_steps": 0, "drafted_tokens": 0, "accepted_tokens": 0,
+                      "images": 0}
 
     @property
     def kv_capacity_tokens(self) -> int:
         return self.cache.num_blocks * self.cache.block_size
 
-    def add_request(self, prompt: list[int], params: SamplingParams, request_id: str | None = None) -> str:
+    @property
+    def vision(self) -> bool:
+        return getattr(self.model, "vision", None) is not None
+
+    def add_request(self, prompt: list[int], params: SamplingParams, request_id: str | None = None,
+                    images=None) -> str:
+        """images: seventy.multimodal.PromptImages of an expanded prompt, or None."""
         params.check()
         rid = request_id or f"req-{next(self._ids)}"
+        if rid in self.requests:
+            raise ValueError(f"request id {rid!r} is in use")
+        prompt = list(prompt)
+        if images is not None and images.images:
+            if not self.vision:
+                raise ValueError("this model has no vision tower; images are not supported")
+            tok = self.model_config.image_token_id
+            for off, n in images.spans:
+                if off < 0 or off + n > len(prompt) or any(t != tok for t in prompt[off : off + n]):
+                    raise ValueError("image spans do not match the prompt's image tokens")
+            if images.positions.shape != (3, len(prompt)):
+                raise ValueError("image positions do not match the prompt")
+        else:
+            images = None
         gen = torch.Generator()
         gen.manual_seed(params.seed if params.seed is not None else torch.randint(0, 2**62, ()).item())
-        r = Request(rid, list(prompt), params, generator=gen)
+        r = Request(rid, prompt, params, generator=gen, images=images,
+                    cache_key=images.cache_key(prompt) if images is not None else None)
         self.scheduler.add(r)
         self.requests[rid] = r
         return rid
 
     def abort(self, request_id: str) -> None:
+        r = self.requests.get(request_id)
         self.scheduler.abort(request_id)
+        if r is not None:
+            self._release_images(r, everything=True)
         self.requests.pop(request_id, None)
+
+    def _encode_images(self, work: list[Work]) -> None:
+        for w in work:
+            r = w.request
+            for _, i, _, _ in r.image_rows(w.start, w.count):
+                key = f"{r.id}/{i}"
+                if key not in self.runner.images:
+                    self.runner.encode(key, r.images.images[i].pixels)
+                    self.stats["images"] += 1
+
+    def _release_images(self, r: Request, everything: bool = False) -> None:
+        if r.images is None:
+            return
+        keys = [f"{r.id}/{i}" for i, (off, n) in enumerate(r.images.spans)
+                if (everything or r.status is Status.FINISHED or r.computed >= off + n)
+                and f"{r.id}/{i}" in self.runner.images]
+        self.runner.release(keys)
 
     def has_work(self) -> bool:
         return self.scheduler.has_work()
@@ -230,10 +276,13 @@ class Engine:
                 self._sample(plan.decode, self.runner.run_decode(plan.decode), outputs)
         if plan.prefill:
             self.stats["prompt_tokens"] += sum(w.count for w in plan.prefill)
+            self._encode_images(plan.prefill)
             logits = self.runner.run(plan.prefill, capture=self.drafter is not None)
             if self.drafter is not None:
                 self._prefill_context(plan.prefill)
             self._sample(plan.prefill, logits, outputs)
+            for w in plan.prefill:
+                self._release_images(w.request)
             if self.drafter is not None:
                 self._draft([w.request for w in plan.prefill
                              if w.request.status is Status.RUNNING and w.request.computed == w.request.length - 1])
@@ -280,7 +329,15 @@ class Engine:
             r.draft, r.draft_q, r.draft_cand = tokens[i], probs[i], cands[i]
         self.stats["drafted_tokens"] += sum(len(t) for t in tokens)
 
+    def _stops(self, r: Request) -> tuple[list[int], int]:
+        """A request's stop tokens and the most tokens it may still emit."""
+        p = r.params
+        stop = ([] if p.ignore_eos else list(self.eos)) + [t for t in p.stop_token_ids if t not in self.eos]
+        limit = min(p.max_tokens - len(r.output), self.config.max_model_len - r.length)
+        return stop, max(1, limit)
+
     def _spec_rows(self, work: list[Work]) -> list[dict] | None:
+        from .spec import STOP_SLOTS
         from .spec_graphs import eligible
 
         g = self.runner.spec_graphs
@@ -291,11 +348,13 @@ class Engine:
         for w in work:
             r = w.request
             p = r.params
-            if len(r.draft) != k or not eligible(p) or len(r.output) < p.min_tokens:
+            stop, limit = self._stops(r)
+            if len(r.draft) != k or not eligible(p) or len(r.output) < p.min_tokens or len(stop) > STOP_SLOTS:
                 return None
-            row = {"tokens": [r.tokens[-1]] + r.draft, "start": w.start, "slot": r.slot, "table": r.blocks,
+            row = {"tokens": [r.tokens[-1]] + r.draft, "start": w.start, "delta": r.rope_delta, "slot": r.slot,
+                   "table": r.blocks,
                    "temp": p.temperature, "top_k": p.top_k if p.temperature > 0 else 1, "top_p": p.top_p,
-                   "min_p": p.min_p, "q": r.draft_q, "cand": r.draft_cand}
+                   "min_p": p.min_p, "q": r.draft_q, "cand": r.draft_cand, "stop": stop, "limit": limit}
             if p.temperature > 0:
                 gen = r.generator
                 row["u_accept"] = torch.rand(k, generator=gen)
@@ -305,7 +364,7 @@ class Engine:
         return rows
 
     def _spec_decode(self, work: list[Work], outputs: dict[str, RequestOutput]) -> None:
-        from .spec import accept
+        from .spec import accept, cut_host
 
         rows = self._spec_rows(work)
         if rows is not None:
@@ -343,6 +402,9 @@ class Engine:
                 n, new = accept(L, r.draft, r.draft_q.to(L.device), r.draft_cand.to(L.device), state, self.eos)
             else:
                 n, new = 0, sample(L[-1:], [state], self.eos)[0]
+            stop, limit = self._stops(r)
+            n = cut_host(n, new, set(stop), limit)
+            new = new[: n + 1]
             results.append((w, n, new, L))
             lens.append(n + 1)
             rows += list(range(row, row + n + 1))

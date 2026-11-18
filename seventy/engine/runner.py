@@ -1,5 +1,10 @@
 """Runs scheduled work on the model: builds the step input, sends it to the tensor-parallel workers, runs the
-forward pass, and returns the logits (rank 0)."""
+forward pass, and returns the logits (rank 0).
+
+A step payload has one tuple per sequence: (token ids, context length, block table, state slot, logits mode,
+rope, image rows). rope is an int delta (positions are token index + delta on all axes) or explicit [3][n]
+positions; image rows are (row in the chunk, image key, first image token, tokens), whose embeddings every rank
+holds from an earlier encode() until release()."""
 
 from __future__ import annotations
 
@@ -14,9 +19,20 @@ from .spec_graphs import SpecGraphs
 from .step import SequenceChunk, StepInput
 
 
-def build_step(payload, block_size: int, device) -> StepInput:
-    chunks = [SequenceChunk(list(ids), ctx, list(table), slot, logits=mode) for ids, ctx, table, slot, mode in payload]
-    return StepInput.build(chunks, block_size, device)
+def _positions(rope, ctx: int, n: int):
+    if isinstance(rope, int):
+        return None if rope == 0 else [list(range(ctx + rope, ctx + n + rope))] * 3
+    return rope
+
+
+def build_step(payload, block_size: int, device, images: dict | None = None) -> StepInput:
+    chunks = [SequenceChunk(list(ids), ctx, list(table), slot, positions=_positions(rope, ctx, len(ids)), logits=mode)
+              for ids, ctx, table, slot, mode, rope, _ in payload]
+    step = StepInput.build(chunks, block_size, device)
+    for b, item in enumerate(payload):
+        for row, key, first, count in item[6]:
+            step.embeds[step.query_start[b] + row] = images[key][first : first + count]
+    return step
 
 
 class ModelRunner:
@@ -32,6 +48,7 @@ class ModelRunner:
         self._stash = None
         self._step = None
         self.spec_graphs: SpecGraphs | None = None
+        self.images: dict[str, torch.Tensor] = {}
 
     def capture_spec(self, max_blocks_per_seq: int, buckets: tuple[int, ...]) -> None:
         self._send(("capture_spec", max_blocks_per_seq, list(buckets)))
@@ -56,7 +73,29 @@ class ModelRunner:
 
     @staticmethod
     def payload(work: list[Work]) -> list[tuple]:
-        return [(w.ids(), w.start, w.request.blocks, w.request.slot, w.logits) for w in work]
+        out = []
+        for w in work:
+            r = w.request
+            rows = [(row, f"{r.id}/{i}", first, n) for row, i, first, n in r.image_rows(w.start, w.count)]
+            out.append((w.ids(), w.start, r.blocks, r.slot, w.logits, r.rope(w.start, w.count), rows))
+        return out
+
+    def encode(self, key: str, pixels) -> None:
+        """Run the vision tower on a resized uint8 image [H, W, 3] on every rank; keep the embeddings as key."""
+        self._send(("encode", key, pixels))
+        self.encode_local(key, pixels)
+
+    def encode_local(self, key: str, pixels) -> None:
+        self.images[key] = self.model.vision.encode(torch.from_numpy(pixels))
+
+    def release(self, keys: list[str]) -> None:
+        if keys:
+            self._send(("release", keys))
+            self.release_local(keys)
+
+    def release_local(self, keys: list[str]) -> None:
+        for k in keys:
+            self.images.pop(k, None)
 
     def capture(self, max_blocks_per_seq: int, buckets: tuple[int, ...]) -> None:
         msg = pickle.dumps(("capture", max_blocks_per_seq, list(buckets)))
@@ -80,8 +119,8 @@ class ModelRunner:
         """Decode work (one new token per sequence) through the CUDA graphs when a bucket fits."""
         if self.graphs is None or self.graphs.bucket(len(work)) is None:
             return self.run(work)
-        payload = [(w.request.tokens[w.start : w.start + 1], w.start, w.request.blocks, w.request.slot, "last")
-                   for w in work]
+        payload = [(w.request.tokens[w.start : w.start + 1], w.start, w.request.blocks, w.request.slot, "last",
+                    w.request.rope_delta, ()) for w in work]
         self._send(("decode", payload))
         return self.graphs.run(payload)
 
@@ -90,13 +129,13 @@ class ModelRunner:
         With capture (speculative decoding), the drafter's context features of every row are kept."""
         payload = self.payload(work)
         self._send(("step", payload, capture))
-        step = build_step(payload, self.cache.block_size, self.device)
+        step = build_step(payload, self.cache.block_size, self.device, self.images)
         logits, cap = self.model.forward(step, self.cache, capture=self.layers if capture else ())
         self._feats = torch.cat([cap[i] for i in self.layers], dim=-1) if capture else None
         return logits
 
     def run_payload(self, payload, capture: bool) -> None:
-        step = build_step(payload, self.cache.block_size, self.device)
+        step = build_step(payload, self.cache.block_size, self.device, self.images)
         _, cap = self.model.forward(step, self.cache, capture=self.layers if capture else ())
         self._feats = torch.cat([cap[i] for i in self.layers], dim=-1) if capture else None
 

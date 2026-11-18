@@ -14,6 +14,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from tokenizers import Tokenizer
 
+from .. import multimodal
+from ..config import load_config
 from ..engine.engine import EngineConfig
 from ..engine.sampling import SamplingParams
 from .chat import ChatTemplate, TemplateError
@@ -29,6 +31,8 @@ class ServerConfig:
     api_key: str | None = None
     default_chat_template_kwargs: dict = field(default_factory=dict)
     max_tokens_default: int | None = None
+    max_image_pixels: int | None = None
+    max_images_per_request: int = 20
 
 
 def _generation_defaults(model_path: Path) -> dict:
@@ -75,6 +79,13 @@ def create_app(config: ServerConfig) -> FastAPI:
     defaults = _generation_defaults(model_path)
     client = EngineClient(config.engine)
     max_len = config.engine.max_model_len
+    model_cfg = load_config(model_path)
+    images_cfg = multimodal.ImageSettings.from_model(model_path)
+    if config.max_image_pixels:
+        import dataclasses
+
+        images_cfg = dataclasses.replace(images_cfg, max_pixels=max(config.max_image_pixels, images_cfg.factor ** 2),
+                                         min_pixels=min(images_cfg.min_pixels, config.max_image_pixels))
 
     @asynccontextmanager
     async def lifespan(app):
@@ -118,17 +129,29 @@ def create_app(config: ServerConfig) -> FastAPI:
         p.check()
         return p
 
-    def chat_prompt(body: dict) -> tuple[list[int], bool, list | None]:
+    def chat_prompt(body: dict) -> tuple[list[int], bool, list | None, multimodal.PromptImages | None]:
+        """Token ids of a chat request (image tokens expanded), whether thinking is on, the tools, the images.
+        Fetches, decodes and resizes images: run it in a thread."""
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty list")
+        urls = multimodal.image_urls(messages)
+        if urls and not client.info.get("vision"):
+            raise ValueError("this model does not take images")
+        if len(urls) > config.max_images_per_request:
+            raise ValueError(f"the request has {len(urls)} images; the limit is {config.max_images_per_request}")
         kwargs = {**config.default_chat_template_kwargs, **(body.get("chat_template_kwargs") or {})}
         if body.get("reasoning_effort"):
             kwargs.setdefault("reasoning_effort", body["reasoning_effort"])
         tools = body.get("tools") if body.get("tool_choice") != "none" else None
         text = template.render(messages, tools=tools, add_generation_prompt=True, **kwargs)
         thinking = kwargs.get("enable_thinking", True) is not False
-        return tokenizer.encode(text, add_special_tokens=False).ids, thinking, tools
+        ids = tokenizer.encode(text, add_special_tokens=False).ids
+        if not urls:
+            return ids, thinking, tools, None
+        images = [multimodal.load_image(u, images_cfg) for u in urls]
+        ids, info = multimodal.expand_prompt(ids, images, model_cfg.image_token_id, images_cfg.merge_size)
+        return ids, thinking, tools, info
 
     def usage(prompt: int, completion: int) -> dict:
         return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
@@ -158,7 +181,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         body = await request.json()
         try:
             if "messages" in body:
-                ids, _, _ = chat_prompt(body)
+                ids, _, _, _ = await asyncio.to_thread(chat_prompt, body)
             else:
                 ids = tokenizer.encode(body.get("prompt", ""), add_special_tokens=False).ids
         except (ValueError, TemplateError) as e:
@@ -178,7 +201,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         if int(body.get("n") or 1) != 1:
             return error(400, "only n = 1 is supported")
         try:
-            prompt, thinking, tools = chat_prompt(body)
+            prompt, thinking, tools, images = await asyncio.to_thread(chat_prompt, body)
             params = sampling(body, len(prompt))
         except (ValueError, TemplateError) as e:
             return error(400, str(e))
@@ -193,7 +216,7 @@ def create_app(config: ServerConfig) -> FastAPI:
             dec = IncrementalDecoder(tokenizer)
             parser = OutputParser(reasoning=thinking, tools=tools)
             out_tokens = 0
-            async for out in client.generate(prompt, params, rid):
+            async for out in client.generate(prompt, params, rid, images=images):
                 out_tokens = out.output_tokens
                 text = dec.push(out.new_tokens)
                 if out.finished:

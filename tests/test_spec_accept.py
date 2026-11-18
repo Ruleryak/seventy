@@ -44,3 +44,22 @@ def test_sampled_device_accept_preserves_target_distribution():
     p = p / p.sum()
     want = torch.zeros(v).scatter(0, idx, p)
     assert (counts - want).abs().max() < 0.01, (counts, want)
+
+
+def test_cut_at_stops_matches_host():
+    from seventy.engine.spec import cut_at_stops, cut_host
+
+    g = torch.Generator().manual_seed(5)
+    for _ in range(200):
+        b, k1 = 4, 8
+        new = torch.randint(0, 6, (b, k1), generator=g)
+        n = torch.randint(0, k1, (b,), generator=g)
+        stop = torch.full((b, 3), -1, dtype=torch.long)
+        stop[:, 0] = 5
+        stop[1, 1] = 4
+        limit = torch.randint(1, k1 + 2, (b,), generator=g)
+        got = cut_at_stops(n, new, stop, limit)
+        for i in range(b):
+            want = cut_host(int(n[i]), new[i].tolist(), {t for t in stop[i].tolist() if t >= 0}, int(limit[i]))
+            assert int(got[i]) == want
+            assert int(got[i]) <= int(n[i]) and int(got[i]) + 1 <= max(1, int(limit[i]))

@@ -107,3 +107,31 @@ def test_flash_attention_matches_reference(lengths, ctx, kv):
                                   None if vs is None else vs.to(dev))
     err = (out.cpu().float() - ref.float()).abs().max().item()
     assert err < 4e-3, err
+
+
+def test_prep_multimodal_positions_match_reference():
+    """attn_prep with distinct temporal, height and width positions (image tokens)."""
+    hq, hkv, d, bs, eps = 6, 2, 256, 16, 1e-6
+    lengths, ctx = [24], [5]
+    qkv, starts, bt, k_cache, v_cache, _ = setup(lengths, ctx, hq, hkv, bs, seed=7)
+    t = qkv.shape[0]
+    g = torch.Generator().manual_seed(1)
+    positions = torch.stack([torch.full((t,), 5), 5 + torch.randint(0, 40, (t,), generator=g),
+                             5 + torch.randint(0, 900, (t,), generator=g)])
+    q_norm = 1.0 + torch.randn(d) * 0.1
+    k_norm = 1.0 + torch.randn(d) * 0.1
+    inv = 1.0 / (1e7 ** (torch.arange(0, 32).float() * 2 / 64))
+    section = (11, 11, 10)
+    qg = qkv[:, : 2 * d * hq].view(t, hq, 2, d)
+    q = R.rms_norm(qg[:, :, 0].reshape(-1, d), q_norm, eps)[0].view(t, hq, d)
+    k = R.rms_norm(qkv[:, 2 * d * hq : 2 * d * hq + d * hkv].reshape(-1, d), k_norm, eps)[0].view(t, hkv, d)
+    cos, sin = R.rotary_cos_sin(positions, inv, section)
+    q, k = R.apply_rotary(q, cos, sin), R.apply_rotary(k, cos, sin)
+    slots = R.kv_slots(starts, ctx, bt.long(), bs)
+    dev = "cuda"
+    kk, kvv = k_cache.to(dev), v_cache.to(dev)
+    qd = kernels.attn_prep(qkv.to(dev), q_norm.to(dev), k_norm.to(dev), positions.to(dev), inv.to(dev), section,
+                           slots.int().to(dev), kk, kvv, hq, hkv, eps, None, None)
+    torch.testing.assert_close(qd.cpu().float(), q.float(), rtol=0, atol=2e-3)
+    blocks, offs = slots // bs, slots % bs
+    torch.testing.assert_close(kk.cpu()[blocks, offs].float(), k.float(), rtol=0, atol=2e-3)

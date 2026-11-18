@@ -1,7 +1,8 @@
 """CUDA graphs of whole speculative decoding steps, one per batch bucket B.
 
 One replay runs: the target's verify step over [anchor, d1 .. d7] for B sequences, acceptance on the device
-(seventy.engine.spec.device_accept), the Gated DeltaNet commit of the accepted rows, the drafter context of all
+(seventy.engine.spec.device_accept, cut at stop tokens and token limits), the Gated DeltaNet commit of the
+accepted rows, the drafter context of all
 eight rows (rows past the accepted ones are overwritten by the next block before anything reads them), and the
 next draft from the new anchor. The host reads back the accepted counts, new tokens and next drafts once.
 
@@ -15,7 +16,7 @@ from __future__ import annotations
 import torch
 
 from .cache import ModelCache
-from .spec import KMAX, device_accept
+from .spec import KMAX, STOP_SLOTS, cut_at_stops, device_accept
 from .step import StepInput
 
 
@@ -38,6 +39,7 @@ class SpecGraphs:
         return {
             "tokens": torch.zeros(b, self.block, dtype=torch.long, device=dev),
             "starts": torch.zeros(b, dtype=torch.long, device=dev),
+            "delta": torch.zeros(b, dtype=torch.long, device=dev),
             "slots": torch.full((b,), self.cache.scratch_slot, dtype=torch.long, device=dev),
             "tables": torch.full((b, self.width), self.cache.scratch_block, dtype=torch.int32, device=dev),
             "temp": torch.zeros(b, device=dev),
@@ -49,6 +51,8 @@ class SpecGraphs:
             "u_accept": torch.zeros(b, k, device=dev),
             "u_residual": torch.zeros(b, k + 1, device=dev),
             "gumbel": torch.zeros(b, k, c, device=dev),
+            "stop": torch.full((b, STOP_SLOTS), -1, dtype=torch.long, device=dev),
+            "limit": torch.full((b,), self.block, dtype=torch.long, device=dev),
         }
 
     def _body(self, b: int, x: dict[str, torch.Tensor]):
@@ -57,7 +61,8 @@ class SpecGraphs:
         pos = x["starts"][:, None] + offs
         kv = x["tables"].gather(1, (pos // bs).int().long()).long() * bs + pos % bs
         step = StepInput(
-            token_ids=x["tokens"].view(-1), positions=pos.reshape(1, -1).expand(3, -1).contiguous(),
+            token_ids=x["tokens"].view(-1),
+            positions=(pos + x["delta"][:, None]).reshape(1, -1).expand(3, -1).contiguous(),
             block_tables=x["tables"], logit_rows=torch.arange(b * blk, device=dev),
             query_start=[i * blk for i in range(b + 1)], context_lens=[0] * b, state_slots=[0] * b, block_size=bs,
             query_start_t=torch.arange(b + 1, dtype=torch.int32, device=dev) * blk,
@@ -68,6 +73,7 @@ class SpecGraphs:
         logits, cap = self.model.forward(step, self.cache, capture=self.layers, stash=stash)
         n, new = device_accept(logits.view(b, blk, -1), x["tokens"][:, 1:], x["q"], x["cand"], x["temp"],
                                x["top_k"], x["top_p"], x["min_p"], x["u_accept"], x["u_residual"])
+        n = cut_at_stops(n, new, x["stop"], x["limit"])
         self.model.commit(step, self.cache, stash, (n + 1).int())
         feats = torch.cat([cap[i] for i in self.layers], dim=-1)
         self.drafter.write_context(feats, pos.reshape(-1), x["slots"].repeat_interleave(blk))
@@ -97,8 +103,9 @@ class SpecGraphs:
         torch.cuda.synchronize(self.device)
 
     def run(self, rows: list[dict]) -> dict[str, torch.Tensor]:
-        """rows: per sequence {tokens [block], start, slot, table, temp, top_k, top_p, min_p, q, cand, u_accept,
-        u_residual, gumbel} (host values). Returns the bucket's output tensors (valid for the first len(rows))."""
+        """rows: per sequence {tokens [block], start, delta (rotary position minus token index), slot, table, temp,
+        top_k, top_p, min_p, q, cand, u_accept, u_residual, gumbel, stop (up to STOP_SLOTS ids), limit (most new
+        tokens)} (host values). Returns the bucket's output tensors (valid for the first len(rows))."""
         b = self.bucket(len(rows))
         graph, x, out = self.graphs[b]
         n = len(rows)
@@ -106,15 +113,21 @@ class SpecGraphs:
         host["slots"].fill_(self.cache.scratch_slot)
         host["top_k"].fill_(1)
         host["top_p"].fill_(1.0)
+        host["stop"].fill_(-1)
+        host["limit"].fill_(self.block)
         width = max(len(r["table"]) for r in rows)
         table = torch.full((b, width), self.cache.scratch_block, dtype=torch.int32)
         for i, r in enumerate(rows):
             host["tokens"][i] = torch.as_tensor(r["tokens"])
             host["starts"][i] = r["start"]
+            host["delta"][i] = r.get("delta", 0)
             host["slots"][i] = r["slot"]
             table[i, : len(r["table"])] = torch.as_tensor(r["table"], dtype=torch.int32)
             for key in ("temp", "top_k", "top_p", "min_p"):
                 host[key][i] = r[key]
+            stops = r.get("stop", ())
+            host["stop"][i, : len(stops)] = torch.as_tensor(list(stops), dtype=torch.long)
+            host["limit"][i] = r.get("limit", self.block)
             for key in ("q", "cand", "u_accept", "u_residual", "gumbel"):
                 if r.get(key) is not None:
                     host[key][i] = torch.as_tensor(r[key])

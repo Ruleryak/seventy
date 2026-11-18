@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.3"]
-reference = ["transformers==5.16.1", "compressed-tensors>=0.15"]
+reference = ["transformers==5.16.1", "compressed-tensors>=0.15", "torchvision==0.25.0"]
 
 [project.scripts]
 seventy = "seventy.__main__:main"
@@ -41,6 +41,7 @@ sdist.include = ["csrc", "CMakeLists.txt"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
 
 [[tool.uv.index]]
 name = "pytorch-cu129"

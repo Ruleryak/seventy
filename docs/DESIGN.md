@@ -73,6 +73,19 @@ API server process ──requests/tokens──────┘
 | Norm weights | FP32, with the `1 + w` offset of zero-centered norms folded in at load |
 | Gated DeltaNet state | FP32 |
 | KV cache (attention layers) | INT8 with one FP32 scale per token and head (default), or FP16 |
+| Vision tower | FP16 weights and GEMM inputs, FP32 residual stream (an outlier channel reaches about 7600) |
+
+## Images
+
+- The API process fetches (`data:` or `http(s):` URLs only), decodes and resizes each image: the checkpoint's
+  `preprocessor_config.json` limits, antialiased bicubic on the uint8 image (the same operation as the reference
+  processor, which the tests check pixel for pixel). `--max-image-pixels` sets a lower limit.
+- The chat template's one image pad token per image becomes one pad per 2 x 2 patch block. Rotary positions follow
+  the multimodal rules (`seventy/multimodal.py`); every token after the last image has position index + delta.
+- The engine encodes an image on every rank just before the first prefill chunk that reaches its tokens, and
+  drops the embeddings when prefill has passed them. The vision tower is split over the tensor-parallel ranks.
+- The prefix cache matches image tokens by a digest of the resized pixels.
+- Videos are not supported yet.
 
 ## Memory model
 

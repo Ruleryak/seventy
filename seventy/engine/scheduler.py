@@ -9,7 +9,8 @@ freed and it starts again from its prompt and the tokens it has generated.
 Prefix cache: when a sequence finishes, its KV blocks and state slot (the state after its last computed token)
 become a cache entry instead of being freed. A new request whose tokens start with an entry's tokens shares the
 entry's full KV blocks (reference counted), gets a copy of the entry's partly filled last block and of its state
-slot, and computes only the rest. The copies are part of the plan; the runner makes them before the step.
+slot, and computes only the rest. The copies are part of the plan; the runner makes them before the step. Entries
+are matched on key_tokens, where image tokens stand for the image's content (seventy.multimodal).
 """
 
 from __future__ import annotations
@@ -50,10 +51,48 @@ class Request:
     draft_q: torch.Tensor | None = None
     draft_cand: torch.Tensor | None = None
     cacheable: bool = True
+    images: object | None = None
+    cache_key: list[int] | None = None
 
     @property
     def tokens(self) -> list[int]:
         return self.prompt + self.output
+
+    @property
+    def key_tokens(self) -> list[int]:
+        return self.tokens if self.cache_key is None else self.cache_key + self.output
+
+    @property
+    def rope_delta(self) -> int:
+        """Rotary position minus token index for every token after the last image (0 without images)."""
+        return self.images.delta if self.images is not None else 0
+
+    def rope(self, start: int, count: int):
+        """Rotary positions of tokens [start, start + count): an int delta when they are index + delta on all
+        three axes, else explicit [3][count] lists."""
+        if self.images is None:
+            return 0
+        n = len(self.prompt)
+        delta = self.images.delta
+        if start >= n:
+            return delta
+        end = start + count
+        pos = [list(map(int, axis)) for axis in self.images.positions[:, start : min(end, n)]]
+        if end > n:
+            for axis in pos:
+                axis += range(n + delta, end + delta)
+        return pos
+
+    def image_rows(self, start: int, count: int) -> list[tuple[int, int, int, int]]:
+        """(row in the chunk, image index, first image token, tokens) of image tokens in [start, start + count)."""
+        if self.images is None:
+            return []
+        out = []
+        for i, (off, n) in enumerate(self.images.spans):
+            lo, hi = max(start, off), min(start + count, off + n)
+            if lo < hi:
+                out.append((lo - start, i, lo - off, hi - lo))
+        return out
 
     @property
     def length(self) -> int:
@@ -247,7 +286,7 @@ class Scheduler:
 
     def _reuse(self, r: Request) -> list[tuple[str, int, int]]:
         """Start a fresh request from the longest matching prefix-cache entry, if any. Returns the copies to make."""
-        entry = self.cache.lookup(r.tokens)
+        entry = self.cache.lookup(r.key_tokens)
         if entry is None:
             return []
         n = len(entry.tokens)
@@ -335,7 +374,7 @@ class Scheduler:
         if self.cache.max_entries and r.slot is not None and r.computed > 0 and r.cacheable:
             keep = -(-r.computed // self.block_size)
             self.blocks.give(r.blocks[keep:])
-            self.cache.add(r.tokens[: r.computed], r.blocks[:keep], r.slot)
+            self.cache.add(r.key_tokens[: r.computed], r.blocks[:keep], r.slot)
             r.blocks, r.slot = [], None
         else:
             self._release(r)

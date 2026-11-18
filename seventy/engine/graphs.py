@@ -64,8 +64,8 @@ class DecodeGraphs:
         return next((b for b in self.buckets if b >= n), None)
 
     def run(self, payload: list[tuple]) -> torch.Tensor:
-        """payload: (token_ids [1], context_len, block_table, state_slot, logits) per sequence. Returns the logits of
-        the real rows."""
+        """payload: (token_ids [1], context_len, block_table, state_slot, logits, rope delta, ()) per sequence.
+        Returns the logits of the real rows."""
         n = len(payload)
         b = self.bucket(n)
         graph, st, logits = self.graphs[b]
@@ -78,9 +78,9 @@ class DecodeGraphs:
         kv = torch.full((b,), scratch * bs, dtype=torch.int32)
         width = max(len(p[2]) for p in payload)
         table = torch.full((b, width), scratch, dtype=torch.int32)
-        for i, (ids, c, blocks, slot, _) in enumerate(payload):
+        for i, (ids, c, blocks, slot, _, delta, _) in enumerate(payload):
             tokens[i] = ids[0]
-            pos[i] = c
+            pos[i] = c + delta
             ctx[i] = c
             slots[i] = slot
             kv[i] = blocks[c // bs] * bs + c % bs

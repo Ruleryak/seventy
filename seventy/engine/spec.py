@@ -121,3 +121,29 @@ def device_accept(logits: torch.Tensor, drafts: torch.Tensor, q: torch.Tensor, c
     new = torch.cat((drafts, torch.zeros_like(drafts[:, :1])), dim=1)
     new[rows, n] = nxt
     return n, new
+
+
+STOP_SLOTS = 8
+
+
+def cut_at_stops(n: torch.Tensor, new: torch.Tensor, stop: torch.Tensor, limit: torch.Tensor) -> torch.Tensor:
+    """Accepted drafts of each row after cutting its new tokens at the first stop token or at its token limit.
+
+    n: [B] accepted drafts; new: [B, k + 1] (the first n + 1 valid); stop: [B, S] stop token ids (-1 pads);
+    limit: [B] most tokens the row may still emit (at least 1). The tokens after a stop are dropped anyway; the cut
+    makes the committed state end at the last emitted token, so a finished request stays usable by the prefix
+    cache. CUDA-graph safe.
+    """
+    k1 = new.shape[1]
+    idx = torch.arange(k1, device=new.device)
+    hit = (new[..., None] == stop[:, None, :]).any(-1) & (idx <= n[:, None])
+    first = torch.where(hit.any(-1), hit.int().argmax(-1), torch.full_like(n, k1))
+    return torch.minimum(torch.minimum(n, first), limit - 1)
+
+
+def cut_host(n: int, new: list[int], stop: set[int], limit: int) -> int:
+    """cut_at_stops for one row on the host."""
+    for j, t in enumerate(new[: n + 1]):
+        if t in stop or j + 1 >= limit:
+            return min(n, j)
+    return n
