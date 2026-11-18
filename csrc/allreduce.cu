@@ -11,7 +11,8 @@
  *   3. after a system-wide fence, sets signal[b][rank] = epoch in every rank's buffer and waits until its own
  *      signal[b][p] == epoch for every p,
  *   4. adds the world slots of its rows in FP32 (rounded once to FP16), adds the residual, and writes the residual
- *      and the RMS-normed row.
+ *      and the RMS-normed row. One block of 1024 threads per row; each thread holds 16-byte slices of the row in
+ *      registers from the push to the norm (rows of up to 16384 values).
  * Rows map to blocks the same way on every rank, so a block only waits for the same block of the other ranks.
  * Two data areas are enough: a rank can only start call e + 2 after every peer passed call e + 1's barrier, which
  * every peer reaches only after it has read call e's data.
@@ -22,7 +23,8 @@ namespace {
 
 constexpr int kMaxRanks = 8;
 constexpr int kMaxBlocks = 64;
-constexpr int kThreads = 256;
+constexpr int kThreads = 1024;
+constexpr int kVecs = 2;
 
 struct ArContext {
   char *buffers[kMaxRanks];
@@ -42,6 +44,24 @@ __device__ __forceinline__ void store_volatile(uint32_t *p, uint32_t v) {
   asm volatile("st.volatile.global.u32 [%0], %1;" ::"l"(p), "r"(v));
 }
 
+__device__ __forceinline__ void unpack8(uint4 v, float (&f)[8]) {
+  const half2 *h = reinterpret_cast<const half2 *>(&v);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const float2 t = __half22float2(h[k]);
+    f[2 * k] = t.x;
+    f[2 * k + 1] = t.y;
+  }
+}
+
+__device__ __forceinline__ uint4 pack8(const float (&f)[8]) {
+  uint4 out;
+  half2 *h = reinterpret_cast<half2 *>(&out);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) h[k] = __floats2half2_rn(f[2 * k], f[2 * k + 1]);
+  return out;
+}
+
 __global__ void __launch_bounds__(kThreads) ar_norm_kernel(ArContext ctx, half *out, half *residual, const half *x,
                                                            const float *weight, int rows, int dim, float eps) {
   __shared__ float scratch[32];
@@ -57,13 +77,20 @@ __global__ void __launch_bounds__(kThreads) ar_norm_kernel(ArContext ctx, half *
   const int64_t area = static_cast<int64_t>(ctx.world) * ctx.slot_bytes;
   const int64_t data_off = signal_bytes + (epoch & 1) * area;
   const int vec_per_row = dim / 8;
+  const int64_t slot_vecs = ctx.slot_bytes / static_cast<int64_t>(sizeof(uint4));
 
   for (int row = b; row < rows; row += gridDim.x) {
-    const uint4 *src = reinterpret_cast<const uint4 *>(x + static_cast<int64_t>(row) * dim);
-    for (int p = 0; p < ctx.world; ++p) {
-      uint4 *dst = reinterpret_cast<uint4 *>(ctx.buffers[p] + data_off + ctx.rank * ctx.slot_bytes +
-                                             static_cast<int64_t>(row) * dim * sizeof(half));
-      for (int i = threadIdx.x; i < vec_per_row; i += kThreads) dst[i] = src[i];
+    const uint4 *src = reinterpret_cast<const uint4 *>(x) + static_cast<int64_t>(row) * vec_per_row;
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      if (i >= vec_per_row) break;
+      const uint4 v = src[i];
+      for (int p = 0; p < ctx.world; ++p) {
+        uint4 *dst = reinterpret_cast<uint4 *>(ctx.buffers[p] + data_off) + ctx.rank * slot_vecs +
+                     static_cast<int64_t>(row) * vec_per_row;
+        dst[i] = v;
+      }
     }
   }
   __syncthreads();
@@ -78,52 +105,56 @@ __global__ void __launch_bounds__(kThreads) ar_norm_kernel(ArContext ctx, half *
   }
   __syncthreads();
 
-  const half *local = reinterpret_cast<const half *>(ctx.buffers[ctx.rank] + data_off);
+  const uint4 *local = reinterpret_cast<const uint4 *>(ctx.buffers[ctx.rank] + data_off);
   for (int row = b; row < rows; row += gridDim.x) {
+    uint4 *res = residual != nullptr ? reinterpret_cast<uint4 *>(residual) + static_cast<int64_t>(row) * vec_per_row
+                                     : nullptr;
+    uint4 *dst = reinterpret_cast<uint4 *>(out) + static_cast<int64_t>(row) * vec_per_row;
+    float r[kVecs][8];
     float sumsq = 0.0f;
-    half *res = residual != nullptr ? residual + static_cast<int64_t>(row) * dim : nullptr;
-    for (int i = threadIdx.x; i < dim / 2; i += kThreads) {
-      float2 acc = make_float2(0.0f, 0.0f);
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      if (i >= vec_per_row) break;
+      float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
       for (int p = 0; p < ctx.world; ++p) {
-        const half2 v = reinterpret_cast<const half2 *>(local + (ctx.slot_bytes / sizeof(half)) * p +
-                                                        static_cast<int64_t>(row) * dim)[i];
-        const float2 f = __half22float2(v);
-        acc.x += f.x;
-        acc.y += f.y;
+        float f[8];
+        unpack8(local[p * slot_vecs + static_cast<int64_t>(row) * vec_per_row + i], f);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) acc[k] += f[k];
       }
-      float2 r = __half22float2(__floats2half2_rn(acc.x, acc.y));
+      uint4 sum16 = pack8(acc);
+      unpack8(sum16, r[j]);
       if (res != nullptr) {
-        const float2 old = __half22float2(reinterpret_cast<half2 *>(res)[i]);
-        r = __half22float2(__floats2half2_rn(r.x + old.x, r.y + old.y));
+        float old[8];
+        unpack8(res[i], old);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) r[j][k] += old[k];
+        sum16 = pack8(r[j]);
+        unpack8(sum16, r[j]);
+        if (weight != nullptr) res[i] = sum16;
       }
       if (weight == nullptr) {
-        reinterpret_cast<half2 *>(out + static_cast<int64_t>(row) * dim)[i] = __floats2half2_rn(r.x, r.y);
+        dst[i] = sum16;
       } else {
-        if (res != nullptr) reinterpret_cast<half2 *>(res)[i] = __floats2half2_rn(r.x, r.y);
-        sumsq += r.x * r.x + r.y * r.y;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) sumsq += r[j][k] * r[j][k];
       }
     }
     if (weight == nullptr) continue;
     const float total = block_sum(sumsq, scratch);
     const float inv = 1.0f / sqrtf(total / dim + eps);
-    const half *srow = res != nullptr ? res : nullptr;
-    for (int i = threadIdx.x; i < dim / 2; i += kThreads) {
-      float2 r;
-      if (srow != nullptr) {
-        r = __half22float2(reinterpret_cast<const half2 *>(srow)[i]);
-      } else {
-        float2 acc = make_float2(0.0f, 0.0f);
-        for (int p = 0; p < ctx.world; ++p) {
-          const float2 f = __half22float2(reinterpret_cast<const half2 *>(
-              local + (ctx.slot_bytes / sizeof(half)) * p + static_cast<int64_t>(row) * dim)[i]);
-          acc.x += f.x;
-          acc.y += f.y;
-        }
-        r = __half22float2(__floats2half2_rn(acc.x, acc.y));
-      }
-      const float2 w = reinterpret_cast<const float2 *>(weight)[i];
-      reinterpret_cast<half2 *>(out + static_cast<int64_t>(row) * dim)[i] =
-          __floats2half2_rn(r.x * inv * w.x, r.y * inv * w.y);
+    const float4 *w4 = reinterpret_cast<const float4 *>(weight);
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      if (i >= vec_per_row) break;
+      const float4 wa = w4[2 * i], wb = w4[2 * i + 1];
+      const float w[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w};
+      float o[8];
+#pragma unroll
+      for (int k = 0; k < 8; ++k) o[k] = r[j][k] * inv * w[k];
+      dst[i] = pack8(o);
     }
     __syncthreads();
   }
@@ -175,11 +206,14 @@ SEVENTY_API int seventy_ar_norm(void *ctx_ptr, void *out, void *residual, const 
                                 int dim, float eps, cudaStream_t stream) {
   using namespace seventy;
   auto *ctx = static_cast<ArContext *>(ctx_ptr);
-  if (ctx == nullptr || out == nullptr || x == nullptr || rows <= 0 || dim <= 0 || dim % 8)
+  if (ctx == nullptr || out == nullptr || x == nullptr || rows <= 0 || dim <= 0 || dim % 8 ||
+      dim / 8 > kThreads * kVecs)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (static_cast<int64_t>(rows) * dim * static_cast<int64_t>(sizeof(half)) > ctx->slot_bytes)
     return SEVENTY_ERR_INVALID_ARGUMENT;
-  if (!aligned(x, 16)) return SEVENTY_ERR_MISALIGNED;
+  if (!aligned(x, 16) || !aligned(out, 16) || (residual != nullptr && !aligned(residual, 16)) ||
+      (weight != nullptr && !aligned(weight, 16)))
+    return SEVENTY_ERR_MISALIGNED;
   const int blocks = rows < kMaxBlocks ? rows : kMaxBlocks;
   ar_norm_kernel<<<blocks, kThreads, 0, stream>>>(*ctx, static_cast<half *>(out), static_cast<half *>(residual),
                                                   static_cast<const half *>(x), weight, rows, dim, eps);
