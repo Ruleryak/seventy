@@ -13,7 +13,7 @@ numerics, the memory model, and the milestones.
 | Speculative decoding | DFlash2 drafters (`DFlash2DraftModel`). |
 | GPUs | V100 16 GB and 32 GB; 1, 2 or 4 GPUs in tensor parallel; any set of GPU ids; NVLink or PCIe. |
 | API | OpenAI-compatible HTTP: chat completions (streaming, tools, thinking on or off, images), completions with logprobs and prompt logprobs, tokenize, models, Prometheus metrics. |
-| Control panel | Startup screen, GPU picker, memory view, live rates, crash reports, automatic restart, API key. |
+| Control panel | Startup screen, GPU picker, memory plan, live dashboard with history, model downloads, engine log, crash reports, automatic restart, API key. |
 
 Other architectures (for example a Qwen4 that changes the layer structure, or a mixture-of-experts model) are
 added as new model modules. The engine core does not assume one architecture.
@@ -61,6 +61,25 @@ API server process ──requests/tokens──────┘
 - The engine runs one process per GPU. Rank 0 owns the scheduler and sends each step's plan to the other ranks.
   All ranks run the same model step on their weight shards.
 - The API server is a separate process, so tokenizing, detokenizing and parsing never delay a GPU step.
+
+## Control panel
+
+`seventy panel` (default 127.0.0.1:8270) does not load PyTorch, so it runs while the engine is stopped.
+
+- Home folder: `$XDG_STATE_HOME/seventy` (else `~/.local/state/seventy`, or `--home`), mode 700. It holds the
+  settings, one run folder per start (`runs/<time>/`, with the settings and the engine log), error reports,
+  the measured memory profiles and the dashboard history (`history.sqlite`, 10-second averages, 30 days).
+- Start: the planner predicts the KV cache size with the engine's own memory model (`seventy/memory.py`); after
+  a start it uses what the engine measured. The engine prints `seventy-stage:` lines; the panel shows them.
+- Stop: SIGINT to the API process; the API process stops the engine process, which stops the tensor-parallel
+  workers (they ignore SIGINT, so all ranks tear down together). SIGKILL to the whole session after 60 s.
+- Crash: an exit nobody asked for, a dead tensor-parallel worker (the engine ends itself), or 8 failed health
+  checks. The panel kills what is left of the session, writes a report and, if allowed, starts the last good
+  settings again (3 times in 10 minutes at most).
+- Access: on an address other than loopback, every `/api/` request needs the UI token (`ui_token` in the home);
+  the panel prints the URL with the token. The engine's API key goes to the engine in its environment, never
+  on the command line.
+- Downloads use the endpoint in the panel settings, or `HF_ENDPOINT`, or the public Hub.
 
 ## Numerics
 

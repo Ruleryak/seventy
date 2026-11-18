@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>seventy</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="viz-root">
+<header class="top">
+  <div class="brand"><span class="logo" aria-hidden="true">70</span><span>seventy</span><span id="instance" class="muted"></span></div>
+  <div id="state" class="chip" role="status" aria-live="polite"><span class="icon" aria-hidden="true"></span><span class="label">…</span></div>
+  <div id="endpoint" class="muted mono"></div>
+  <div class="actions">
+    <button id="btn-restart" class="ghost" hidden>Restart</button>
+    <button id="btn-stop" class="ghost danger" hidden>Stop engine</button>
+    <button id="theme" class="ghost icon-btn" title="Light or dark" aria-label="Switch light or dark">◐</button>
+  </div>
+</header>
+<nav class="tabs" role="tablist">
+  <button role="tab" data-view="dashboard" aria-selected="true">Dashboard</button>
+  <button role="tab" data-view="start">Start</button>
+  <button role="tab" data-view="models">Models</button>
+  <button role="tab" data-view="log">Log</button>
+  <button role="tab" data-view="reports">Error reports</button>
+  <button role="tab" data-view="settings">Settings</button>
+</nav>
+
+<main>
+<section id="view-dashboard" class="view">
+  <div id="banner" class="banner" hidden></div>
+  <div id="starting" class="card" hidden>
+    <h2>Starting the engine</h2>
+    <ol id="stages" class="stages"></ol>
+    <pre id="start-log" class="log small"></pre>
+    <div class="row"><button id="btn-cancel" class="ghost danger">Cancel</button></div>
+  </div>
+  <div class="filters" role="group" aria-label="Time range">
+    <span class="muted">Range</span>
+    <div id="ranges" class="seg"></div>
+    <label class="check"><input type="checkbox" id="show-tables"> Show data tables</label>
+  </div>
+  <div id="tiles" class="tiles"></div>
+  <div id="charts" class="charts"></div>
+</section>
+
+<section id="view-start" class="view" hidden>
+  <div class="grid2">
+    <div>
+      <div class="card"><h2>1. This machine</h2><div id="machine"></div></div>
+      <div class="card">
+        <h2>2. Model</h2>
+        <label>Target model <select id="f-model"></select></label>
+        <div id="model-note" class="note"></div>
+        <label>DFlash2 drafter (speculative decoding) <select id="f-draft"></select></label>
+      </div>
+      <div class="card"><h2>3. GPUs</h2><div id="f-gpus" class="gpu-pick"></div></div>
+      <div class="card">
+        <h2>4. Options</h2>
+        <div class="form2">
+          <label>Maximum context per request <input id="f-maxlen" type="number" min="1024" step="1024"></label>
+          <label>Concurrent streams <input id="f-seqs" type="number" min="1" max="64" value="8"></label>
+          <label>GPU memory budget <input id="f-util" type="number" min="0.5" max="0.98" step="0.01" value="0.90"></label>
+          <label>Prompt tokens per step <input id="f-prefill" type="number" min="512" step="512" value="4096"></label>
+          <label>KV cache format <select id="f-kv"><option value="int8">INT8 (per token and head)</option><option value="fp16">FP16</option></select></label>
+          <label>Thinking by default <select id="f-think"><option value="1">On</option><option value="0">Off</option></select></label>
+          <label>Images per request <input id="f-images" type="number" min="0" max="256" value="20"></label>
+          <label>Videos per request <input id="f-videos" type="number" min="0" max="16" value="1"></label>
+          <label>Largest image (pixels, empty = model limit) <input id="f-pixels" type="number" min="65536" step="65536"></label>
+          <label>Served model name <input id="f-name" type="text" placeholder="the model folder name"></label>
+          <label class="check"><input id="f-graphs" type="checkbox" checked> CUDA graphs</label>
+          <label class="check"><input id="f-prefix" type="checkbox" checked> Prefix cache</label>
+        </div>
+      </div>
+      <div class="card">
+        <h2>5. Access</h2>
+        <div class="form2">
+          <label>Listen on <select id="f-host"><option value="127.0.0.1">This machine only (127.0.0.1)</option><option value="0.0.0.0">The network (0.0.0.0)</option></select></label>
+          <label>API port <input id="f-port" type="number" min="1" max="65535" value="8000"></label>
+          <label class="wide">API key (empty = none) <span class="row"><input id="f-key" type="password" autocomplete="off"><button id="btn-key" class="ghost" type="button">Generate</button><button id="btn-showkey" class="ghost" type="button" aria-label="Show the key">Show</button></span></label>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="card sticky">
+        <h2>Plan</h2>
+        <div id="plan"></div>
+        <div class="row"><button id="btn-start" class="primary">Start engine</button></div>
+        <div id="start-error" class="error" role="alert"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="view-models" class="view" hidden>
+  <div class="card">
+    <h2>Models on this machine</h2>
+    <div id="models-table"></div>
+    <div class="row"><label class="grow">Add a folder <input id="m-dir" type="text" placeholder="/path/to/models or a checkpoint folder"></label><button id="btn-adddir" class="ghost">Add</button></div>
+  </div>
+  <div class="card">
+    <h2>Download from Hugging Face</h2>
+    <div class="row"><label class="grow">Repository <input id="m-repo" type="text" placeholder="owner/name"></label><button id="btn-download" class="primary">Download</button></div>
+    <div class="note">Endpoint: <span id="m-endpoint" class="mono"></span> (change it in Settings)</div>
+    <div id="downloads"></div>
+  </div>
+</section>
+
+<section id="view-log" class="view" hidden>
+  <div class="card">
+    <div class="row between"><h2>Engine log</h2><label class="check"><input type="checkbox" id="log-follow" checked> Follow</label></div>
+    <pre id="log" class="log"></pre>
+  </div>
+</section>
+
+<section id="view-reports" class="view" hidden>
+  <div class="card"><h2>Error reports</h2><div id="reports"></div></div>
+  <div class="card" id="report-card" hidden><h2 id="report-title"></h2><div id="report-meta" class="note"></div><pre id="report-log" class="log"></pre></div>
+</section>
+
+<section id="view-settings" class="view" hidden>
+  <div class="card">
+    <h2>Settings</h2>
+    <div class="form2">
+      <label>Instance name <input id="s-name" type="text"></label>
+      <label>Hugging Face endpoint (empty = huggingface.co or HF_ENDPOINT) <input id="s-endpoint" type="text" placeholder="https://huggingface.co"></label>
+      <label class="check"><input id="s-autostart" type="checkbox"> Start the last good engine when the panel starts</label>
+      <label class="check"><input id="s-restart" type="checkbox"> Restart the engine after a crash (3 times in 10 minutes at most)</label>
+    </div>
+    <div class="row"><button id="btn-save" class="primary">Save</button><span id="s-saved" class="muted"></span></div>
+  </div>
+  <div class="card"><h2>About</h2><div id="about" class="note"></div></div>
+</section>
+</main>
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

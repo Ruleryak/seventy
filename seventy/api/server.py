@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from tokenizers import Tokenizer
 
-from .. import multimodal
+from .. import __version__, multimodal
 from ..config import load_config
 from ..engine.engine import EngineConfig
 from ..engine.sampling import SamplingParams
@@ -208,6 +208,7 @@ def create_app(config: ServerConfig) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
+        arrival = time.time()
         check_key(request)
         body = await request.json()
         if int(body.get("n") or 1) != 1:
@@ -228,7 +229,7 @@ def create_app(config: ServerConfig) -> FastAPI:
             dec = IncrementalDecoder(tokenizer)
             parser = OutputParser(reasoning=thinking, tools=tools)
             out_tokens = 0
-            async for out in client.generate(prompt, params, rid, images=images):
+            async for out in client.generate(prompt, params, rid, images=images, arrival=arrival):
                 out_tokens = out.output_tokens
                 text = dec.push(out.new_tokens)
                 if out.finished:
@@ -316,6 +317,7 @@ def create_app(config: ServerConfig) -> FastAPI:
 
     @app.post("/v1/completions")
     async def completions(request: Request):
+        arrival = time.time()
         check_key(request)
         body = await request.json()
         raw = body.get("prompt", "")
@@ -338,7 +340,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         dec = IncrementalDecoder(tokenizer)
         text, tokens, lps, reason, prompt_lps, ctok = "", [], [], None, None, 0
         try:
-            async for out in client.generate(prompt, params, rid):
+            async for out in client.generate(prompt, params, rid, arrival=arrival):
                 piece = dec.push(out.new_tokens) + (dec.flush() if out.finished else "")
                 text += stops.feed(piece, final=out.finished)
                 tokens += out.new_tokens
@@ -403,7 +405,25 @@ def create_app(config: ServerConfig) -> FastAPI:
         m("preemptions_total", "counter", s.get("preemptions", 0), "Sequences preempted.")
         m("engine_steps_total", "counter", s.get("steps", 0), "Engine iterations.")
         m("step_time_ms", "gauge", round(s.get("step_ms", 0.0), 3), "Smoothed engine iteration time.")
+        m("prefix_cache_hits_total", "counter", s.get("cache_hits", 0), "Requests that reused a prefix-cache entry.")
+        m("prefix_cache_hit_tokens_total", "counter", s.get("cache_hit_tokens", 0),
+          "Prompt tokens reused from the prefix cache (not computed).")
+        m("spec_verify_steps_total", "counter", s.get("verify_steps", 0), "Speculative verify rows (one per sequence).")
+        m("spec_draft_tokens_total", "counter", s.get("drafted_tokens", 0), "Draft tokens proposed.")
+        m("spec_accepted_tokens_total", "counter", s.get("accepted_tokens", 0), "Draft tokens accepted.")
+        m("vision_encodes_total", "counter", s.get("images", 0), "Images and video frame pairs encoded.")
+        m("uptime_seconds", "gauge", round(s.get("uptime_s", 0.0), 1), "Seconds since the engine started.")
+        lines.extend(client.ttft.lines("seventy:time_to_first_token_seconds",
+                                       "Time from the HTTP request to its first token."))
+        lines.extend(client.latency.lines("seventy:request_latency_seconds",
+                                          "Time from the HTTP request to its last token."))
         return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
+    @app.get("/info")
+    async def info(request: Request):
+        check_key(request)
+        return {"served_model_name": config.served_model_name, "model": str(model_path), "version": __version__,
+                **client.info}
 
     return app
 

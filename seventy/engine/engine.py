@@ -16,7 +16,8 @@ from pathlib import Path
 import torch
 import torch.multiprocessing as mp
 
-from ..config import ModelConfig, load_config
+from .. import memory
+from ..config import load_config
 from ..parallel import Parallel
 from . import distributed
 from .cache import ModelCache
@@ -55,17 +56,17 @@ class RequestOutput:
     output_tokens: int = 0
 
 
-def bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: torch.dtype, tp: int = 1) -> int:
-    t = cfg.text
-    per_vec = t.head_dim * (1 if kv_dtype == torch.int8 else 2) + (4 if kv_dtype == torch.int8 else 0)
-    return len(t.attention_layers) * 2 * block_size * (t.num_kv_heads // tp) * per_vec
+def display_name(path: str | Path) -> str:
+    """owner/name for a Hugging Face cache snapshot folder, else the folder name."""
+    for part in Path(path).parts:
+        if part.startswith("models--"):
+            return part[len("models--"):].replace("--", "/")
+    return Path(path).name
 
 
-def bytes_per_slot(cfg: ModelConfig, tp: int = 1) -> int:
-    t = cfg.text
-    hv = t.gdn_v_heads // tp
-    conv = (2 * t.gdn_k_heads * t.gdn_k_dim + t.gdn_v_heads * t.gdn_v_dim) // tp
-    return len(t.linear_layers) * (hv * t.gdn_k_dim * t.gdn_v_dim * 4 + conv * (t.conv_kernel - 1) * 2)
+def _stage(name: str, detail: str = "") -> None:
+    """A startup progress line for the control panel (see seventy.panel.supervisor)."""
+    print(f"seventy-stage: {name} {detail}".rstrip(), flush=True)
 
 
 class Engine:
@@ -85,6 +86,7 @@ class Engine:
         self.workers, peers = [], []
         port = distributed.free_port()
         if tp > 1:
+            _stage("workers", f"starting {tp - 1} tensor-parallel worker processes")
             ctx = mp.get_context("spawn")
             for rank in range(1, tp):
                 parent, child = ctx.Pipe()
@@ -98,30 +100,36 @@ class Engine:
             distributed.init(0, tp, port, "nccl")
         from .worker import load_shard
 
+        _stage("weights", f"loading {display_name(path)} on {tp} GPU(s)")
         _, self.model = load_shard(str(path), 0, tp, self.device, torch.float16)
+        torch.cuda.synchronize()
+        weights = torch.cuda.memory_allocated(self.device)
         self.drafter = None
         if config.draft_model:
             from ..model.dflash2 import Drafter
 
+            _stage("drafter", f"loading {display_name(config.draft_model)}")
             self.drafter = Drafter(config.draft_model, self.model, self.device, torch.float16, par=Parallel(0, tp))
         torch.cuda.synchronize()
+        drafter_bytes = torch.cuda.memory_allocated(self.device) - weights
         budgets = [distributed.memory_budget(self.device, config.gpu_memory_utilization, reserve)]
         for conn, proc in zip(peers, self.workers):
             budgets.append(_expect(conn, "ready", proc))
         slots = config.max_num_seqs
         entries = (config.cache_entries or config.max_num_seqs) if config.prefix_cache else 0
         total_slots = slots + entries
-        per_block = bytes_per_block(self.model_config, config.block_size, kv_dtype, tp)
+        kv_name = "int8" if kv_dtype == torch.int8 else "fp16"
+        per_block = memory.kv_bytes_per_block(self.model_config, config.block_size, kv_name, tp)
         ring = self.drafter.ring_bytes_per_slot() if self.drafter is not None else 0
-        state = (total_slots + 1) * (bytes_per_slot(self.model_config, tp) + ring)
+        state = (total_slots + 1) * (memory.state_bytes_per_slot(self.model_config, tp) + ring)
         num_blocks = (min(budgets) - state) // per_block
         need = -(-config.max_model_len // config.block_size)
         if num_blocks < min(need, 64):
             raise RuntimeError(f"not enough GPU memory for the KV cache ({num_blocks} blocks)")
         num_blocks = min(num_blocks, need * total_slots)
-        kv_name = "int8" if kv_dtype == torch.int8 else "float16"
+        _stage("cache", f"{num_blocks * config.block_size} KV tokens on each GPU")
         for conn in peers:
-            conn.send(("init", num_blocks, config.block_size, total_slots, kv_name))
+            conn.send(("init", num_blocks, config.block_size, total_slots, "int8" if kv_dtype == torch.int8 else "float16"))
         self.cache = ModelCache(self.model_config.text, num_blocks, config.block_size, total_slots, torch.float16,
                                 self.device, par=Parallel(0, tp), kv_dtype=kv_dtype)
         if self.drafter is not None:
@@ -130,6 +138,9 @@ class Engine:
         for conn, proc in zip(peers, self.workers):
             _expect(conn, "ok", proc)
         self.runner = ModelRunner(self.model, self.cache, self.device, peers, self.drafter)
+        before_graphs = torch.cuda.memory_reserved(self.device)
+        if config.cuda_graphs:
+            _stage("graphs", "capturing CUDA graphs")
         if config.cuda_graphs and self.drafter is not None:
             from .graphs import BUCKETS
 
@@ -145,6 +156,15 @@ class Engine:
             if slots not in buckets and slots <= 64:
                 buckets += (slots,)
             self.runner.capture(need, buckets)
+        torch.cuda.synchronize(self.device)
+        self.memory = {"gpu_total": torch.cuda.get_device_properties(self.device).total_memory,
+                       "weights": weights, "drafter": drafter_bytes, "kv": num_blocks * per_block, "state": state,
+                       "graphs": max(0, torch.cuda.memory_reserved(self.device) - before_graphs),
+                       "budget_min": min(budgets), "reserve": reserve}
+        if self.workers:
+            import threading
+
+            threading.Thread(target=self._watch_workers, daemon=True, name="worker-watch").start()
         self.scheduler = Scheduler(num_blocks, config.block_size, total_slots, config.max_model_len,
                                    prefill_budget=config.prefill_budget, max_running=slots, cache_entries=entries)
         self.eos = tuple(self.model_config.text.eos_token_ids)
@@ -153,6 +173,19 @@ class Engine:
         self.stats = {"steps": 0, "prompt_tokens": 0, "generated_tokens": 0, "preemptions": 0, "cache_hits": 0,
                       "cache_hit_tokens": 0, "verify_steps": 0, "drafted_tokens": 0, "accepted_tokens": 0,
                       "images": 0}
+
+    def _watch_workers(self) -> None:
+        """A dead tensor-parallel worker leaves rank 0 waiting in a collective forever: end the process instead,
+        so whoever runs it (the API process, the panel) sees the failure."""
+        import time
+
+        while not getattr(self, "_closing", False):
+            for p in self.workers:
+                if not p.is_alive() and not getattr(self, "_closing", False):
+                    print(f"seventy: tensor-parallel worker {p.name} exited with code {p.exitcode}; stopping",
+                          flush=True)
+                    os._exit(70)
+            time.sleep(1.0)
 
     @property
     def kv_capacity_tokens(self) -> int:
@@ -443,6 +476,7 @@ class Engine:
 
     def close(self) -> None:
         """Stop the workers. Every rank tears its process group down at the same time (NCCL needs that)."""
+        self._closing = True
         self.runner.close()
         self.runner.graphs = None
         self.runner.spec_graphs = None

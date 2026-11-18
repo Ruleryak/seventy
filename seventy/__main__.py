@@ -84,6 +84,15 @@ def cmd_engine(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_panel(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from .panel.app import run
+
+    run(args.host, args.port, Path(args.home) if args.home else None)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="seventy", description=__doc__)
     parser.add_argument("--version", action="version", version=f"seventy {__version__}")
@@ -115,6 +124,11 @@ def main(argv: list[str] | None = None) -> int:
     eng.add_argument("--max-images-per-request", type=int, default=20)
     eng.add_argument("--max-videos-per-request", type=int, default=1)
     eng.set_defaults(fn=cmd_engine)
+    pan = sub.add_parser("panel", help="the control panel: start, watch and stop the engine from a browser")
+    pan.add_argument("--host", default="127.0.0.1", help="0.0.0.0 opens the panel to the network (needs the UI token)")
+    pan.add_argument("--port", type=int, default=8270)
+    pan.add_argument("--home", help="settings, logs and history (default: $XDG_STATE_HOME/seventy)")
+    pan.set_defaults(fn=cmd_panel)
     args = parser.parse_args(argv)
     return args.fn(args)
 

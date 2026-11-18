@@ -57,6 +57,34 @@
   SEVENTY_TEST_MODEL=/path/to/checkpoint .venv/bin/pytest -m model
   ```
 
+## Run from the source tree
+
+- The control panel, for this machine only (open http://127.0.0.1:8270/):
+
+  ```
+  .venv/bin/seventy panel
+  ```
+
+- The control panel, open to the network. It prints a URL with the UI token:
+
+  ```
+  .venv/bin/seventy panel --host 0.0.0.0
+  ```
+
+- The control panel with a separate home folder, so a test does not change your settings or history:
+
+  ```
+  .venv/bin/seventy panel --port 8271 --home /path/to/test-home
+  ```
+
+- The engine alone, without the panel (4 GPUs, with the DFlash2 drafter):
+
+  ```
+  .venv/bin/seventy engine --model /path/to/model --draft-model /path/to/drafter --gpus 0,1,2,3
+  ```
+
+You can run each command again; the panel keeps its settings and history in its home folder.
+
 ## Build the wheel
 
 ```

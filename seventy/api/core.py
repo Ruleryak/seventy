@@ -24,14 +24,25 @@ from ..engine.sampling import SamplingParams
 
 
 def engine_process_main(config: dict, req_addr: str, out_addr: str, ready) -> None:
+    """The engine process. It ignores SIGINT: the API process stops it with a "shutdown" message, so the
+    tensor-parallel ranks tear down together. It also stops when the API process is gone."""
+    import signal
+
     from ..engine.engine import Engine
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    parent = os.getppid()
 
     try:
         engine = Engine(EngineConfig(**config))
     except Exception:
         ready.send(("error", traceback.format_exc()))
         raise
-    ready.send(("ready", {"kv_tokens": engine.kv_capacity_tokens, "pid": os.getpid(), "vision": engine.vision}))
+    c = engine.config
+    ready.send(("ready", {"kv_tokens": engine.kv_capacity_tokens, "pid": os.getpid(), "vision": engine.vision,
+                          "draft": engine.drafter is not None, "tensor_parallel": c.tensor_parallel,
+                          "max_model_len": c.max_model_len, "max_num_seqs": c.max_num_seqs,
+                          "kv_dtype": c.kv_dtype, "memory": engine.memory}))
     ctx = zmq.Context()
     pull = ctx.socket(zmq.PULL)
     pull.connect(req_addr)
@@ -72,6 +83,9 @@ def engine_process_main(config: dict, req_addr: str, out_addr: str, ready) -> No
         while alive:
             if not engine.has_work():
                 if pull.poll(1000) == 0:
+                    if os.getppid() != parent:
+                        print("seventy: the API process is gone; stopping the engine", flush=True)
+                        break
                     push.send(pickle.dumps(("stats", snapshot())))
                     continue
             while alive and pull.poll(0):
@@ -84,7 +98,32 @@ def engine_process_main(config: dict, req_addr: str, out_addr: str, ready) -> No
             counters["finished"] += sum(1 for o in outputs if o.finished)
             push.send(pickle.dumps(("out", outputs, snapshot())))
     finally:
+        print("seventy: stopping the engine", flush=True)
         engine.close()
+        print("seventy: engine stopped", flush=True)
+
+
+class Histogram:
+    """A Prometheus histogram: cumulative bucket counts, sum and count."""
+
+    def __init__(self, buckets: tuple[float, ...]):
+        self.buckets = buckets
+        self.counts = [0] * len(buckets)
+        self.sum = 0.0
+        self.count = 0
+
+    def observe(self, value: float) -> None:
+        self.sum += value
+        self.count += 1
+        for i, b in enumerate(self.buckets):
+            if value <= b:
+                self.counts[i] += 1
+
+    def lines(self, name: str, help_text: str) -> list[str]:
+        out = [f"# HELP {name} {help_text}", f"# TYPE {name} histogram"]
+        out += [f'{name}_bucket{{le="{b}"}} {c}' for b, c in zip(self.buckets, self.counts)]
+        out += [f'{name}_bucket{{le="+Inf"}} {self.count}', f"{name}_sum {self.sum}", f"{name}_count {self.count}"]
+        return out
 
 
 class EngineClient:
@@ -97,6 +136,8 @@ class EngineClient:
         self.info: dict = {}
         self.process = None
         self.dead: str | None = None
+        self.ttft = Histogram((0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0))
+        self.latency = Histogram((1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0, 640.0, 1280.0))
 
     async def start(self) -> None:
         import torch.multiprocessing as mp
@@ -149,11 +190,15 @@ class EngineClient:
                     q.put_nowait(RuntimeError(self.dead))
                 os._exit(1)
 
-    async def generate(self, prompt: list[int], params: SamplingParams, request_id: str | None = None, images=None):
+    async def generate(self, prompt: list[int], params: SamplingParams, request_id: str | None = None, images=None,
+                       arrival: float | None = None):
         """Yields RequestOutput objects (new tokens per step) until the request finishes. images: the
-        seventy.multimodal.PromptImages of an expanded prompt."""
+        seventy.multimodal.PromptImages of an expanded prompt; arrival: when the HTTP request came in (time.time),
+        for the time-to-first-token and latency histograms."""
         if self.dead:
             raise RuntimeError(self.dead)
+        arrival = arrival or time.time()
+        first = True
         rid = request_id or uuid.uuid4().hex
         q: asyncio.Queue = asyncio.Queue()
         self.queues[rid] = q
@@ -163,6 +208,11 @@ class EngineClient:
                 item = await q.get()
                 if isinstance(item, Exception):
                     raise item
+                if first and item.new_tokens:
+                    first = False
+                    self.ttft.observe(time.time() - arrival)
+                if item.finished:
+                    self.latency.observe(time.time() - arrival)
                 yield item
                 if item.finished:
                     return

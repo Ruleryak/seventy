@@ -42,9 +42,27 @@ def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None
     return cfg, model
 
 
+def _watch_parent() -> None:
+    """End this worker when rank 0's process is gone (it may be waiting in a collective that never completes)."""
+    import threading
+    import time
+
+    parent = os.getppid()
+
+    def watch():
+        while True:
+            time.sleep(1.0)
+            if os.getppid() != parent:
+                os._exit(71)
+
+    threading.Thread(target=watch, daemon=True, name="parent-watch").start()
+
+
 def worker_main(rank: int, size: int, port: int, backend: str, device_name: str, model_path: str, dtype_name: str,
                 utilization: float, reserve_bytes: int, conn, layers=None, draft_path: str | None = None) -> None:
     faulthandler.register(signal.SIGUSR1, all_threads=True)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _watch_parent()
     try:
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         device = torch.device(device_name)
