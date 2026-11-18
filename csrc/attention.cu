@@ -161,8 +161,9 @@ __global__ void __launch_bounds__(kHead) decode_attention_kernel(
   const int rows = group * tokens;
   const int total = context_lens[b] + tokens;
   const int seq_blocks = (total + block_size - 1) / block_size;
-  const int blocks_per_split = (seq_blocks + max_splits - 1) / max_splits;
-  const int first = split * blocks_per_split * block_size;
+  const int used = max(1, min(max_splits, (total + 255) / 256));
+  const int blocks_per_split = (seq_blocks + used - 1) / used;
+  const int first = split < used ? split * blocks_per_split * block_size : total;
   const int last = min(total, first + blocks_per_split * block_size);
   const int tid = threadIdx.x;
   if (tokens <= 0 || rows > kMaxRows) return;

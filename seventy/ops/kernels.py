@@ -200,10 +200,13 @@ def decode_attention_splits(num_seqs: int, hkv: int, device: torch.device) -> in
     return max(1, min(256, round(2 * _sm_count(device) / max(1, num_seqs * hkv))))
 
 
+VERIFY_MIN_SPLIT_KEYS = 128
+
+
 def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                      block_tables: torch.Tensor, query_start: torch.Tensor, context_lens: torch.Tensor,
                      max_query_len: int, max_blocks: int, scale: float, k_scale: torch.Tensor | None = None,
-                     v_scale: torch.Tensor | None = None) -> torch.Tensor:
+                     v_scale: torch.Tensor | None = None, min_split_keys: int | None = None) -> torch.Tensor:
     """Gated attention output [T, hq * 256] for steps with few new tokens per sequence."""
     t, hq, _ = q.shape
     hkv, block_size = k_cache.shape[2], k_cache.shape[1]
@@ -214,12 +217,14 @@ def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, 
     ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=q.device)
     out = torch.empty(t, hq * 256, dtype=torch.float16, device=q.device)
     ks, vs, kind = _kv_args(k_cache, v_cache, k_scale, v_scale)
-    code = lib().seventy_decode_attention(
-        out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), ks, vs, kind, qkv.data_ptr(), qkv.shape[1],
-        block_tables.data_ptr(), block_tables.shape[1], query_start.data_ptr(), context_lens.data_ptr(),
-        context_lens.numel(), t, max_query_len, block_size, hq, hkv, 256, splits, scale, ws.data_ptr(),
-        ws.numel() * 4, _stream(q),
-    )
+    common = (out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), ks, vs, kind, qkv.data_ptr(),
+              qkv.shape[1], block_tables.data_ptr(), block_tables.shape[1], query_start.data_ptr(),
+              context_lens.data_ptr(), context_lens.numel(), t, max_query_len, block_size, hq, hkv, 256, splits)
+    if max_query_len > 1:
+        code = lib().seventy_verify_attention(*common, min_split_keys or VERIFY_MIN_SPLIT_KEYS, scale, ws.data_ptr(),
+                                              ws.numel() * 4, _stream(q))
+    else:
+        code = lib().seventy_decode_attention(*common, scale, ws.data_ptr(), ws.numel() * 4, _stream(q))
     check("decode_attention", code)
     return out
 

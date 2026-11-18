@@ -139,3 +139,16 @@ SEVENTY_API int seventy_flash_attention(void *out, const void *q, const void *k_
                                         int table_width, const int *query_start, const int *context_lens,
                                         int block_size, int hq, int hkv, int head_dim, float scale,
                                         cudaStream_t stream);
+
+/*
+ * Causal attention for speculative verify steps ((hq / hkv) * max_query_len <= 64) on tensor cores, with the same
+ * arguments and result as seventy_decode_attention (see csrc/flash_attention.cu). Each sequence uses
+ * min(splits, ceil(keys / min_split_keys)) of the `splits` blocks.
+ */
+SEVENTY_API int seventy_verify_attention(void *out, const void *q, const void *k_cache, const void *v_cache,
+                                         const float *k_scale, const float *v_scale, int kv_type, const void *qkv,
+                                         int ld, const int *block_tables, int table_width, const int *query_start,
+                                         const int *context_lens, int num_seqs, int tokens, int max_query_len,
+                                         int block_size, int hq, int hkv, int head_dim, int splits,
+                                         int min_split_keys, float scale, void *workspace, int64_t workspace_bytes,
+                                         cudaStream_t stream);
