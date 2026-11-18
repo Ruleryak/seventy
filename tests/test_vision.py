@@ -139,3 +139,85 @@ def test_vision_tower_matches_reference(model_path):
         err = ((ours - ref).norm() / ref.norm()).item()
         cos = torch.nn.functional.cosine_similarity(ours, ref, dim=-1).min().item()
         assert err < 5e-3 and cos > 0.999, (err, cos)
+
+
+def synthetic_video(n: int, h: int, w: int) -> np.ndarray:
+    return np.stack([synthetic_image(h, w, seed=i) for i in range(n)])
+
+
+@pytest.mark.parametrize("n, fps, h, w", [(30, 10.0, 180, 320), (25, 24.0, 233, 401), (7, 2.0, 96, 128)])
+def test_video_pixels_and_timestamps_match_reference(n, fps, h, w):
+    vp = pytest.importorskip("transformers.models.qwen3_vl.video_processing_qwen3_vl")
+    pytest.importorskip("torchvision")
+    from transformers.video_utils import VideoMetadata
+
+    settings = mm.VideoSettings()
+    proc = vp.Qwen3VLVideoProcessor(patch_size=16, temporal_patch_size=2, merge_size=2,
+                                    size={"shortest_edge": 4096, "longest_edge": 25165824},
+                                    image_mean=[0.5] * 3, image_std=[0.5] * 3)
+    video = synthetic_video(n, h, w)
+    meta = VideoMetadata(total_num_frames=n, fps=fps, frames_indices=list(range(n)))
+    ref = proc(videos=[video], video_metadata=[meta], do_sample_frames=True, cap_pixels_per_frame=False,
+               return_tensors="pt", return_metadata=True)
+    idx = mm.sample_indices(n, fps, settings)
+    media = mm.prepare_video(video[idx], idx, fps, settings)
+    t, gh, gw = ref["video_grid_thw"][0].tolist()
+    assert len(media.groups) == t and media.groups[0].grid == (1, gh, gw)
+    ours = torch.cat([patchify(torch.from_numpy(g.pixels), 16, 2, 2) for g in media.groups])
+    assert ours.shape == ref["pixel_values_videos"].shape
+    assert (ours - ref["pixel_values_videos"]).abs().max().item() < 1e-6
+    ref_idx = list(ref["video_metadata"][0].frames_indices)
+    assert ref_idx == idx
+    pad = ref_idx + [ref_idx[-1]] * (len(ref_idx) % 2)
+    secs = [i / fps for i in pad]
+    want = [(secs[i] + secs[i + 1]) / 2 for i in range(0, len(secs), 2)]
+    assert media.timestamps == pytest.approx(want)
+
+
+def test_video_expansion_and_positions_match_reference():
+    hf = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+    tok = mm.MediaTokens(image=248056, video=248057, vision_start=248053, vision_end=248054)
+    video = synthetic_video(8, 64, 96)
+    idx = list(range(8))
+    media = mm.prepare_video(video, idx, 4.0, mm.VideoSettings(min_pixels=4096))
+    img = mm.prepare_image(synthetic_image(64, 64), mm.ImageSettings(min_pixels=4096))
+    stamps = {}
+
+    def encode(text):
+        stamps.setdefault(text, [900 + len(stamps), 901 + len(stamps)])
+        return stamps[text]
+
+    ids = [1, tok.vision_start, tok.image, tok.vision_end, 2, tok.vision_start, tok.video, tok.vision_end, 3, 4]
+    out, info = mm.expand(ids, [mm.Media("image", [img]), media], tok, 2, encode)
+    assert sorted(stamps) == sorted(f"<{s:.1f} seconds>" for s in media.timestamps)
+    assert len(info.images) == 1 + len(media.groups)
+    for (off, n), g in zip(info.spans, info.images):
+        assert n == g.tokens(2)
+        assert all(t in (tok.image, tok.video) for t in out[off : off + n])
+    fake = types.SimpleNamespace(config=types.SimpleNamespace(vision_config=types.SimpleNamespace(spatial_merge_size=2)))
+    fake.get_vision_position_ids = lambda *a, **k: hf.Qwen3_5Model.get_vision_position_ids(fake, *a, **k)
+    ids_t = torch.tensor([out])
+    types_t = (ids_t == tok.image).int() + 2 * (ids_t == tok.video).int()
+    grid_v = torch.tensor([[len(media.groups), *media.groups[0].grid[1:]]])
+    ref, delta = hf.Qwen3_5Model.get_rope_index(fake, ids_t, types_t, image_grid_thw=torch.tensor([img.grid]),
+                                                video_grid_thw=grid_v)
+    assert np.array_equal(info.positions, ref[:, 0].numpy())
+    assert info.delta == int(delta[0, 0])
+    with pytest.raises(mm.ImageError):
+        mm.expand(ids, [media, mm.Media("image", [img])], tok, 2, encode)
+
+
+def test_decode_video_reads_sampled_frames(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    path = tmp_path / "v.avi"
+    frames = [np.full((64, 96, 3), (i * 20) % 256, np.uint8) for i in range(12)]
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 6.0, (96, 64))
+    for f in frames:
+        writer.write(f)
+    writer.release()
+    got, idx, fps = mm.decode_video(path.read_bytes(), mm.VideoSettings())
+    assert fps == pytest.approx(6.0)
+    assert idx == mm.sample_indices(12, 6.0, mm.VideoSettings())
+    assert got.shape == (len(idx), 64, 96, 3)
+    for g, i in zip(got, idx):
+        assert abs(int(g.mean()) - (i * 20) % 256) <= 3

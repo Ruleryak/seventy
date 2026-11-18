@@ -173,10 +173,10 @@ class Engine:
         if images is not None and images.images:
             if not self.vision:
                 raise ValueError("this model has no vision tower; images are not supported")
-            tok = self.model_config.image_token_id
+            pads = {self.model_config.image_token_id, self.model_config.video_token_id}
             for off, n in images.spans:
-                if off < 0 or off + n > len(prompt) or any(t != tok for t in prompt[off : off + n]):
-                    raise ValueError("image spans do not match the prompt's image tokens")
+                if off < 0 or off + n > len(prompt) or len(set(prompt[off : off + n])) != 1 or prompt[off] not in pads:
+                    raise ValueError("image spans do not match the prompt's image and video tokens")
             if images.positions.shape != (3, len(prompt)):
                 raise ValueError("image positions do not match the prompt")
         else:

@@ -33,6 +33,7 @@ class ServerConfig:
     max_tokens_default: int | None = None
     max_image_pixels: int | None = None
     max_images_per_request: int = 20
+    max_videos_per_request: int = 1
 
 
 def _generation_defaults(model_path: Path) -> dict:
@@ -81,6 +82,10 @@ def create_app(config: ServerConfig) -> FastAPI:
     max_len = config.engine.max_model_len
     model_cfg = load_config(model_path)
     images_cfg = multimodal.ImageSettings.from_model(model_path)
+    videos_cfg = multimodal.VideoSettings.from_model(model_path)
+    media_tokens = multimodal.MediaTokens(model_cfg.image_token_id, model_cfg.video_token_id,
+                                          model_cfg.vision_start_token_id, model_cfg.vision_end_token_id) \
+        if model_cfg.image_token_id is not None else None
     if config.max_image_pixels:
         import dataclasses
 
@@ -135,22 +140,29 @@ def create_app(config: ServerConfig) -> FastAPI:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty list")
-        urls = multimodal.image_urls(messages)
-        if urls and not client.info.get("vision"):
-            raise ValueError("this model does not take images")
-        if len(urls) > config.max_images_per_request:
-            raise ValueError(f"the request has {len(urls)} images; the limit is {config.max_images_per_request}")
+        urls = multimodal.media_urls(messages)
+        if urls and (not client.info.get("vision") or media_tokens is None):
+            raise ValueError("this model does not take images or videos")
+        n_img = sum(kind == "image" for kind, _ in urls)
+        n_vid = len(urls) - n_img
+        if n_img > config.max_images_per_request:
+            raise ValueError(f"the request has {n_img} images; the limit is {config.max_images_per_request}")
+        if n_vid > config.max_videos_per_request:
+            raise ValueError(f"the request has {n_vid} videos; the limit is {config.max_videos_per_request}")
         kwargs = {**config.default_chat_template_kwargs, **(body.get("chat_template_kwargs") or {})}
         if body.get("reasoning_effort"):
             kwargs.setdefault("reasoning_effort", body["reasoning_effort"])
         tools = body.get("tools") if body.get("tool_choice") != "none" else None
-        text = template.render(messages, tools=tools, add_generation_prompt=True, **kwargs)
+        text = template.render(multimodal.template_messages(messages) if urls else messages, tools=tools,
+                               add_generation_prompt=True, **kwargs)
         thinking = kwargs.get("enable_thinking", True) is not False
         ids = tokenizer.encode(text, add_special_tokens=False).ids
         if not urls:
             return ids, thinking, tools, None
-        images = [multimodal.load_image(u, images_cfg) for u in urls]
-        ids, info = multimodal.expand_prompt(ids, images, model_cfg.image_token_id, images_cfg.merge_size)
+        media = [multimodal.Media("image", [multimodal.load_image(u, images_cfg)]) if kind == "image"
+                 else multimodal.load_video(u, videos_cfg) for kind, u in urls]
+        ids, info = multimodal.expand(ids, media, media_tokens, images_cfg.merge_size,
+                                      lambda text: tokenizer.encode(text, add_special_tokens=False).ids)
         return ids, thinking, tools, info
 
     def usage(prompt: int, completion: int) -> dict:

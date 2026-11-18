@@ -48,12 +48,18 @@ def block_major(t: torch.Tensor, h: int, w: int, merge: int) -> torch.Tensor:
 
 
 def patchify(image: torch.Tensor, patch: int, merge: int, temporal: int) -> torch.Tensor:
-    """uint8 [H, W, 3] (sides multiples of patch x merge) to FP32 patches [h * w, 3 * temporal * patch * patch]:
-    block-major rows, each patch's (channel, frame, row, col) values flattened, the frame repeated."""
-    hh, ww = image.shape[0] // patch, image.shape[1] // patch
-    x = (image.permute(2, 0, 1).float() - 127.5) / 127.5
-    x = x.reshape(3, hh // merge, merge, patch, ww // merge, merge, patch).permute(1, 4, 2, 5, 0, 3, 6)
-    x = x.unsqueeze(5).expand(-1, -1, -1, -1, -1, temporal, -1, -1)
+    """uint8 [H, W, 3] (an image: its frame repeated over the temporal patch) or [temporal, H, W, 3] (video
+    frames), sides multiples of patch x merge, to FP32 patches [h * w, 3 * temporal * patch * patch]: block-major
+    rows, each patch's (channel, frame, row, col) values flattened."""
+    frames = image[None] if image.dim() == 3 else image
+    hh, ww = frames.shape[1] // patch, frames.shape[2] // patch
+    x = (frames.permute(0, 3, 1, 2).float() - 127.5) / 127.5
+    x = x.reshape(frames.shape[0], 3, hh // merge, merge, patch, ww // merge, merge, patch)
+    x = x.permute(2, 5, 3, 6, 1, 0, 4, 7)
+    if frames.shape[0] == 1:
+        x = x.expand(-1, -1, -1, -1, -1, temporal, -1, -1)
+    elif frames.shape[0] != temporal:
+        raise ValueError(f"a video group needs {temporal} frames, not {frames.shape[0]}")
     return x.reshape(hh * ww, 3 * temporal * patch * patch)
 
 
@@ -164,15 +170,16 @@ class VisionTower:
 
     @torch.inference_mode()
     def encode(self, image: torch.Tensor) -> torch.Tensor:
-        """uint8 [H, W, 3] image (already resized) to FP16 embeddings [tokens, out_hidden_size] in LLM order."""
+        """uint8 [H, W, 3] image or [2, H, W, 3] video frame pair (already resized) to FP16 embeddings
+        [tokens, out_hidden_size] in LLM order."""
         c = self.cfg
         p, m = c.patch_size, c.spatial_merge_size
-        if image.dtype != torch.uint8 or image.dim() != 3 or image.shape[2] != 3:
-            raise ValueError("the image must be uint8 [height, width, 3]")
-        if image.shape[0] % (p * m) or image.shape[1] % (p * m):
+        if image.dtype != torch.uint8 or image.dim() not in (3, 4) or image.shape[-1] != 3:
+            raise ValueError("the image must be uint8 [height, width, 3] or [frames, height, width, 3]")
+        if image.shape[-3] % (p * m) or image.shape[-2] % (p * m):
             raise ValueError(f"image sides must be multiples of {p * m}")
         image = image.to(self.device, non_blocking=True)
-        h, w = image.shape[0] // p, image.shape[1] // p
+        h, w = image.shape[-3] // p, image.shape[-2] // p
         patches = patchify(image, p, m, c.temporal_patch_size).half()
         x = torch.mm(patches, self.patch_w.T, out_dtype=torch.float32) + self.patch_b
         pos, cos, sin = self._positions(h, w)

@@ -75,7 +75,7 @@ API server process ──requests/tokens──────┘
 | KV cache (attention layers) | INT8 with one FP32 scale per token and head (default), or FP16 |
 | Vision tower | FP16 weights and GEMM inputs, FP32 residual stream (an outlier channel reaches about 7600) |
 
-## Images
+## Images and videos
 
 - The API process fetches (`data:` or `http(s):` URLs only), decodes and resizes each image: the checkpoint's
   `preprocessor_config.json` limits, antialiased bicubic on the uint8 image (the same operation as the reference
@@ -85,7 +85,10 @@ API server process ──requests/tokens──────┘
 - The engine encodes an image on every rank just before the first prefill chunk that reaches its tokens, and
   drops the embeddings when prefill has passed them. The vision tower is split over the tensor-parallel ranks.
 - The prefix cache matches image tokens by a digest of the resized pixels.
-- Videos are not supported yet.
+- Videos (`video_url` parts, one per request by default): OpenCV decodes the frames, which are sampled at 2 per
+  second (4 to 768) and resized together (`video_preprocessor_config.json`). Each pair of frames is one group: a
+  "<t seconds>" timestamp, then its own vision block in the prompt; the vision tower encodes a group like an image
+  whose two temporal frames differ.
 
 ## Memory model
 
