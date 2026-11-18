@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -144,6 +145,8 @@ class Drafter:
         self.inv_freq = (1.0 / (cfg.rope_theta ** (torch.arange(0, half, dtype=torch.float64) * 2 / cfg.head_dim))
                          ).float().to(device)
         self.groups = cfg.hidden // cfg.group_size
+        self.fused = (self.device.type == "cuda" and dtype == torch.float16 and cfg.head_dim == 128
+                      and os.environ.get("SEVENTY_DRAFTER_FUSED", "1") != "0")
 
     def ring_bytes_per_slot(self) -> int:
         cfg = self.cfg
@@ -162,20 +165,26 @@ class Drafter:
 
     def _norm(self, x, weight, residual=None):
         """RMS norm in FP32; returns (normalized FP16, new FP32 residual or None)."""
+        if self.fused:
+            from ..ops import kernels
+
+            return kernels.drafter_norm(x, weight, self.cfg.eps, residual)
         s = x.float() if residual is None else residual + x.float()
         out = s * torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + self.cfg.eps) * weight
         return out.to(self.dtype), (None if residual is None else s)
 
     @staticmethod
-    def _mm(x: torch.Tensor, w) -> torch.Tensor:
-        """x (FP16) @ w^T with FP32 output. Packed weights use the small-batch FP16 GEMM, 64 rows at a time."""
+    def _mm(x: torch.Tensor, w, row_scale: torch.Tensor | None = None) -> torch.Tensor:
+        """x (FP16) @ w^T with FP32 output (times row_scale per row, packed weights only). Packed weights use the
+        small-batch FP16 GEMM, 64 rows at a time."""
         from ..ops.kernels import DenseWeight, dense_gemm
 
         if isinstance(w, DenseWeight):
             x = x.contiguous()
             if x.shape[0] <= 64:
-                return dense_gemm(x, w)
-            return torch.cat([dense_gemm(x[i : i + 64], w) for i in range(0, x.shape[0], 64)])
+                return dense_gemm(x, w, row_scale=row_scale)
+            return torch.cat([dense_gemm(x[i : i + 64], w, row_scale=None if row_scale is None else row_scale[i : i + 64])
+                              for i in range(0, x.shape[0], 64)])
         return torch.mm(x, w.T, out_dtype=torch.float32) if x.is_cuda else x.float() @ w.float().T
 
     def _mm_scaled(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -196,6 +205,15 @@ class Drafter:
         ctx = self._norm(self._mm(features.to(self.dtype), self.fc), self.hidden_norm)[0]
         kv = self.layers[0].kv
         d = cfg.head_dim
+        if self.fused:
+            from ..ops import kernels
+
+            flat = self._mm(ctx, self.kv_all)
+            width = 2 * kv * d
+            for li, layer in enumerate(self.layers):
+                kernels.drafter_qk(None, flat[:, li * width : (li + 1) * width], None, layer.k_norm, positions, slots,
+                                   self.inv_freq, self.k_ring[li], self.v_ring[li], 0, kv, cfg.eps)
+            return
         allkv = self._mm(ctx, self.kv_all).view(-1, cfg.layers, 2, kv, d)
         cos, sin = self._rope(positions)
         idx = positions % cfg.ring
@@ -207,6 +225,11 @@ class Drafter:
     def _conv(self, x: torch.Tensor, base: torch.Tensor, delta: torch.Tensor, out_dtype=None) -> torch.Tensor:
         """Two-tap grouped convolution within each block of `block` rows: out[t] = c0[t] x[t] + c1[t] x[t - 1]."""
         cfg = self.cfg
+        if self.fused:
+            from ..ops import kernels
+
+            return kernels.drafter_conv(x, base, delta, cfg.group_size, cfg.block,
+                                        (out_dtype or x.dtype) == torch.float32)
         t = x.shape[0]
         xs = x.float().view(t, self.groups, cfg.group_size)
         coef = base.view(1, cfg.taps, self.groups, cfg.group_size) + delta.float().unsqueeze(-1)
@@ -222,6 +245,15 @@ class Drafter:
         cfg = self.cfg
         b = slots.numel()
         blk, d = cfg.block, cfg.head_dim
+        if self.fused:
+            from ..ops import kernels
+
+            q16 = kernels.drafter_qk(self._mm(h, layer.q), self._mm(h, layer.kv_w), layer.q_norm, layer.k_norm,
+                                     positions, slots.repeat_interleave(blk), self.inv_freq, self.k_ring[li],
+                                     self.v_ring[li], layer.heads, layer.kv, cfg.eps)
+            o = kernels.drafter_attention(q16, self.k_ring[li], self.v_ring[li], slots, ends - blk, blk, cfg.window,
+                                          1.0 / math.sqrt(d))
+            return self.par.all_reduce(self._mm(o, layer.o))
         q = self._mm(h, layer.q).view(-1, layer.heads, d)
         kv = self._mm(h, layer.kv_w).view(-1, 2, layer.kv, d)
         q = self._norm(q.reshape(-1, d), layer.q_norm)[0].view(-1, layer.heads, d)
@@ -269,8 +301,14 @@ class Drafter:
             base, proj = layer.conv["mlp_conv"]
             coef = self._mm(h, proj).view(-1, 2, cfg.taps, self.groups)
             gu = self._mm(self._conv(h, base[0], coef[:, 0]), layer.gate_up)
-            gate, up = gu.chunk(2, dim=-1)
-            m = self._mm_scaled(F.silu(gate) * up, layer.down)
+            if self.fused:
+                from ..ops import kernels
+
+                p16, sc = kernels.silu_mul_scale(gu)
+                m = self._mm(p16, layer.down, row_scale=sc)
+            else:
+                gate, up = gu.chunk(2, dim=-1)
+                m = self._mm_scaled(F.silu(gate) * up, layer.down)
             x = self._conv(self.par.all_reduce(m), base[1], coef[:, 1], torch.float32)
         return self._norm(x, self.norm, residual)[0]
 

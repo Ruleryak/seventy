@@ -2,7 +2,8 @@
 
 /*
  * FP16 weight GEMM for small batches (1 to 64 rows): out[m, n] = sum_k x[m, k] * w[n, k], FP32 accumulation, FP32 or
- * FP16 output. Same structure as csrc/nvfp4_gemm.cu: a warp owns 32 output columns (mma.m8n8k4 B fragments, layout
+ * FP16 output, optionally times a per-row scale (row_scale[m], for inputs scaled into the FP16 range). Same
+ * structure as csrc/nvfp4_gemm.cu: a warp owns 32 output columns (mma.m8n8k4 B fragments, layout
  * there), the block stages 64-wide k steps of the activations in shared memory, and k splits go to an FP32
  * workspace that a reduce kernel adds in split order.
  *
@@ -27,7 +28,7 @@ __device__ __forceinline__ void mma_8x8x4(float (&c)[8], uint32_t a0, uint32_t a
 template <int MT, int W>
 __global__ void __launch_bounds__(W * 32) dense_gemm_kernel(void *out, int out_fp32, float *ws, const half *x,
                                                              const uint4 *wpk, int m, int n, int n_tiles, int k,
-                                                             int steps_per_split) {
+                                                             int steps_per_split, const float *row_scale) {
   __shared__ uint4 smem[2][MT * 8 * kRowStride];
   constexpr int kRows = MT * 8;
   constexpr int kLoads = (kRows * 8 + W * 32 - 1) / (W * 32);
@@ -110,8 +111,9 @@ __global__ void __launch_bounds__(W * 32) dense_gemm_kernel(void *out, int out_f
       if (row >= m) continue;
       if (gridDim.y == 1) {
         if (col < n) {
-          if (out_fp32) static_cast<float *>(out)[static_cast<int64_t>(row) * n + col] = acc[t][j];
-          else static_cast<half *>(out)[static_cast<int64_t>(row) * n + col] = __float2half_rn(acc[t][j]);
+          const float v = row_scale != nullptr ? acc[t][j] * row_scale[row] : acc[t][j];
+          if (out_fp32) static_cast<float *>(out)[static_cast<int64_t>(row) * n + col] = v;
+          else static_cast<half *>(out)[static_cast<int64_t>(row) * n + col] = __float2half_rn(v);
         }
       } else {
         ws[(static_cast<int64_t>(blockIdx.y) * m + row) * n_padded + col] = acc[t][j];
@@ -119,29 +121,31 @@ __global__ void __launch_bounds__(W * 32) dense_gemm_kernel(void *out, int out_f
     }
 }
 
-__global__ void dense_reduce_kernel(void *out, int out_fp32, const float *ws, int m, int n, int n_padded, int splits) {
+__global__ void dense_reduce_kernel(void *out, int out_fp32, const float *ws, int m, int n, int n_padded, int splits,
+                                    const float *row_scale) {
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= static_cast<int64_t>(m) * n) return;
   const int row = static_cast<int>(idx / n);
   const int col = static_cast<int>(idx % n);
   float s = 0.0f;
   for (int p = 0; p < splits; ++p) s += ws[(static_cast<int64_t>(p) * m + row) * n_padded + col];
+  if (row_scale != nullptr) s *= row_scale[row];
   if (out_fp32) static_cast<float *>(out)[idx] = s;
   else static_cast<half *>(out)[idx] = __float2half_rn(s);
 }
 
 template <int MT>
 int launch(int warps, void *out, int out_fp32, float *ws, const half *x, const uint4 *wpk, int m, int n, int n_tiles,
-           int k, int splits, cudaStream_t stream) {
+           int k, int splits, const float *row_scale, cudaStream_t stream) {
   const int ksteps = k / kStepK;
   const int per = (ksteps + splits - 1) / splits;
   const int used = (ksteps + per - 1) / per;
   if (warps >= 8) {
     dense_gemm_kernel<MT, 8><<<dim3((n_tiles + 7) / 8, used), 256, 0, stream>>>(out, out_fp32, ws, x, wpk, m, n,
-                                                                                  n_tiles, k, per);
+                                                                                  n_tiles, k, per, row_scale);
   } else {
     dense_gemm_kernel<MT, 4><<<dim3((n_tiles + 3) / 4, used), 128, 0, stream>>>(out, out_fp32, ws, x, wpk, m, n,
-                                                                                  n_tiles, k, per);
+                                                                                  n_tiles, k, per, row_scale);
   }
   return used;
 }
@@ -155,7 +159,7 @@ SEVENTY_API int64_t seventy_dense_gemm_workspace(int m, int n_padded, int splits
 
 SEVENTY_API int seventy_dense_gemm(void *out, int out_fp32, const void *x, const void *wpk, int m, int n, int n_padded,
                                    int k, int splits, int warps, void *workspace, int64_t workspace_bytes,
-                                   cudaStream_t stream) {
+                                   const float *row_scale, cudaStream_t stream) {
   using namespace seventy;
   if (out == nullptr || x == nullptr || wpk == nullptr || m <= 0 || m > 64 || n <= 0 || n_padded < n ||
       n_padded % 32 || k <= 0 || k % kStepK || splits < 1)
@@ -172,19 +176,19 @@ SEVENTY_API int seventy_dense_gemm(void *out, int out_fp32, const void *x, const
   const auto *wp = static_cast<const uint4 *>(wpk);
   int got = 0;
   switch ((m + 7) / 8) {
-    case 1: got = launch<1>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
-    case 2: got = launch<2>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
-    case 3: got = launch<3>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
-    case 4: got = launch<4>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
-    case 5: got = launch<5>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
-    case 6: got = launch<6>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
-    case 7: got = launch<7>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
-    default: got = launch<8>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, stream); break;
+    case 1: got = launch<1>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, row_scale, stream); break;
+    case 2: got = launch<2>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, row_scale, stream); break;
+    case 3: got = launch<3>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, row_scale, stream); break;
+    case 4: got = launch<4>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, row_scale, stream); break;
+    case 5: got = launch<5>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, row_scale, stream); break;
+    case 6: got = launch<6>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, row_scale, stream); break;
+    case 7: got = launch<7>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, row_scale, stream); break;
+    default: got = launch<8>(warps, out, out_fp32, ws, xh, wp, m, n, n_tiles, k, used, row_scale, stream); break;
   }
   if (got > 1) {
     const int64_t total = static_cast<int64_t>(m) * n;
     dense_reduce_kernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0, stream>>>(out, out_fp32, ws, m, n,
-                                                                                       n_padded, got);
+                                                                                       n_padded, got, row_scale);
   }
   return launch_status();
 }

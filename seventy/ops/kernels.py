@@ -269,11 +269,15 @@ class DenseWeight:
         self.wpk, self.n, self.k, self.n_padded = tiles, n, k, n_padded
 
 
-def dense_gemm(x: torch.Tensor, w: DenseWeight, out_fp32: bool = True) -> torch.Tensor:
+def dense_gemm(x: torch.Tensor, w: DenseWeight, out_fp32: bool = True,
+               row_scale: torch.Tensor | None = None) -> torch.Tensor:
+    """x [m <= 64, k] (FP16) @ w^T, FP32 accumulation, times row_scale[m] (FP32) when given."""
     _expect(x, "x", torch.float16)
     m, k = x.shape
     if k != w.k:
         raise ValueError(f"x has k = {k}, the weight has k = {w.k}")
+    if row_scale is not None:
+        _expect(row_scale, "row_scale", torch.float32)
     tiles = w.n_padded // 32
     small = m <= 16
     warps = 8 if small else 4
@@ -283,6 +287,101 @@ def dense_gemm(x: torch.Tensor, w: DenseWeight, out_fp32: bool = True) -> torch.
     out = torch.empty(m, w.n, dtype=torch.float32 if out_fp32 else torch.float16, device=x.device)
     code = lib().seventy_dense_gemm(out.data_ptr(), 1 if out_fp32 else 0, x.data_ptr(), w.wpk.data_ptr(), m, w.n,
                                     w.n_padded, k, splits, warps, ws.data_ptr() if ws is not None else None,
-                                    need, _stream(x))
+                                    need, row_scale.data_ptr() if row_scale is not None else None, _stream(x))
     check("dense_gemm", code)
     return out
+
+
+def drafter_norm(x: torch.Tensor, weight: torch.Tensor, eps: float,
+                 residual: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """RMS norm of x (+ residual, FP32) with an FP32 weight: (FP16 output, the new FP32 residual or None)."""
+    if x.dtype not in (torch.float16, torch.float32):
+        raise TypeError("drafter_norm takes FP16 or FP32 input")
+    x = x.contiguous()
+    rows, dim = x.shape
+    out = torch.empty(rows, dim, dtype=torch.float16, device=x.device)
+    res_out = torch.empty(rows, dim, dtype=torch.float32, device=x.device) if residual is not None else None
+    if residual is not None:
+        _expect(residual, "residual", torch.float32)
+    code = lib().seventy_drafter_norm(out.data_ptr(), res_out.data_ptr() if res_out is not None else None,
+                                      x.data_ptr(), 1 if x.dtype == torch.float32 else 0,
+                                      residual.data_ptr() if residual is not None else None, weight.data_ptr(),
+                                      rows, dim, eps, _stream(x))
+    check("drafter_norm", code)
+    return out, res_out
+
+
+def drafter_conv(x: torch.Tensor, base: torch.Tensor, delta: torch.Tensor, group_size: int, block: int,
+                 out_fp32: bool) -> torch.Tensor:
+    """The two-tap grouped convolution (csrc/drafter.cu). base: FP32 [2, channels]; delta: FP32 [rows, 2, groups]
+    (a row-strided view is fine)."""
+    x = x.contiguous()
+    rows, channels = x.shape
+    groups = delta.shape[-1]
+    if delta.stride(-1) != 1 or delta.stride(-2) != groups or delta.dtype != torch.float32:
+        raise ValueError("delta must be FP32 [rows, 2, groups] with contiguous groups")
+    base = base.contiguous()
+    out = torch.empty(rows, channels, dtype=torch.float32 if out_fp32 else torch.float16, device=x.device)
+    code = lib().seventy_drafter_conv(out.data_ptr(), 1 if out_fp32 else 0, x.data_ptr(),
+                                      1 if x.dtype == torch.float32 else 0, base.data_ptr(), delta.data_ptr(),
+                                      delta.stride(0), rows, groups, group_size, block, _stream(x))
+    check("drafter_conv", code)
+    return out
+
+
+def drafter_qk(q: torch.Tensor | None, kv: torch.Tensor, q_norm: torch.Tensor | None, k_norm: torch.Tensor,
+               positions: torch.Tensor, slots: torch.Tensor, inv_freq: torch.Tensor, k_ring: torch.Tensor,
+               v_ring: torch.Tensor, heads: int, kv_heads: int, eps: float) -> torch.Tensor | None:
+    """Norm and rotary for the query heads (returned, FP16 [rows, heads, 128]) and the key heads, and K and V into
+    the layer's rings [slots, ring, kv_heads, 128] at position % ring. q: FP32 [rows, heads * 128]; kv: FP32
+    [rows, 2 * kv_heads * 128]; both may be row-strided views."""
+    rows = kv.shape[0]
+    d = 128
+    ring = k_ring.shape[1]
+    if kv.stride(-1) != 1 or (q is not None and q.stride(-1) != 1):
+        raise ValueError("q and kv rows must be contiguous")
+    positions = positions.to(torch.int64).contiguous()
+    slots = slots.to(torch.int64).contiguous()
+    q_out = torch.empty(rows, heads, d, dtype=torch.float16, device=kv.device) if q is not None else None
+    code = lib().seventy_drafter_qk(q_out.data_ptr() if q_out is not None else None, k_ring.data_ptr(),
+                                    v_ring.data_ptr(), q.data_ptr() if q is not None else None,
+                                    q.stride(0) if q is not None else 0, kv.data_ptr(), kv.stride(0),
+                                    q_norm.data_ptr() if q_norm is not None else None, k_norm.data_ptr(),
+                                    positions.data_ptr(), slots.data_ptr(), inv_freq.data_ptr(), rows,
+                                    heads if q is not None else 0, kv_heads, d, ring, eps, _stream(kv))
+    check("drafter_qk", code)
+    return q_out
+
+
+def drafter_attention(q: torch.Tensor, k_ring: torch.Tensor, v_ring: torch.Tensor, slots: torch.Tensor,
+                      starts: torch.Tensor, block: int, window: int, scale: float) -> torch.Tensor:
+    """Block attention of the drafter over its rings: q FP16 [seqs * block, heads, 128] -> FP16
+    [seqs * block, heads * 128]."""
+    _expect(q, "q", torch.float16)
+    rows, heads, d = q.shape
+    seqs = rows // block
+    kv_heads, ring = k_ring.shape[2], k_ring.shape[1]
+    slots = slots.to(torch.int64).contiguous()
+    starts = starts.to(torch.int64).contiguous()
+    splits = lib().seventy_drafter_attention_splits(block, window)
+    need = lib().seventy_drafter_attention_workspace(seqs, kv_heads, splits)
+    ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=q.device)
+    out = torch.empty(rows, heads * d, dtype=torch.float16, device=q.device)
+    code = lib().seventy_drafter_attention(out.data_ptr(), q.data_ptr(), k_ring.data_ptr(), v_ring.data_ptr(),
+                                           slots.data_ptr(), starts.data_ptr(), seqs, heads, kv_heads, d, block,
+                                           window, ring, scale, ws.data_ptr(), need, _stream(q))
+    check("drafter_attention", code)
+    return out
+
+
+def silu_mul_scale(gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """silu(gate) * up of FP32 [rows, 2 * inter], scaled per row into the FP16 range: (FP16 [rows, inter], FP32
+    scale [rows])."""
+    _expect(gate_up, "gate_up", torch.float32)
+    gate_up = gate_up.contiguous()
+    rows, two = gate_up.shape
+    out = torch.empty(rows, two // 2, dtype=torch.float16, device=gate_up.device)
+    scale = torch.empty(rows, dtype=torch.float32, device=gate_up.device)
+    check("silu_mul_scale", lib().seventy_silu_mul_scale(out.data_ptr(), scale.data_ptr(), gate_up.data_ptr(), rows,
+                                                         two // 2, _stream(gate_up)))
+    return out, scale
