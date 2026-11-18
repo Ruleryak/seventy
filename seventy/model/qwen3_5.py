@@ -19,8 +19,10 @@ from ..checkpoint import Checkpoint
 from ..config import ModelConfig, TextConfig
 from ..engine.cache import ModelCache
 from ..engine.step import StepInput
-from ..ops import reference as R
+from ..ops import kernels
 from ..parallel import SINGLE, Parallel
+
+RECURRENT_MAX_TOKENS = 32
 from .layers import Linear, Source, _to_dtype
 
 
@@ -50,10 +52,24 @@ class AttentionLayer:
         self.eps = cfg.rms_norm_eps
         self.scale = 1.0 / math.sqrt(d)
         self.par = par
+        self.section = cfg.mrope_section
 
     def __call__(self, x, step: StepInput, cache: ModelCache, layer: int, rope, slots):
         t, d = x.shape[0], self.head_dim
         qkv = self.qkv(x)
+        if qkv.is_cuda and d == 256:
+            q = kernels.attn_prep(qkv, self.q_norm, self.k_norm, step.positions, self.inv_freq, self.section,
+                                  step.kv_slots_t, cache.k[layer], cache.v[layer], self.heads, self.kv_heads, self.eps)
+            if (self.heads // self.kv_heads) * step.max_query_len <= 64:
+                o = kernels.decode_attention(q, qkv, cache.k[layer], cache.v[layer], step.block_tables,
+                                             step.query_start_t, step.context_lens_t, step.max_query_len,
+                                             step.max_blocks, self.scale)
+            else:
+                o = ops.paged_attention(q, cache.k[layer], cache.v[layer], step.query_start, step.context_lens,
+                                        step.block_tables, self.scale)
+                o = ops.sigmoid_gate(o.reshape(t, self.heads * d), qkv[:, : 2 * d * self.heads].view(
+                    t, self.heads, 2, d)[:, :, 1].reshape(t, self.heads * d))
+            return self.par.all_reduce(self.o_proj(o))
         qg = qkv[:, : 2 * d * self.heads].view(t, self.heads, 2, d)
         q = qg[:, :, 0].contiguous()
         gate = qg[:, :, 1].reshape(t, self.heads * d)
@@ -103,6 +119,11 @@ class GatedDeltaNetLayer:
         t = x.shape[0]
         key, val = self.hk * self.dk, self.hv * self.dv
         y = self.in_proj(x)
+        if y.is_cuda and step.max_query_len <= RECURRENT_MAX_TOKENS:
+            o = kernels.gdn_recurrent(y, self.conv_weight, cache.conv[layer], cache.state[layer], self.a_log,
+                                      self.dt_bias, self.norm, step.query_start_t, step.context_lens_t,
+                                      step.state_slots_t, self.hk, self.hv, self.eps)
+            return self.par.all_reduce(self.out_proj(o))
         conv_dim = 2 * key + val
         qkv = ops.causal_conv1d(y[:, :conv_dim].contiguous(), self.conv_weight, cache.conv[layer],
                                 step.query_start, step.context_lens, step.state_slots)
@@ -163,6 +184,11 @@ class Qwen35TextModel:
         self.embed = _to_dtype(ckpt.rows(f"{p}embed_tokens.weight", v0, v1), dtype).to(device)
         count = t.num_layers if layers is None else layers
         self.layers = [Layer(t, ckpt, i, par, dtype, device, keep_dense) for i in range(count)]
+        half = t.rotary_dim // 2
+        inv_freq = 1.0 / (t.rope_theta ** (torch.arange(0, half, dtype=torch.float64) * 2 / t.rotary_dim))
+        for layer in self.layers:
+            if layer.kind == "full_attention":
+                layer.mixer.inv_freq = inv_freq.float().to(device)
         self.final_norm = _norm_weight(ckpt, f"{p}norm.weight", device, 1.0)
         head = "lm_head.weight" if not t.tie_word_embeddings else f"{p}embed_tokens.weight"
         self.lm_head = _to_dtype(ckpt.rows(head, v0, v1), dtype).to(device)
@@ -179,11 +205,14 @@ class Qwen35TextModel:
         return self.par.all_reduce(rows)
 
     def logits(self, x: torch.Tensor) -> torch.Tensor:
-        """FP32 logits [rows, vocab] of final hidden states."""
-        out = torch.empty(x.shape[0], self.lm_head.shape[0], dtype=torch.float32, device=x.device)
-        xf = x.float()
-        for s in range(0, self.lm_head.shape[0], 32768):
-            out[:, s : s + 32768] = xf @ self.lm_head[s : s + 32768].float().T
+        """FP32 logits [rows, vocab] of final hidden states (FP16 products, FP32 accumulation and output)."""
+        if x.is_cuda and x.dtype == torch.float16:
+            out = torch.mm(x, self.lm_head.T, out_dtype=torch.float32)
+        else:
+            out = torch.empty(x.shape[0], self.lm_head.shape[0], dtype=torch.float32, device=x.device)
+            xf = x.float()
+            for s in range(0, self.lm_head.shape[0], 32768):
+                out[:, s : s + 32768] = xf @ self.lm_head[s : s + 32768].float().T
         if self.par.size == 1:
             return out
         parts = [torch.empty_like(out) for _ in range(self.par.size)]

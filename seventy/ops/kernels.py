@@ -120,3 +120,83 @@ def nvfp4_gemm_dequantize(w: GemmWeight, out: torch.Tensor | None = None) -> tor
                                                w.n, w.n_padded, w.k, _stream(out))
     check("nvfp4_gemm_dequantize", code)
     return out
+
+
+def gdn_recurrent(
+    y: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    state: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    norm_weight: torch.Tensor,
+    query_start: torch.Tensor,
+    context_lens: torch.Tensor,
+    state_slots: torch.Tensor,
+    hk: int,
+    hv: int,
+    eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fused Gated DeltaNet decode/verify step; see seventy_gdn_recurrent in csrc/seventy.h."""
+    _expect(y, "y", torch.float16)
+    _expect(conv_state, "conv_state", torch.float16)
+    _expect(state, "state", torch.float32)
+    for name, t in (("conv_weight", conv_weight), ("a_log", a_log), ("dt_bias", dt_bias), ("norm_weight", norm_weight)):
+        _expect(t, name, torch.float32)
+    for name, t in (("query_start", query_start), ("context_lens", context_lens), ("state_slots", state_slots)):
+        _expect(t, name, torch.int32)
+    dk, dv = state.shape[2], state.shape[3]
+    out = torch.empty(y.shape[0], hv * dv, dtype=torch.float16, device=y.device) if out is None else out
+    code = lib().seventy_gdn_recurrent(
+        out.data_ptr(), conv_state.data_ptr(), state.data_ptr(), y.data_ptr(), y.shape[1], conv_weight.data_ptr(),
+        a_log.data_ptr(), dt_bias.data_ptr(), norm_weight.data_ptr(), query_start.data_ptr(), context_lens.data_ptr(),
+        state_slots.data_ptr(), context_lens.numel(), hk, hv, dk, dv, conv_weight.shape[1], eps, _stream(y),
+    )
+    check("gdn_recurrent", code)
+    return out
+
+
+def attn_prep(qkv: torch.Tensor, q_norm: torch.Tensor, k_norm: torch.Tensor, positions: torch.Tensor,
+              inv_freq: torch.Tensor, section: tuple[int, int, int], slots: torch.Tensor, k_cache: torch.Tensor,
+              v_cache: torch.Tensor, hq: int, hkv: int, eps: float) -> torch.Tensor:
+    """Normed, rotated queries [T, hq, 256]; keys and values written to the caches at `slots` (int32 [T])."""
+    _expect(qkv, "qkv", torch.float16)
+    _expect(positions, "positions", torch.int64)
+    _expect(slots, "slots", torch.int32)
+    t = qkv.shape[0]
+    q = torch.empty(t, hq, 256, dtype=torch.float16, device=qkv.device)
+    code = lib().seventy_attn_prep(
+        q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), qkv.data_ptr(), qkv.shape[1], q_norm.data_ptr(),
+        k_norm.data_ptr(), positions.data_ptr(), positions.shape[1], inv_freq.data_ptr(), section[1], section[2],
+        2 * inv_freq.numel(), slots.data_ptr(), t, hq, hkv, 256, eps, _stream(qkv),
+    )
+    check("attn_prep", code)
+    return q
+
+
+def decode_attention_splits(max_blocks: int, num_seqs: int, hkv: int, device: torch.device) -> tuple[int, int]:
+    """(splits, blocks per split): about two blocks per SM, at least 4 cache blocks per split."""
+    want = max(1, round(2 * _sm_count(device) / max(1, num_seqs * hkv)))
+    per = max(4, -(-max_blocks // want))
+    return max(1, -(-max_blocks // per)), per
+
+
+def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                     block_tables: torch.Tensor, query_start: torch.Tensor, context_lens: torch.Tensor,
+                     max_query_len: int, max_blocks: int, scale: float) -> torch.Tensor:
+    """Gated attention output [T, hq * 256] for steps with few new tokens per sequence."""
+    t, hq, _ = q.shape
+    hkv, block_size = k_cache.shape[2], k_cache.shape[1]
+    splits, per = decode_attention_splits(max_blocks, context_lens.numel(), hkv, q.device)
+    need = lib().seventy_decode_attention_workspace(t, hq, splits)
+    ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=q.device)
+    out = torch.empty(t, hq * 256, dtype=torch.float16, device=q.device)
+    code = lib().seventy_decode_attention(
+        out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), qkv.data_ptr(), qkv.shape[1],
+        block_tables.data_ptr(), block_tables.shape[1], query_start.data_ptr(), context_lens.data_ptr(),
+        context_lens.numel(), t, max_query_len, block_size, hq, hkv, 256, splits, per, scale, ws.data_ptr(),
+        ws.numel() * 4, _stream(q),
+    )
+    check("decode_attention", code)
+    return out

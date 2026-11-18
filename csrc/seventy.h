@@ -66,3 +66,46 @@ SEVENTY_API int seventy_nvfp4_gemm(void *out, const void *x, const void *wpk, co
  */
 SEVENTY_API int seventy_nvfp4_gemm_dequantize(void *out, const void *wpk, const void *wsc, const float *alpha, int n,
                                               int n_padded, int k, cudaStream_t stream);
+
+/*
+ * Gated DeltaNet for decode and verify steps, fused (see csrc/gdn.cu): convolution with the cached history, SiLU,
+ * q/k L2 norms, gates, delta-rule update and output, gated RMS norm.
+ * out: FP16 [T, hv * dv]. conv_state: FP16 [slots, conv_dim, taps - 1]. state: FP32 [slots, hv, dk, dv].
+ * y: FP16 [T, ld], the in_proj output [q k v (conv_dim) | z (hv * dv) | b (hv) | a (hv)].
+ * conv_w: FP32 [conv_dim, taps]. a_log, dt_bias: FP32 [hv]. norm_w: FP32 [dv].
+ * query_start: int32 [num_seqs + 1], context_lens and state_slots: int32 [num_seqs], all on the device.
+ * dk = dv = 128, 2 <= taps <= 4, hv a multiple of hk.
+ */
+SEVENTY_API int seventy_gdn_recurrent(void *out, void *conv_state, float *state, const void *y, int ld,
+                                      const float *conv_w, const float *a_log, const float *dt_bias,
+                                      const float *norm_w, const int *query_start, const int *context_lens,
+                                      const int *state_slots, int num_seqs, int hk, int hv, int dk, int dv, int taps,
+                                      float eps, cudaStream_t stream);
+
+/*
+ * Attention prep for full-attention layers (head size 256), one launch per layer step: RMS norm of each query and
+ * key head (weights with the 1 + w offset in them), multimodal rotary on the first rotary_dim values, queries to
+ * q_out [T, hq, 256], keys and raw values to the paged caches [blocks, block_size, hkv, 256] at slots[t].
+ * qkv: FP16 [T, ld] = [q_proj (per head: query 256 | gate 256) | k_proj | v_proj]. positions: int64 [3, T]
+ * (row stride pos_stride). inv_freq: FP32 [rotary_dim / 2]. section1, section2: the height and width sections of
+ * the interleaved multimodal rotary.
+ */
+SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, const void *qkv, int ld,
+                                  const float *q_norm, const float *k_norm, const int64_t *positions,
+                                  int64_t pos_stride, const float *inv_freq, int section1, int section2,
+                                  int rotary_dim, const int *slots, int tokens, int hq, int hkv, int head_dim,
+                                  float eps, cudaStream_t stream);
+
+SEVENTY_API int64_t seventy_decode_attention_workspace(int tokens, int hq, int splits);
+
+/*
+ * Causal attention for steps with few new tokens per sequence ((hq / hkv) * max_query_len <= 64), over the paged
+ * FP16 caches, split over cache ranges of blocks_per_split blocks, then merged and multiplied by sigmoid(gate)
+ * (the gate half of each query head in qkv). out: FP16 [T, hq * 256]. block_tables: int32 [num_seqs, table_width].
+ */
+SEVENTY_API int seventy_decode_attention(void *out, const void *q, const void *k_cache, const void *v_cache,
+                                         const void *qkv, int ld, const int *block_tables, int table_width,
+                                         const int *query_start, const int *context_lens, int num_seqs, int tokens,
+                                         int max_query_len, int block_size, int hq, int hkv, int head_dim, int splits,
+                                         int blocks_per_split, float scale, void *workspace, int64_t workspace_bytes,
+                                         cudaStream_t stream);

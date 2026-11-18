@@ -42,6 +42,15 @@ class StepInput:
     state_slots: list[int]
     block_size: int
     embeds: dict[int, torch.Tensor] = field(default_factory=dict)
+    query_start_t: torch.Tensor | None = None
+    context_lens_t: torch.Tensor | None = None
+    state_slots_t: torch.Tensor | None = None
+    kv_slots_t: torch.Tensor | None = None
+    max_blocks: int = 0
+
+    @property
+    def max_query_len(self) -> int:
+        return max((self.query_start[b + 1] - self.query_start[b] for b in range(self.num_seqs)), default=0)
 
     @property
     def num_tokens(self) -> int:
@@ -53,7 +62,8 @@ class StepInput:
 
     @staticmethod
     def build(chunks: list[SequenceChunk], block_size: int, device: torch.device | str) -> "StepInput":
-        ids, pos, starts, rows = [], [[], [], []], [0], []
+        ids, pos, starts, rows, slots = [], [[], [], []], [0], [], []
+        max_blocks = 0
         width = max((len(c.block_table) for c in chunks), default=0)
         tables = torch.zeros(len(chunks), max(width, 1), dtype=torch.int32)
         for b, c in enumerate(chunks):
@@ -62,6 +72,9 @@ class StepInput:
             if len(c.block_table) < need:
                 raise ValueError(f"sequence {b} needs {need} cache blocks, has {len(c.block_table)}")
             ids += c.token_ids
+            max_blocks = max(max_blocks, need)
+            for i in range(c.context_len, c.context_len + n):
+                slots.append(c.block_table[i // block_size] * block_size + i % block_size)
             p = c.positions or [list(range(c.context_len, c.context_len + n))] * 3
             for axis in range(3):
                 pos[axis] += p[axis]
@@ -80,4 +93,9 @@ class StepInput:
             context_lens=[c.context_len for c in chunks],
             state_slots=[c.state_slot for c in chunks],
             block_size=block_size,
+            query_start_t=torch.tensor(starts, dtype=torch.int32, device=device),
+            context_lens_t=torch.tensor([c.context_len for c in chunks], dtype=torch.int32, device=device),
+            state_slots_t=torch.tensor([c.state_slot for c in chunks], dtype=torch.int32, device=device),
+            kv_slots_t=torch.tensor(slots, dtype=torch.int32, device=device),
+            max_blocks=max_blocks,
         )
