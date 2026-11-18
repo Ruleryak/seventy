@@ -10,6 +10,7 @@ import torch
 from ..engine.cache import ModelCache
 from .graphs import DecodeGraphs
 from .scheduler import Work
+from .spec_graphs import SpecGraphs
 from .step import SequenceChunk, StepInput
 
 
@@ -30,6 +31,22 @@ class ModelRunner:
         self._feats = None
         self._stash = None
         self._step = None
+        self.spec_graphs: SpecGraphs | None = None
+
+    def capture_spec(self, max_blocks_per_seq: int, buckets: tuple[int, ...]) -> None:
+        self._send(("capture_spec", max_blocks_per_seq, list(buckets)))
+        self.spec_graphs = SpecGraphs(self.model, self.drafter, self.cache, self.device, max_blocks_per_seq, buckets)
+        self.spec_graphs.capture()
+        for p in self.peers:
+            if not p.poll(900):
+                raise RuntimeError("a tensor-parallel worker did not finish capturing CUDA graphs")
+            reply = p.recv()
+            if reply[0] != "captured":
+                raise RuntimeError(f"a worker failed to capture CUDA graphs: {reply}")
+
+    def spec_step(self, rows: list[dict]) -> dict:
+        self._send(("spec", rows))
+        return self.spec_graphs.run(rows)
 
     def _send(self, msg) -> None:
         if self.peers:

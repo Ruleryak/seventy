@@ -1,0 +1,46 @@
+import torch
+
+from seventy.engine.sampling import RowState, SamplingParams
+from seventy.engine.spec import KMAX, accept, device_accept
+
+
+def test_greedy_device_accept_matches_host():
+    torch.manual_seed(0)
+    b, k, v = 5, 7, 300
+    logits = torch.randn(b, k + 1, v)
+    pred = logits.argmax(-1)
+    drafts = pred[:, :k].clone()
+    drafts[1, 3] = (drafts[1, 3] + 1) % v
+    drafts[2, 0] = (drafts[2, 0] + 1) % v
+    q = torch.zeros(b, k, 16)
+    q[..., 0] = 1
+    cand = drafts[..., None].expand(b, k, 16).clone()
+    z = torch.zeros(b)
+    n, new = device_accept(logits, drafts, q, cand, z, torch.ones(b, dtype=torch.long), torch.ones(b), z,
+                           torch.rand(b, k), torch.rand(b, k + 1))
+    for i in range(b):
+        row = RowState(SamplingParams(temperature=0), [1], [], None)
+        hn, hnew = accept(logits[i], drafts[i].tolist(), None, None, row, ())
+        assert int(n[i]) == hn and new[i, : hn + 1].tolist() == hnew
+
+
+def test_sampled_device_accept_preserves_target_distribution():
+    torch.manual_seed(1)
+    v, k, trials = 12, 1, 40000
+    logits = torch.randn(1, k + 1, v).expand(trials, -1, -1).contiguous()
+    cand = torch.arange(16).remainder(v)[None, None].expand(trials, k, 16).clone()
+    qraw = torch.softmax(torch.randn(16), 0)
+    q = qraw[None, None].expand(trials, k, 16).clone()
+    drafts = cand[:, 0].gather(1, torch.multinomial(qraw, trials, replacement=True)[:, None])
+    t = torch.ones(trials)
+    n, new = device_accept(logits, drafts, q, cand, t, torch.full((trials,), 5), torch.full((trials,), 0.9),
+                           torch.zeros(trials), torch.rand(trials, k), torch.rand(trials, k + 1))
+    first = new[:, 0]
+    counts = torch.bincount(first, minlength=v).float() / trials
+    vals, idx = torch.topk(logits[0, 0], 5)
+    p = torch.softmax(vals, 0)
+    keep = (torch.cumsum(p, 0) - p) < 0.9
+    p = p * keep
+    p = p / p.sum()
+    want = torch.zeros(v).scatter(0, idx, p)
+    assert (counts - want).abs().max() < 0.01, (counts, want)

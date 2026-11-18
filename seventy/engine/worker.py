@@ -61,6 +61,7 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
             msg = pickle.loads(conn.recv_bytes())
             if msg[0] == "exit":
                 graphs = None
+                runner.spec_graphs = None
                 break
             if msg[0] == "step":
                 runner.run_payload(msg[1], msg[2])
@@ -76,6 +77,14 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
                 graphs.run(msg[1])
             elif msg[0] == "copy":
                 cache.apply(msg[1])
+            elif msg[0] == "spec":
+                runner.spec_graphs.run(msg[1])
+            elif msg[0] == "capture_spec":
+                from .spec_graphs import SpecGraphs
+
+                runner.spec_graphs = SpecGraphs(model, drafter, cache, device, msg[1], tuple(msg[2]))
+                runner.spec_graphs.capture()
+                conn.send(("captured", None))
             elif msg[0] == "capture":
                 graphs = DecodeGraphs(model, cache, device, msg[1], tuple(msg[2]))
                 graphs.capture()

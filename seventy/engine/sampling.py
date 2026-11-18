@@ -126,7 +126,7 @@ def sample(logits: torch.Tensor, rows: list[RowState], eos_ids: tuple[int, ...] 
                 tokens.append(int(x.argmax()))
                 continue
             x = _filter(x / p.temperature, p)
-            probs = torch.softmax(x, dim=-1)
+            probs = torch.softmax(x, dim=-1).cpu()
             tokens.append(int(torch.multinomial(probs, 1, generator=row.generator)))
         chosen = torch.tensor(tokens, device=logits.device)
     lps = [None] * len(rows)

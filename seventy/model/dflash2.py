@@ -274,6 +274,30 @@ class Drafter:
             ids = torch.cat(ks, -1).gather(-1, sel)
         return values, ids
 
+    def walk(self, anchors, values, ids, h, temps: torch.Tensor, gumbel: torch.Tensor | None) -> Draft:
+        """The selector walk for a batch, on the device. gumbel: [B, positions, top_k] noise (or None: greedy)."""
+        cfg = self.cfg
+        b, n, kk = ids.shape
+        hid = self._mm(h, self.sel_hidden).view(b, n, -1)
+        prev = torch.cat((anchors.view(b, 1, 1).expand(b, 1, kk), ids[:, :-1]), dim=1)
+        edges = values[:, :, None, :] + torch.einsum("blpr,blcr->blpc", self.pred[prev].float() * hid[:, :, None],
+                                                      self.succ[ids].float())
+        rows = torch.arange(b, device=ids.device)
+        idx = torch.zeros(b, dtype=torch.long, device=ids.device)
+        greedy = temps == 0
+        safe_t = torch.where(greedy, torch.ones_like(temps), temps)
+        tokens, probs = [], []
+        for step in range(n):
+            scores = edges[rows, step, idx]
+            scaled = scores / safe_t[:, None]
+            noisy = scaled if gumbel is None else torch.where(greedy[:, None], scaled, scaled + gumbel[:, step])
+            choice = noisy.argmax(-1)
+            p = torch.where(greedy[:, None], F.one_hot(choice, kk).float(), torch.softmax(scaled, dim=-1))
+            tokens.append(ids[rows, step, choice])
+            probs.append(p)
+            idx = choice
+        return Draft(tokens=torch.stack(tokens, 1), probs=torch.stack(probs, 1), candidates=ids)
+
     def draft(self, anchors: torch.Tensor, starts: torch.Tensor, slots: torch.Tensor, temperatures: list[float],
               generators: list) -> Draft:
         """block - 1 draft tokens per sequence, with their draft probabilities over the candidates."""
@@ -299,7 +323,7 @@ class Drafter:
             p = torch.softmax(scaled, dim=-1)
             choice = scores.argmax(-1)
             for i in torch.nonzero(~greedy).flatten().tolist():
-                choice[i] = torch.multinomial(p[i], 1, generator=generators[i])[0]
+                choice[i] = torch.multinomial(p[i].cpu(), 1, generator=generators[i])[0]
             probs[:, step] = torch.where(greedy[:, None], F.one_hot(choice, cfg.top_k).float(), p)
             tokens[:, step] = ids[rows, step, choice]
             idx = choice

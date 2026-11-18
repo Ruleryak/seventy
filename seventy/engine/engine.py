@@ -126,6 +126,14 @@ class Engine:
         for conn, proc in zip(peers, self.workers):
             _expect(conn, "ok", proc)
         self.runner = ModelRunner(self.model, self.cache, self.device, peers, self.drafter)
+        if config.cuda_graphs and self.drafter is not None:
+            from .graphs import BUCKETS
+
+            limit = max(1, min(slots, 64 // self.drafter.cfg.block))
+            buckets = tuple(b for b in BUCKETS if b <= limit)
+            if limit not in buckets:
+                buckets += (limit,)
+            self.runner.capture_spec(need, buckets)
         if config.cuda_graphs and self.drafter is None:
             from .graphs import BUCKETS
 
@@ -148,10 +156,8 @@ class Engine:
     def add_request(self, prompt: list[int], params: SamplingParams, request_id: str | None = None) -> str:
         params.check()
         rid = request_id or f"req-{next(self._ids)}"
-        gen = None
-        if params.seed is not None:
-            gen = torch.Generator(device=self.device)
-            gen.manual_seed(params.seed)
+        gen = torch.Generator()
+        gen.manual_seed(params.seed if params.seed is not None else torch.randint(0, 2**62, ()).item())
         r = Request(rid, list(prompt), params, generator=gen)
         self.scheduler.add(r)
         self.requests[rid] = r
@@ -269,13 +275,63 @@ class Engine:
                               [r.slot for r in requests], [r.params.temperature for r in requests],
                               [r.generator for r in requests])
         tokens = d.tokens.tolist()
+        probs, cands = d.probs.cpu(), d.candidates.cpu()
         for i, r in enumerate(requests):
-            r.draft, r.draft_q, r.draft_cand = tokens[i], d.probs[i], d.candidates[i]
+            r.draft, r.draft_q, r.draft_cand = tokens[i], probs[i], cands[i]
         self.stats["drafted_tokens"] += sum(len(t) for t in tokens)
+
+    def _spec_rows(self, work: list[Work]) -> list[dict] | None:
+        from .spec_graphs import eligible
+
+        g = self.runner.spec_graphs
+        k = self.drafter.cfg.block - 1
+        if g is None or g.bucket(len(work)) is None:
+            return None
+        rows = []
+        for w in work:
+            r = w.request
+            p = r.params
+            if len(r.draft) != k or not eligible(p) or len(r.output) < p.min_tokens:
+                return None
+            row = {"tokens": [r.tokens[-1]] + r.draft, "start": w.start, "slot": r.slot, "table": r.blocks,
+                   "temp": p.temperature, "top_k": p.top_k if p.temperature > 0 else 1, "top_p": p.top_p,
+                   "min_p": p.min_p, "q": r.draft_q, "cand": r.draft_cand}
+            if p.temperature > 0:
+                gen = r.generator
+                row["u_accept"] = torch.rand(k, generator=gen)
+                row["u_residual"] = torch.rand(k + 1, generator=gen)
+                row["gumbel"] = -torch.log(-torch.log(torch.rand(k, g.top, generator=gen).clamp(1e-20, 1.0)))
+            rows.append(row)
+        return rows
 
     def _spec_decode(self, work: list[Work], outputs: dict[str, RequestOutput]) -> None:
         from .spec import accept
 
+        rows = self._spec_rows(work)
+        if rows is not None:
+            out = self.runner.spec_step(rows)
+            ns, news = out["n"].tolist(), out["new"].tolist()
+            drafts, probs, cands = out["drafts"].tolist(), out["probs"].cpu(), out["cand"].cpu()
+            self.stats["verify_steps"] += len(work)
+            for i, w in enumerate(work):
+                r, n = w.request, ns[i]
+                self.stats["accepted_tokens"] += n
+                r.computed = w.start + n + 1
+                r.draft, r.draft_q, r.draft_cand = drafts[i], probs[i], cands[i]
+                o = outputs.setdefault(r.id, RequestOutput(r.id, [], False, None))
+                reason = None
+                for j, t in enumerate(news[i][: n + 1]):
+                    r.output.append(t)
+                    o.new_tokens.append(t)
+                    reason = self._stop_reason(r, t)
+                    if reason:
+                        if j < n:
+                            r.cacheable = False
+                        break
+                if reason:
+                    self.scheduler.finish(r, reason)
+            self.stats["drafted_tokens"] += sum(len(d) for d in drafts)
+            return
         logits = self.runner.verify(work)
         lens, rows, positions, slots, results, row = [], [], [], [], [], 0
         for w in work:
@@ -284,7 +340,7 @@ class Engine:
             L = logits[row : row + n_rows]
             state = RowState(r.params, r.prompt, r.output, r.generator)
             if r.draft and n_rows == 1 + len(r.draft):
-                n, new = accept(L, r.draft, r.draft_q, r.draft_cand, state, self.eos)
+                n, new = accept(L, r.draft, r.draft_q.to(L.device), r.draft_cand.to(L.device), state, self.eos)
             else:
                 n, new = 0, sample(L[-1:], [state], self.eos)[0]
             results.append((w, n, new, L))
@@ -327,6 +383,7 @@ class Engine:
         """Stop the workers. Every rank tears its process group down at the same time (NCCL needs that)."""
         self.runner.close()
         self.runner.graphs = None
+        self.runner.spec_graphs = None
         distributed.shutdown()
         for p in self.workers:
             p.join(timeout=60)
