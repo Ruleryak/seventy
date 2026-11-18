@@ -101,3 +101,77 @@ def quantize(weight: torch.Tensor) -> Nvfp4Weight:
     nearest = (scaled.abs().unsqueeze(-1) - mags).abs().argmin(-1)
     q = mags[nearest] * torch.where(scaled < 0, -1.0, 1.0)
     return Nvfp4Weight(pack(q.view(n, k)), scales.view(torch.uint8).contiguous(), global_scale)
+
+
+GEMM_TILE = 32
+GEMM_ALPHA_SHIFT = 2.0**7
+_NIBBLE_POS = (3, 7, 2, 6, 1, 5, 0, 4)
+
+
+def _lane_columns() -> list[int]:
+    """Column (within a 32-column tile) of each lane in the GEMM kernel's mma.m8n8k4 B fragments."""
+    return [8 * ((lane >> 2) & 3) + (lane & 3) + 4 * (lane >= 16) for lane in range(32)]
+
+
+@dataclass
+class GemmWeight:
+    """An NVFP4 weight repacked for the GEMM kernel (see csrc/nvfp4_gemm.cu).
+
+    wpk: uint8 [n_padded / 32, k / 32, 32 lanes, 16 bytes]. Each lane's 16 bytes are 4 little-endian words of
+    8 codes for k = 8 j .. 8 j + 7, at nibbles 3, 7, 2, 6, 1, 5, 0, 4.
+    wsc: uint8 [n_padded / 32, k / 64, 32 lanes, 4 bytes], the E4M3 scales of the 4 groups of a 64-wide k block.
+    alpha: FP32 [n_padded], 2^7 / global_scale of the row's source tensor (0 for padding rows).
+    """
+
+    wpk: torch.Tensor
+    wsc: torch.Tensor
+    alpha: torch.Tensor
+    n: int
+    k: int
+
+    @property
+    def n_padded(self) -> int:
+        return self.alpha.numel()
+
+
+def pack_for_gemm(parts: list[Nvfp4Weight], block_rows: int = 2048) -> GemmWeight:
+    """Stack the rows of `parts` (same k) and repack them for the GEMM kernel, on the parts' device, in blocks of
+    block_rows rows to bound the temporary memory."""
+    k = parts[0].shape[1]
+    if any(p.shape[1] != k for p in parts):
+        raise ValueError("all parts of a fused weight must have the same k")
+    if k % 64:
+        raise ValueError(f"k = {k} is not a multiple of 64")
+    device = parts[0].packed.device
+    n = sum(p.shape[0] for p in parts)
+    n_padded = -(-n // GEMM_TILE) * GEMM_TILE
+    tiles, chunks = n_padded // GEMM_TILE, k // 32
+    wpk = torch.empty(tiles, chunks, 32, 16, dtype=torch.uint8, device=device)
+    wsc = torch.empty(tiles, k // 64, 32, 4, dtype=torch.uint8, device=device)
+    alpha = torch.zeros(n_padded, dtype=torch.float32, device=device)
+    starts, row = [], 0
+    for p in parts:
+        if bool(((p.scales & 0x80) != 0).any()) or bool((p.scales == 0x7F).any()):
+            raise ValueError("NVFP4 scales must be non-negative and finite")
+        alpha[row : row + p.shape[0]] = GEMM_ALPHA_SHIFT / p.global_scale
+        starts.append(row)
+        row += p.shape[0]
+    lanes = torch.tensor(_lane_columns(), device=device)
+    shifts = torch.tensor([4 * q for q in _NIBBLE_POS], device=device, dtype=torch.int32)
+    block = max(GEMM_TILE, block_rows // GEMM_TILE * GEMM_TILE)
+    for r0 in range(0, n_padded, block):
+        r1 = min(n_padded, r0 + block)
+        packed = torch.zeros(r1 - r0, k // 2, dtype=torch.uint8, device=device)
+        scales = torch.zeros(r1 - r0, k // GROUP, dtype=torch.uint8, device=device)
+        for p, start in zip(parts, starts):
+            a, b = max(r0, start), min(r1, start + p.shape[0])
+            if a < b:
+                packed[a - r0 : b - r0] = p.packed[a - start : b - start]
+                scales[a - r0 : b - r0] = p.scales[a - start : b - start]
+        t = (r1 - r0) // GEMM_TILE
+        codes = torch.stack((packed & 0x0F, packed >> 4), dim=-1).view(r1 - r0, k).to(torch.int32)
+        codes = codes.view(t, GEMM_TILE, chunks, 4, 8)[:, lanes].permute(0, 2, 1, 3, 4)
+        words = (codes << shifts).sum(-1, dtype=torch.int32)
+        wpk[r0 // GEMM_TILE : r1 // GEMM_TILE] = words.contiguous().view(torch.uint8).view(t, chunks, 32, 16)
+        wsc[r0 // GEMM_TILE : r1 // GEMM_TILE] = scales.view(t, GEMM_TILE, k // 64, 4)[:, lanes].permute(0, 2, 1, 3)
+    return GemmWeight(wpk=wpk, wsc=wsc, alpha=alpha, n=n, k=k)

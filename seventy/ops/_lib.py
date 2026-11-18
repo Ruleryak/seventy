@@ -20,6 +20,9 @@ SIGNATURES = {
     "seventy_error_string": (ctypes.c_char_p, [_I32]),
     "seventy_rms_norm": (_I32, [_P, _P, _P, _P, _P, _I64, _I32, _F32, _P]),
     "seventy_nvfp4_dequantize": (_I32, [_P, _P, _P, _F32, _I64, _I64, _P]),
+    "seventy_nvfp4_gemm_workspace": (_I64, [_I32, _I32, _I32]),
+    "seventy_nvfp4_gemm_dequantize": (_I32, [_P, _P, _P, _P, _I32, _I32, _I32, _P]),
+    "seventy_nvfp4_gemm": (_I32, [_P, _P, _P, _P, _P, _I32, _I32, _I32, _I32, _I32, _I32, _P, _I64, _P]),
 }
 
 

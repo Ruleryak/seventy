@@ -9,7 +9,10 @@ import torch.nn.functional as F
 
 from .. import nvfp4, ops
 from ..checkpoint import Checkpoint
-from ..nvfp4 import Nvfp4Weight
+from ..nvfp4 import GemmWeight, Nvfp4Weight
+from ..ops import kernels
+
+SMALL_BATCH = 64
 
 
 @dataclass(frozen=True)
@@ -24,7 +27,8 @@ class Linear:
     """y = x W^T, where W stacks the row ranges of all sources (so fused projections are one product).
 
     cols restricts W to an input column range (the shard of a row-parallel layer). NVFP4 weights stay packed;
-    this version dequantizes them at each call (the GEMM kernels replace that).
+    on the GPU, batches of up to SMALL_BATCH rows use the fused NVFP4 GEMM kernel, and larger batches (prefill)
+    dequantize the weight to FP16 and use cuBLAS. On the CPU (reference runs) the weight is dequantized at each call.
     """
 
     def __init__(
@@ -39,6 +43,7 @@ class Linear:
         self.dtype = dtype
         self.parts: list[Nvfp4Weight] = []
         self.dense: torch.Tensor | None = None
+        self.gemm: GemmWeight | None = None
         quantized = [ckpt.is_nvfp4(s.module) for s in sources]
         if any(quantized) and not all(quantized):
             raise ValueError(f"cannot fuse quantized and dense modules: {[s.module for s in sources]}")
@@ -55,6 +60,9 @@ class Linear:
         elif keep_dense:
             self.dense = self._dequantize()
             self.parts = []
+        elif self.parts[0].packed.is_cuda and dtype == torch.float16 and self.parts[0].shape[1] % 64 == 0:
+            self.gemm = nvfp4.pack_for_gemm(self.parts)
+            self.parts = []
         self.out_features = self.dense.shape[0] if self.dense is not None else sum(p.shape[0] for p in self.parts)
 
     def _dequantize(self) -> torch.Tensor:
@@ -63,9 +71,15 @@ class Linear:
         return torch.cat([nvfp4.dequantize(p, self.dtype) for p in self.parts])
 
     def weight(self) -> torch.Tensor:
-        return self.dense if self.dense is not None else self._dequantize()
+        if self.dense is not None:
+            return self.dense
+        if self.gemm is not None:
+            return kernels.nvfp4_gemm_dequantize(self.gemm)
+        return self._dequantize()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.gemm is not None and 0 < x.shape[0] <= SMALL_BATCH and x.is_contiguous():
+            return kernels.nvfp4_gemm(x, self.gemm)
         return F.linear(x, self.weight())
 
 
