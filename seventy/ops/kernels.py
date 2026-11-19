@@ -273,9 +273,62 @@ class DenseWeight:
         self.wpk, self.n, self.k, self.n_padded = tiles, n, k, n_padded
 
 
-def dense_gemm(x: torch.Tensor, w: DenseWeight, out_fp32: bool = True,
+_LANES = [8 * ((l >> 2) & 3) + (l & 3) + 4 * (l >= 16) for l in range(32)]
+
+
+class DenseWeightFP8:
+    """An FP16 weight [n, k] quantized to FP8 E4M3 with one scale per output row (the speculative drafter only:
+    lossy), packed for seventy_dense_gemm_fp8 as [n_padded / 32, k / 64, 32 lanes, 64 bytes] (the DenseWeight
+    layout, one byte per value). col_scale: FP32 [n_padded], the row scale times 2^8 (the kernel's E4M3 decoding
+    gives value * 2^-8). Rows are quantized in chunks, so a large weight needs little extra memory."""
+
+    def __init__(self, w: torch.Tensor, chunk: int = 8192):
+        if w.dtype != torch.float16 or w.dim() != 2 or w.shape[1] % 64:
+            raise ValueError("dense GEMM weights must be FP16 [n, k] with k a multiple of 64")
+        n, k = w.shape
+        n_padded = -(-n // 32) * 32
+        q = torch.zeros(n_padded, k, dtype=torch.uint8, device=w.device)
+        scale = torch.zeros(n_padded, dtype=torch.float32, device=w.device)
+        for r in range(0, n, chunk):
+            part = w[r : r + chunk].float()
+            s = part.abs().amax(-1) / 448.0
+            q[r : r + part.shape[0]] = (part / s.clamp(min=1e-30)[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
+            scale[r : r + part.shape[0]] = s
+        lanes = torch.tensor(_LANES, device=w.device)
+        self.wpk = q.view(n_padded // 32, 32, k // 64, 64)[:, lanes].permute(0, 2, 1, 3).contiguous()
+        self.col_scale = scale * 256.0
+        self.n, self.k, self.n_padded = n, k, n_padded
+
+    @classmethod
+    def from_dense(cls, w: "DenseWeight", chunk_tiles: int = 256) -> "DenseWeightFP8":
+        """The FP8 version of a packed FP16 weight (unpacked one group of tiles at a time)."""
+        inv = torch.empty(32, dtype=torch.long)
+        inv[torch.tensor(_LANES)] = torch.arange(32)
+        inv = inv.to(w.wpk.device)
+        tiles = w.n_padded // 32
+        parts = []
+        for t in range(0, tiles, chunk_tiles):
+            blk = w.wpk[t : t + chunk_tiles].permute(0, 2, 1, 3)[:, inv]
+            parts.append(cls(blk.reshape(-1, w.k)))
+        out = cls.__new__(cls)
+        out.wpk = torch.cat([p.wpk for p in parts])
+        out.col_scale = torch.cat([p.col_scale for p in parts])
+        out.n, out.k, out.n_padded = w.n, w.k, w.n_padded
+        return out
+
+    def dequantize(self) -> torch.Tensor:
+        """FP32 [n, k] of the quantized values (for tests)."""
+        inv = torch.empty(32, dtype=torch.long)
+        inv[torch.tensor(_LANES)] = torch.arange(32)
+        q = self.wpk.permute(0, 2, 1, 3)[:, inv.to(self.wpk.device)].reshape(self.n_padded, self.k)
+        vals = q.view(torch.float8_e4m3fn).float() * (self.col_scale / 256.0)[:, None]
+        return vals[: self.n]
+
+
+def dense_gemm(x: torch.Tensor, w: "DenseWeight | DenseWeightFP8", out_fp32: bool = True,
                row_scale: torch.Tensor | None = None) -> torch.Tensor:
-    """x [m <= 64, k] (FP16) @ w^T, FP32 accumulation, times row_scale[m] (FP32) when given."""
+    """x [m <= 64, k] (FP16) @ w^T, FP32 accumulation, times row_scale[m] (FP32) when given. FP8 weights
+    (DenseWeightFP8) use seventy_dense_gemm_fp8."""
     _expect(x, "x", torch.float16)
     m, k = x.shape
     if k != w.k:
@@ -289,9 +342,16 @@ def dense_gemm(x: torch.Tensor, w: DenseWeight, out_fp32: bool = True,
     need = lib().seventy_dense_gemm_workspace(m, w.n_padded, splits)
     ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=x.device) if need else None
     out = torch.empty(m, w.n, dtype=torch.float32 if out_fp32 else torch.float16, device=x.device)
+    rs = row_scale.data_ptr() if row_scale is not None else None
+    wsp = ws.data_ptr() if ws is not None else None
+    if isinstance(w, DenseWeightFP8):
+        code = lib().seventy_dense_gemm_fp8(out.data_ptr(), 1 if out_fp32 else 0, x.data_ptr(), w.wpk.data_ptr(),
+                                            w.col_scale.data_ptr(), m, w.n, w.n_padded, k, splits, warps, wsp, need,
+                                            rs, _stream(x))
+        check("dense_gemm_fp8", code)
+        return out
     code = lib().seventy_dense_gemm(out.data_ptr(), 1 if out_fp32 else 0, x.data_ptr(), w.wpk.data_ptr(), m, w.n,
-                                    w.n_padded, k, splits, warps, ws.data_ptr() if ws is not None else None,
-                                    need, row_scale.data_ptr() if row_scale is not None else None, _stream(x))
+                                    w.n_padded, k, splits, warps, wsp, need, rs, _stream(x))
     check("dense_gemm", code)
     return out
 

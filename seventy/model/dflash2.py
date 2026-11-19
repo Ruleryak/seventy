@@ -13,7 +13,11 @@ other side's taps; the same around the MLP. Each mask position predicts the toke
 
 Numerics: the drafter was trained in BF16, and its residual stream grows past the FP16 range. The residual stream,
 the convolutions and every large intermediate stay in FP32; the tensor cores see FP16 inputs that fit (norm
-outputs, attention outputs, and the MLP's down-projection input scaled per row), with FP32 outputs.
+outputs, attention outputs, and the MLP's down-projection input scaled per row), with FP32 outputs. On GPUs the
+candidate logits come from an FP8 E4M3 copy of the target's LM head shard (one scale per vocabulary row; half the
+traffic of the drafter's largest GEMM; SEVENTY_DRAFTER_FP8=0 uses the FP16 head). Acceptance uses this drafter's
+own draft probabilities, so the target's output distribution is unchanged, and the measured acceptance is the same
+as with FP16. FP8 drafter layers (per-row scales) were tried: acceptance fell from 0.314 to 0.29, so they stay FP16.
 
 Selector: the top-k tokens of each mask position (from the LM head), and edge scores
 score[l, p, c] = logit[l, c] + sum_r pred[token before (l, p)]_r * hidden[l]_r * succ[candidate (l, c)]_r,
@@ -120,6 +124,8 @@ class Drafter:
                  num_slots: int = 1):
         self.cfg = cfg = DrafterConfig.load(path)
         self.target, self.par, self.device, self.dtype = target, par, torch.device(device), dtype
+        self.fp8 = (self.device.type == "cuda" and dtype == torch.float16
+                    and os.environ.get("SEVENTY_DRAFTER_FP8", "1") != "0")
         with Checkpoint(path) as ckpt:
             self.fc = _to_dtype(ckpt.tensor("fc.weight"), dtype).to(device)
             self.hidden_norm = ckpt.tensor("hidden_norm.weight").float().to(device)
@@ -129,14 +135,17 @@ class Drafter:
             self.pred = _to_dtype(ckpt.tensor("candidate_selector.predecessor_codebook"), dtype).to(device)
             self.succ = _to_dtype(ckpt.tensor("candidate_selector.successor_codebook"), dtype).to(device)
         self.kv_all = torch.cat([layer.kv_w for layer in self.layers])
+        self.cand_head = None
         if self.device.type == "cuda" and dtype == torch.float16:
-            from ..ops.kernels import DenseWeight
+            from ..ops.kernels import DenseWeight, DenseWeightFP8
 
             for layer in self.layers:
                 for name in ("q", "kv_w", "o", "gate_up", "down"):
                     setattr(layer, name, DenseWeight(getattr(layer, name)))
                 layer.conv = {side: (base, DenseWeight(proj)) for side, (base, proj) in layer.conv.items()}
             self.fc, self.kv_all, self.sel_hidden = DenseWeight(self.fc), DenseWeight(self.kv_all), DenseWeight(self.sel_hidden)
+            if self.fp8 and target.lm_head_packed is not None:
+                self.cand_head = DenseWeightFP8.from_dense(target.lm_head_packed)
             torch.cuda.empty_cache()
         self.k_ring = self.v_ring = None
         if num_slots:
@@ -177,9 +186,9 @@ class Drafter:
     def _mm(x: torch.Tensor, w, row_scale: torch.Tensor | None = None) -> torch.Tensor:
         """x (FP16) @ w^T with FP32 output (times row_scale per row, packed weights only). Packed weights use the
         small-batch FP16 GEMM, 64 rows at a time."""
-        from ..ops.kernels import DenseWeight, dense_gemm
+        from ..ops.kernels import DenseWeight, DenseWeightFP8, dense_gemm
 
-        if isinstance(w, DenseWeight):
+        if isinstance(w, (DenseWeight, DenseWeightFP8)):
             x = x.contiguous()
             if x.shape[0] <= 64:
                 return dense_gemm(x, w, row_scale=row_scale)
@@ -315,7 +324,12 @@ class Drafter:
     def _candidates(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Global top-k (values, token ids) of the target LM head for rows of h."""
         k = self.cfg.top_k
-        if self.target.lm_head_packed is not None:
+        if self.cand_head is not None:
+            from ..ops.kernels import dense_gemm
+
+            h = h.contiguous()
+            logits = torch.cat([dense_gemm(h[i : i + 64], self.cand_head) for i in range(0, h.shape[0], 64)])
+        elif self.target.lm_head_packed is not None:
             logits = self.target.head(h)
         else:
             logits = h.float() @ self.target.lm_head.float().T

@@ -190,6 +190,15 @@ SEVENTY_API int seventy_dense_gemm(void *out, int out_fp32, const void *x, const
                                    int k, int splits, int warps, void *workspace, int64_t workspace_bytes,
                                    const float *row_scale, cudaStream_t stream);
 
+/*
+ * The same GEMM with FP8 E4M3 weights (csrc/dense_gemm.cu, dense_gemm_fp8_kernel): wpk packed one byte per value
+ * as [n_padded / 32, k / 64, 32 lanes, 64 bytes] (seventy.ops.kernels.DenseWeightFP8); col_scale FP32 [n_padded],
+ * the per-column scale times 2^8. Same splits, warps, workspace and row_scale as seventy_dense_gemm.
+ */
+SEVENTY_API int seventy_dense_gemm_fp8(void *out, int out_fp32, const void *x, const void *wpk, const float *col_scale,
+                                       int m, int n, int n_padded, int k, int splits, int warps, void *workspace,
+                                       int64_t workspace_bytes, const float *row_scale, cudaStream_t stream);
+
 /* DFlash2 drafter kernels (see csrc/drafter.cu; head size 128). */
 SEVENTY_API int seventy_drafter_norm(void *out, float *residual_out, const void *x, int x_fp32,
                                      const float *residual_in, const float *weight, int rows, int dim, float eps,

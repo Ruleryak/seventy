@@ -77,3 +77,24 @@ def test_silu_mul_matches_reference():
     torch.manual_seed(4)
     x = (torch.randn(37, 2 * 4352) * 4).half()
     assert torch.equal(ops.silu_mul(x.cuda()).cpu(), R.silu_mul(x.cuda()).cpu())
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("m", [1, 8, 28, 32, 64])
+def test_dense_gemm_fp8_matches_its_dequantized_weights(m):
+    torch.manual_seed(m)
+    n, k = 600, 1536
+    w = (torch.randn(n, k) * 0.02).half().cuda()
+    w[3] *= 50
+    x = torch.randn(m, k).half().cuda()
+    q = kernels.DenseWeightFP8(w)
+    ref = x.float() @ q.dequantize().T
+    got = kernels.dense_gemm(x, q)
+    torch.testing.assert_close(got, ref, rtol=1e-3, atol=1e-3 * ref.abs().max().item())
+    fp16 = kernels.dense_gemm(x, kernels.DenseWeight(w))
+    rel = ((got - fp16).norm() / fp16.norm()).item()
+    assert rel < 0.05, rel
+    again = kernels.DenseWeightFP8.from_dense(kernels.DenseWeight(w))
+    assert torch.equal(again.wpk, q.wpk) and torch.equal(again.col_scale, q.col_scale)
+    scaled = kernels.dense_gemm(x, q, row_scale=torch.full((m,), 2.0, device="cuda"))
+    torch.testing.assert_close(scaled, 2 * got, rtol=1e-5, atol=1e-5)
