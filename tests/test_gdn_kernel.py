@@ -25,10 +25,12 @@ def reference_layer(y, conv_w, conv_state, state, a_log, dt_bias, norm_w, starts
     return R.gated_rms_norm(o.reshape(t * hv, d), z.reshape(t * hv, d), norm_w, eps).view(t, val)
 
 
-@pytest.mark.parametrize("lengths, ctx", [([1, 1, 1], [5, 0, 9]), ([9, 1, 4], [3, 7, 0]), ([16], [2])])
-def test_gdn_recurrent_matches_reference(lengths, ctx):
+@pytest.mark.parametrize("lengths, ctx, taps", [([1, 1, 1], [5, 0, 9], 4), ([9, 1, 4], [3, 7, 0], 4), ([16], [2], 4),
+                                               ([20, 3], [2, 0], 4), ([32], [5], 4), ([9, 2], [4, 0], 3),
+                                               ([5, 1], [1, 6], 2)])
+def test_gdn_recurrent_matches_reference(lengths, ctx, taps):
     torch.manual_seed(sum(lengths) + sum(ctx))
-    hk, hv, d, taps, eps = 2, 6, 128, 4, 1e-6
+    hk, hv, d, eps = 2, 6, 128, 1e-6
     conv_dim = 2 * hk * d + hv * d
     width = conv_dim + hv * d + 2 * hv
     t = sum(lengths)
