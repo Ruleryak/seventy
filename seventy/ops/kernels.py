@@ -196,7 +196,8 @@ def attn_prep(qkv: torch.Tensor, q_norm: torch.Tensor, k_norm: torch.Tensor, pos
 
 
 def decode_attention_splits(num_seqs: int, hkv: int, device: torch.device) -> int:
-    """Context splits per sequence: about two blocks per SM in total."""
+    """Context splits per sequence for the decode kernel: about two blocks per SM in total. (The verify kernel runs
+    one block per SM, so it takes one split per SM.)"""
     return max(1, min(256, round(2 * _sm_count(device) / max(1, num_seqs * hkv))))
 
 
@@ -210,7 +211,10 @@ def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, 
     """Gated attention output [T, hq * 256] for steps with few new tokens per sequence."""
     t, hq, _ = q.shape
     hkv, block_size = k_cache.shape[2], k_cache.shape[1]
-    splits = decode_attention_splits(context_lens.numel(), hkv, q.device)
+    if max_query_len > 1:
+        splits = max(1, min(256, round(_sm_count(q.device) / max(1, context_lens.numel() * hkv))))
+    else:
+        splits = decode_attention_splits(context_lens.numel(), hkv, q.device)
     if max_blocks:
         splits = max(1, min(splits, max_blocks // 2))
     need = lib().seventy_decode_attention_workspace(t, hq, splits)
