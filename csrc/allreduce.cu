@@ -8,8 +8,9 @@
  * flags, then two data areas (alternating between calls) of world slots of slot_bytes each. Block b of a call:
  *   1. takes epoch = ++counter[b] (the same on every rank, because every rank makes the same calls in order),
  *   2. writes its rows of the local partial sums into slot `rank` of every rank's data area (epoch parity),
- *   3. after a system-wide fence, sets signal[b][rank] = epoch in every rank's buffer and waits until its own
- *      signal[b][p] == epoch for every p,
+ *   3. sets signal[b][rank] = epoch in every rank's buffer with a system-scope release store (after the block's
+ *      barrier, so it orders the whole block's pushes) and waits with system-scope acquire loads until its own
+ *      signal[b][p] == epoch for every p (a full system fence on each side cost about 4 us per call),
  *   4. adds the world slots of its rows in FP32 (rounded once to FP16), adds the residual, and writes the residual
  *      and the RMS-normed row. One block of 1024 threads per row; each thread holds 16-byte slices of the row in
  *      registers from the push to the norm (rows of up to 16384 values).
@@ -34,14 +35,14 @@ struct ArContext {
   int world;
 };
 
-__device__ __forceinline__ uint32_t load_volatile(const uint32_t *p) {
-  uint32_t v;
-  asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(v) : "l"(p));
-  return v;
+__device__ __forceinline__ void store_release(uint32_t *p, uint32_t v) {
+  asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
 
-__device__ __forceinline__ void store_volatile(uint32_t *p, uint32_t v) {
-  asm volatile("st.volatile.global.u32 [%0], %1;" ::"l"(p), "r"(v));
+__device__ __forceinline__ uint32_t load_acquire(const uint32_t *p) {
+  uint32_t v;
+  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
 }
 
 __device__ __forceinline__ void unpack8(uint4 v, float (&f)[8]) {
@@ -95,13 +96,11 @@ __global__ void __launch_bounds__(kThreads) ar_norm_kernel(ArContext ctx, half *
   }
   __syncthreads();
   if (threadIdx.x < ctx.world) {
-    __threadfence_system();
     uint32_t *flag = reinterpret_cast<uint32_t *>(ctx.buffers[threadIdx.x]) + b * kMaxRanks + ctx.rank;
-    store_volatile(flag, epoch);
+    store_release(flag, epoch);
     const uint32_t *mine = reinterpret_cast<const uint32_t *>(ctx.buffers[ctx.rank]) + b * kMaxRanks + threadIdx.x;
-    while (load_volatile(mine) != epoch) {
+    while (load_acquire(mine) != epoch) {
     }
-    __threadfence_system();
   }
   __syncthreads();
 
@@ -190,13 +189,11 @@ __global__ void __launch_bounds__(kThreads) ar_sum_f32_kernel(ArContext ctx, flo
   }
   __syncthreads();
   if (threadIdx.x < ctx.world) {
-    __threadfence_system();
     uint32_t *flag = reinterpret_cast<uint32_t *>(ctx.buffers[threadIdx.x]) + b * kMaxRanks + ctx.rank;
-    store_volatile(flag, epoch);
+    store_release(flag, epoch);
     const uint32_t *mine = reinterpret_cast<const uint32_t *>(ctx.buffers[ctx.rank]) + b * kMaxRanks + threadIdx.x;
-    while (load_volatile(mine) != epoch) {
+    while (load_acquire(mine) != epoch) {
     }
-    __threadfence_system();
   }
   __syncthreads();
   const float4 *local = reinterpret_cast<const float4 *>(ctx.buffers[ctx.rank] + data_off);

@@ -2,8 +2,9 @@
 
     python bench/bench_allreduce.py --gpus 4
 
-The custom kernel runs as a CUDA graph of back-to-back calls (all ranks start after a barrier), so its time is the
-kernel latency without the skew of a real model step. NCCL runs eagerly (launch overhead included).
+The custom kernel runs as a CUDA graph of back-to-back calls, replayed twice; the second replay is timed, so the
+ranks are already in step (the first replay absorbs their start skew) and the time is the kernel latency without
+the skew of a real model step. NCCL runs eagerly (launch overhead included).
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ def rank_main(rank: int, world: int, port: int, rows_list: list[int], iters: int
     distributed.init(rank, world, port, "nccl")
     dev = torch.device("cuda", rank)
     ar = CustomAllReduce(rank, world, dev)
+
     w = torch.ones(5120, device=dev)
     out = {}
     for rows in rows_list:
@@ -49,6 +51,8 @@ def rank_main(rank: int, world: int, port: int, rows_list: list[int], iters: int
             torch.distributed.barrier()
             torch.cuda.synchronize()
             s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            if g is not None:
+                g.replay()
             s.record()
             if g is not None:
                 g.replay()
