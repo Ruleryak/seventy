@@ -112,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     eng.add_argument("--max-model-len", type=int)
     eng.add_argument("--max-num-seqs", type=int, default=8)
     eng.add_argument("--gpu-memory-utilization", type=float, default=0.90)
-    eng.add_argument("--prefill-budget", type=int, default=4096, help="prompt tokens per engine step")
+    eng.add_argument("--prefill-budget", type=int, default=8192, help="prompt tokens per engine step")
     eng.add_argument("--kv-cache-dtype", choices=("int8", "fp16"), default="int8")
     eng.add_argument("--no-cuda-graphs", action="store_true")
     eng.add_argument("--draft-model", help="DFlash2 drafter checkpoint folder for speculative decoding")

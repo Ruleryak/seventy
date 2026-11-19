@@ -34,7 +34,7 @@ class EngineConfig:
     max_model_len: int = 262144
     block_size: int = 16
     gpu_memory_utilization: float = 0.90
-    prefill_budget: int = 4096
+    prefill_budget: int = 8192
     kv_dtype: str = "int8"
     activation_reserve_gib: float = 3.0
     tensor_parallel: int = 1

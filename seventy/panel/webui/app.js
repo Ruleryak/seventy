@@ -513,7 +513,7 @@ function settingsFromForm() {
     model: $("f-model").value, draft_model: $("f-draft").value || null,
     gpus: [...$("f-gpus").querySelectorAll("input:checked")].map((c) => +c.value),
     max_model_len: num("f-maxlen"), max_num_seqs: num("f-seqs") || 8, gpu_memory_utilization: num("f-util") || 0.9,
-    prefill_budget: num("f-prefill") || 4096, kv_cache_dtype: $("f-kv").value, thinking: $("f-think").value === "1",
+    prefill_budget: num("f-prefill") || 8192, kv_cache_dtype: $("f-kv").value, thinking: $("f-think").value === "1",
     max_images_per_request: num("f-images") ?? 20, max_videos_per_request: num("f-videos") ?? 1, max_image_pixels: num("f-pixels"),
     served_model_name: $("f-name").value || null, host: $("f-host").value, port: num("f-port") || 8000,
     api_key: $("f-key").value || null, cuda_graphs: $("f-graphs").checked, prefix_cache: $("f-prefix").checked,

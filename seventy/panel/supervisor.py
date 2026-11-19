@@ -36,7 +36,7 @@ class Settings:
     max_model_len: int | None = None
     max_num_seqs: int = 8
     gpu_memory_utilization: float = 0.90
-    prefill_budget: int = 4096
+    prefill_budget: int = 8192
     kv_cache_dtype: str = "int8"
     host: str = "127.0.0.1"
     port: int = 8000

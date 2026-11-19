@@ -794,41 +794,49 @@ __global__ void __launch_bounds__(kVT, 1) verify_attention_wmma(
     for (int off = 16; off > 0; off >>= 1) tile_unit = fmaxf(tile_unit, __shfl_xor_sync(0xffffffffu, tile_unit, off));
     tile_unit = tile_unit > 0.0f ? tile_unit : 1.0f;
     const float rescale = unit / tile_unit;
-    for (int r = warp; r < rows; r += kVW) {
-      const int limit = ctx + r / group;
-      float sv[2];
-      float mx = -FLT_MAX;
+    {
+      const int r = warp * 4 + (lane >> 3);
+      const int c0 = (lane & 7) * 8;
+      if (r < row_tiles * 16) {
+        const int limit = ctx + r / group;
+        float v[8];
+        const float4 *src = reinterpret_cast<const float4 *>(ss + r * kLdS + c0);
+        const float4 f0 = src[0], f1 = src[1];
+        v[0] = f0.x; v[1] = f0.y; v[2] = f0.z; v[3] = f0.w;
+        v[4] = f1.x; v[5] = f1.y; v[6] = f1.z; v[7] = f1.w;
+        float mx = -FLT_MAX;
 #pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const int c = lane + 32 * h;
-        const int key = k0 + c;
-        const bool ok = key < last && key <= limit;
-        sv[h] = ok ? ss[r * kLdS + c] * kscale[c] * scale : -FLT_MAX;
-        mx = fmaxf(mx, sv[h]);
-      }
+        for (int c = 0; c < 8; ++c) {
+          const int key = k0 + c0 + c;
+          const bool ok = r < rows && key < last && key <= limit;
+          v[c] = ok ? v[c] * kscale[c0 + c] * scale : -FLT_MAX;
+          mx = fmaxf(mx, v[c]);
+        }
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
+        const float m_old = r < rows ? m_s[r] : -FLT_MAX;
+        const float m_new = fmaxf(m_old, mx);
+        const float corr = (m_old == -FLT_MAX) ? 0.0f : expf(m_old - m_new);
+        float sum = 0.0f;
+        half ph[8];
 #pragma unroll
-      for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-      const float m_old = m_s[r];
-      const float m_new = fmaxf(m_old, mx);
-      const float corr = (m_old == -FLT_MAX) ? 0.0f : expf(m_old - m_new);
-      float sum = 0.0f;
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const int c = lane + 32 * h;
-        const float p = (sv[h] == -FLT_MAX) ? 0.0f : expf(sv[h] - m_new);
-        sum += __half2float(__float2half_rn(p));
-        ps[r * kTile + (((c / 8) ^ swz(r)) * 8) + (c & 7)] = __float2half_rn(p * (vscale[c] / tile_unit));
-      }
-#pragma unroll
-      for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
-      if (lane == 0) {
-        m_s[r] = m_new;
-        l_s[r] = l_s[r] * corr + sum;
-        fac_s[r] = corr * rescale;
+        for (int c = 0; c < 8; ++c) {
+          const float p = (v[c] == -FLT_MAX) ? 0.0f : expf(v[c] - m_new);
+          sum += __half2float(__float2half_rn(p));
+          ph[c] = __float2half_rn(p * (vscale[c0 + c] / tile_unit));
+        }
+        reinterpret_cast<uint4 *>(ps)[r * (kTile / 8) + ((c0 / 8) ^ swz(r))] = *reinterpret_cast<uint4 *>(ph);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 4);
+        if ((lane & 7) == 0 && r < rows) {
+          m_s[r] = m_new;
+          l_s[r] = l_s[r] * corr + sum;
+          fac_s[r] = corr * rescale;
+        }
       }
     }
-    for (int r = rows + warp; r < row_tiles * 16; r += kVW)
-      for (int c = lane; c < kTile; c += 32) ps[r * kTile + c] = __float2half_rn(0.0f);
     unit = tile_unit;
     __syncthreads();
 
@@ -869,6 +877,236 @@ __global__ void __launch_bounds__(kVT, 1) verify_attention_wmma(
   }
 }
 
+/*
+ * flash_attention_wmma: prefill attention (one block per 64-token query tile and query head) on WMMA tiles, with the
+ * numerics of flash_attention_kernel (K and V dequantized while staged, P rounded to FP16, row sums of the rounded P,
+ * gated FP16 output). 8 warps: S = Q K^T is 4 x 4 tiles of 16 x 16 (two per warp, sharing the A operand), the
+ * softmax takes 8 rows per warp, and O += P V gives each warp a 16-row x 128-column slice. Q and P are swizzled as in
+ * verify_attention_wmma; the next K and V tiles are in registers while the current one computes.
+ */
+constexpr int kPT = kWarps * 32;
+constexpr int kPrefillSmem = (kTile * kHead + kTile * kLdW + kTile * kTile) * static_cast<int>(sizeof(half)) +
+                             (kTile * kLdS + 3 * kTile) * static_cast<int>(sizeof(float));
+
+template <typename T>
+struct PrefillTile {
+  static constexpr int kPer = 16 / sizeof(T);
+  static constexpr int kChunks = kTile * kHead / kPer / kPT;
+  uint4 v[kChunks];
+  float s[kChunks];
+};
+
+template <typename T>
+__device__ __forceinline__ void prefill_load(PrefillTile<T> &raw, const T *cache, const float *scales, const int *table,
+                                             int k0, int n, int block_size, int hkv, int kh) {
+  constexpr int kPer = PrefillTile<T>::kPer;
+#pragma unroll
+  for (int i = 0; i < PrefillTile<T>::kChunks; ++i) {
+    const int e = threadIdx.x + i * kPT;
+    const int j = e / (kHead / kPer);
+    const int c = (e % (kHead / kPer)) * kPer;
+    raw.v[i] = make_uint4(0, 0, 0, 0);
+    raw.s[i] = 0.0f;
+    if (j < n) {
+      const int pos = k0 + j;
+      const int64_t vec = (static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size) * hkv + kh;
+      raw.v[i] = *reinterpret_cast<const uint4 *>(cache + vec * kHead + c);
+      raw.s[i] = sizeof(T) == 1 ? scales[vec] : 1.0f;
+    }
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ void prefill_store(half *dst, const PrefillTile<T> &raw) {
+  constexpr int kPer = PrefillTile<T>::kPer;
+#pragma unroll
+  for (int i = 0; i < PrefillTile<T>::kChunks; ++i) {
+    const int e = threadIdx.x + i * kPT;
+    const int j = e / (kHead / kPer);
+    const int c = (e % (kHead / kPer)) * kPer;
+    if constexpr (sizeof(T) == 2) {
+      *reinterpret_cast<uint4 *>(dst + j * kLdW + c) = raw.v[i];
+    } else {
+      half h[16];
+      int8x4_to_half(raw.v[i].x, raw.s[i], h);
+      int8x4_to_half(raw.v[i].y, raw.s[i], h + 4);
+      int8x4_to_half(raw.v[i].z, raw.s[i], h + 8);
+      int8x4_to_half(raw.v[i].w, raw.s[i], h + 12);
+      *reinterpret_cast<uint4 *>(dst + j * kLdW + c) = *reinterpret_cast<uint4 *>(h);
+      *reinterpret_cast<uint4 *>(dst + j * kLdW + c + 8) = *reinterpret_cast<uint4 *>(h + 8);
+    }
+  }
+}
+
+template <typename T>
+__global__ void __launch_bounds__(kPT, 1) flash_attention_wmma(
+    half *out, const half *q, const T *k_cache, const T *v_cache, const float *k_scale, const float *v_scale,
+    const half *qkv, int ld, const int *tiles, const int *block_tables, int table_width, const int *query_start,
+    const int *context_lens, int block_size, int hq, int hkv, float scale) {
+  using namespace nvcuda;
+  extern __shared__ __align__(16) unsigned char fsm[];
+  half *qs = reinterpret_cast<half *>(fsm);
+  half *kv = qs + kTile * kHead;
+  half *ps = kv + kTile * kLdW;
+  float *ss = reinterpret_cast<float *>(ps + kTile * kTile);
+  float *m_s = ss + kTile * kLdS;
+  float *l_s = m_s + kTile;
+  float *fac_s = l_s + kTile;
+
+  const int b = tiles[2 * blockIdx.x];
+  const int q0 = tiles[2 * blockIdx.x + 1];
+  const int head = blockIdx.y;
+  const int kh = head / (hq / hkv);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int t0 = query_start[b];
+  const int n_new = query_start[b + 1] - t0;
+  const int ctx = context_lens[b];
+  const int rows = min(kTile, n_new - q0);
+  const int key_end = ctx + q0 + rows;
+  const int *table = block_tables + static_cast<int64_t>(b) * table_width;
+  const int row_tiles = (rows + 15) / 16;
+  for (int e = threadIdx.x; e < kTile * (kHead / 8); e += kPT) {
+    const int r = e / (kHead / 8);
+    const int c = (e % (kHead / 8)) * 8;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (r < rows) v = *reinterpret_cast<const uint4 *>(q + (static_cast<int64_t>(t0 + q0 + r) * hq + head) * kHead + c);
+    reinterpret_cast<uint4 *>(qs)[r * (kHead / 8) + ((c / 8) ^ swz(r))] = v;
+  }
+  for (int r = threadIdx.x; r < kTile; r += kPT) {
+    m_s[r] = -FLT_MAX;
+    l_s[r] = 0.0f;
+  }
+  const int rt = warp >> 1, ct = (warp & 1) * 2, cols = (warp & 1) * (kHead / 2);
+  const bool active = rt < row_tiles;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> o[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) wmma::fill_fragment(o[j], 0.0f);
+
+  PrefillTile<T> rk, rv;
+  prefill_load<T>(rk, k_cache, k_scale, table, 0, min(kTile, key_end), block_size, hkv, kh);
+  prefill_load<T>(rv, v_cache, v_scale, table, 0, min(kTile, key_end), block_size, hkv, kh);
+  for (int k0 = 0; k0 < key_end; k0 += kTile) {
+    const int k1 = k0 + kTile;
+    const int n1 = min(kTile, key_end - k1);
+    __syncthreads();
+    prefill_store<T>(kv, rk);
+    __syncthreads();
+    if (k1 < key_end) prefill_load<T>(rk, k_cache, k_scale, table, k1, n1, block_size, hkv, kh);
+    if (active) {
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> s0, s1, s2, s3;
+      wmma::fill_fragment(s0, 0.0f);
+      wmma::fill_fragment(s1, 0.0f);
+      wmma::fill_fragment(s2, 0.0f);
+      wmma::fill_fragment(s3, 0.0f);
+#pragma unroll 2
+      for (int k = 0; k < kHead; k += 32) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a, a2;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b0, b1, b2, b3;
+        load_a_swizzled(a, qs, rt * 16, kHead / 8, k);
+        load_a_swizzled(a2, qs, rt * 16, kHead / 8, k + 16);
+        wmma::load_matrix_sync(b0, kv + ct * 16 * kLdW + k, kLdW);
+        wmma::load_matrix_sync(b1, kv + (ct + 1) * 16 * kLdW + k, kLdW);
+        wmma::load_matrix_sync(b2, kv + ct * 16 * kLdW + k + 16, kLdW);
+        wmma::load_matrix_sync(b3, kv + (ct + 1) * 16 * kLdW + k + 16, kLdW);
+        wmma::mma_sync(s0, a, b0, s0);
+        wmma::mma_sync(s1, a, b1, s1);
+        wmma::mma_sync(s2, a2, b2, s2);
+        wmma::mma_sync(s3, a2, b3, s3);
+      }
+#pragma unroll
+      for (int i = 0; i < s0.num_elements; ++i) {
+        s0.x[i] += s2.x[i];
+        s1.x[i] += s3.x[i];
+      }
+      wmma::store_matrix_sync(ss + rt * 16 * kLdS + ct * 16, s0, kLdS, wmma::mem_row_major);
+      wmma::store_matrix_sync(ss + rt * 16 * kLdS + (ct + 1) * 16, s1, kLdS, wmma::mem_row_major);
+    }
+    __syncthreads();
+    prefill_store<T>(kv, rv);
+    if (k1 < key_end) prefill_load<T>(rv, v_cache, v_scale, table, k1, n1, block_size, hkv, kh);
+    {
+      const int r = warp * 8 + (lane >> 2);
+      const int c0 = (lane & 3) * 16;
+      if (warp * 8 < row_tiles * 16) {
+        const int limit = ctx + q0 + r;
+        float v[16];
+        const float4 *src = reinterpret_cast<const float4 *>(ss + r * kLdS + c0);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const float4 f = src[i];
+          v[4 * i] = f.x;
+          v[4 * i + 1] = f.y;
+          v[4 * i + 2] = f.z;
+          v[4 * i + 3] = f.w;
+        }
+        float mx = -FLT_MAX;
+#pragma unroll
+        for (int c = 0; c < 16; ++c) {
+          const int key = k0 + c0 + c;
+          const bool ok = r < rows && key < key_end && key <= limit;
+          v[c] = ok ? v[c] * scale : -FLT_MAX;
+          mx = fmaxf(mx, v[c]);
+        }
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+        const float m_old = m_s[r];
+        const float m_new = fmaxf(m_old, mx);
+        const float corr = (m_old == -FLT_MAX) ? 0.0f : expf(m_old - m_new);
+        float sum = 0.0f;
+        half ph[16];
+#pragma unroll
+        for (int c = 0; c < 16; ++c) {
+          ph[c] = __float2half_rn((v[c] == -FLT_MAX) ? 0.0f : expf(v[c] - m_new));
+          sum += __half2float(ph[c]);
+        }
+        uint4 *prow = reinterpret_cast<uint4 *>(ps) + r * (kTile / 8);
+        prow[(c0 / 8) ^ swz(r)] = *reinterpret_cast<uint4 *>(ph);
+        prow[(c0 / 8 + 1) ^ swz(r)] = *reinterpret_cast<uint4 *>(ph + 8);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+        if ((lane & 3) == 0) {
+          m_s[r] = m_new;
+          l_s[r] = l_s[r] * corr + sum;
+          fac_s[r] = corr;
+        }
+      }
+    }
+    __syncthreads();
+    if (active) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float f = fac_s[rt * 16 + acc_row(lane, i)];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) o[j].x[i] *= f;
+      }
+#pragma unroll
+      for (int k = 0; k < kTile; k += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+        load_a_swizzled(a, ps, rt * 16, kTile / 8, k);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> bv;
+          wmma::load_matrix_sync(bv, kv + k * kLdW + cols + 16 * j, kLdW);
+          wmma::mma_sync(o[j], a, bv, o[j]);
+        }
+      }
+    }
+  }
+  if (!active) return;
+#pragma unroll
+  for (int j = 0; j < 8; ++j)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int row = rt * 16 + acc_row(lane, i);
+      if (row >= rows) continue;
+      const int col = cols + 16 * j + acc_col(lane, i);
+      const int64_t t = t0 + q0 + row;
+      const float a = __half2float(__float2half_rn(o[j].x[i] / l_s[row]));
+      const float g = __half2float(qkv[t * ld + head * 2 * kHead + kHead + col]);
+      out[(t * hq + head) * kHead + col] = __float2half_rn(a / (1.0f + expf(-g)));
+    }
+}
+
 constexpr int kSmemBytes = (kTile * kLdQ + kHead * kLdV + kTile * kLdV) * static_cast<int>(sizeof(half));
 
 template <typename T>
@@ -876,9 +1114,9 @@ int launch(half *out, const half *q, const T *k, const T *v, const float *ks, co
            int ld, const int *tiles, int num_tiles, const int *block_tables, int table_width, const int *query_start,
            const int *context_lens, int block_size, int hq, int hkv, float scale, cudaStream_t stream) {
   const cudaError_t e =
-      cudaFuncSetAttribute(flash_attention_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+      cudaFuncSetAttribute(flash_attention_wmma<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, kPrefillSmem);
   if (e != cudaSuccess) return static_cast<int>(e);
-  flash_attention_kernel<T><<<dim3(num_tiles, hq), kWarps * 32, kSmemBytes, stream>>>(
+  flash_attention_wmma<T><<<dim3(num_tiles, hq), kPT, kPrefillSmem, stream>>>(
       out, q, k, v, ks, vs, qkv, ld, tiles, block_tables, table_width, query_start, context_lens, block_size, hq, hkv,
       scale);
   return launch_status();

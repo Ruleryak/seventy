@@ -62,7 +62,7 @@
           <label>Maximum context per request <input id="f-maxlen" type="number" min="1024" step="1024"></label>
           <label>Concurrent streams <input id="f-seqs" type="number" min="1" max="64" value="8"></label>
           <label>GPU memory budget <input id="f-util" type="number" min="0.5" max="0.98" step="0.01" value="0.90"></label>
-          <label>Prompt tokens per step <input id="f-prefill" type="number" min="512" step="512" value="4096"></label>
+          <label>Prompt tokens per step <input id="f-prefill" type="number" min="512" step="512" value="8192"></label>
           <label>KV cache format <select id="f-kv"><option value="int8">INT8 (per token and head)</option><option value="fp16">FP16</option></select></label>
           <label>Thinking by default <select id="f-think"><option value="1">On</option><option value="0">Off</option></select></label>
           <label>Images per request <input id="f-images" type="number" min="0" max="256" value="20"></label>
