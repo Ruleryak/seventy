@@ -12,10 +12,10 @@
  * + 4 * (j >> 2).
  *
  * Two kernels. nvfp4_gemm_wk (see its comment) gives each block one 32-column tile and splits k over the block's
- * warps; it runs up to 32 rows, and above that when k is at most 72 steps of 64 or up to 40 rows unless n is large
- * (measured on V100: with 8 m-tiles and long k, one block per SM is slower than nvfp4_gemm_kernel). Below 8 steps
- * of k and otherwise, nvfp4_gemm_kernel runs; it is described here. SEVENTY_GEMM_WK=0 selects nvfp4_gemm_kernel
- * for all sizes.
+ * warps; it runs for all sizes except wide and long ones above 40 rows (more than 200 column tiles and more than
+ * 72 steps of 64 in k, such as the MLP gate_up projection), where nvfp4_gemm_kernel is as fast or faster (measured
+ * on V100). Below 8 steps of k nvfp4_gemm_kernel runs too; it is described here. SEVENTY_GEMM_WK=0 selects
+ * nvfp4_gemm_kernel for all sizes.
  *
  * Work split: a warp owns a tile of 32 output columns (quad-pair p: columns 8 p .. 8 p + 7) and all batch rows
  * (8 per m-tile). A block of W warps owns W adjacent tiles. blockIdx.y takes a range of k, in steps of 64.
@@ -206,7 +206,8 @@ __global__ void __launch_bounds__(W * 32) nvfp4_gemm_kernel(half *out, float *ws
 }
 
 /*
- * nvfp4_gemm_wk (at least 8 k steps; selection in seventy_nvfp4_gemm): one block of 8 warps per 32-column tile; the warps split k (contiguous ranges of
+ * nvfp4_gemm_wk (at least 8 k steps; selection in seventy_nvfp4_gemm): one block of W warps (8 up to 16 rows, 4
+ * from 17 rows: two such blocks share an SM and each warp gets twice the k range) per 32-column tile; the warps split k (contiguous ranges of
  * 64-steps) and add their partial tiles in shared memory at the end, so there is no workspace and no reduce
  * kernel, and no block barrier in the main loop. Each warp stages its own activations: the next step's 64 k of
  * all rows are loaded into registers (coalesced, rows past m clamped to row m - 1, their outputs not written)
@@ -214,11 +215,9 @@ __global__ void __launch_bounds__(W * 32) nvfp4_gemm_kernel(half *out, float *ws
  * stored there after a warp barrier. On sm70 all of a warp's outstanding global loads wait together, so the
  * prefetch is covered by one whole step of tensor-core work. Weights and scales are prefetched one step ahead.
  */
-template <int MT>
-__global__ void __launch_bounds__(256, (MT >= 4 ? 1 : 2)) nvfp4_gemm_wk_kernel(half *out, const half *x, const uint4 *wpk,
-                                                              const uint32_t *wsc, const float *alpha, int m, int n,
-                                                              int k) {
-  constexpr int kW = 8;
+template <int MT, int kW>
+__global__ void __launch_bounds__(kW * 32, (MT >= 4 ? 8 / kW : 16 / kW)) nvfp4_gemm_wk_kernel(
+    half *out, const half *x, const uint4 *wpk, const uint32_t *wsc, const float *alpha, int m, int n, int k) {
   constexpr int kRows = MT * 8;
   constexpr int kLoads = kRows * 8 / 32;
   extern __shared__ uint4 wk_smem[];
@@ -304,19 +303,26 @@ __global__ void __launch_bounds__(256, (MT >= 4 ? 1 : 2)) nvfp4_gemm_wk_kernel(h
     }
 }
 
-template <int MT>
-void launch_wk(half *out, const half *x, const uint4 *wpk, const uint32_t *wsc, const float *alpha, int m, int n,
-               int k, int n_tiles, cudaStream_t stream) {
-  constexpr int kBytes = 8 * MT * 8 * kRowStride * static_cast<int>(sizeof(uint4));
-  static_assert(kBytes >= 7 * MT * 8 * 32 * static_cast<int>(sizeof(float)), "reduction must fit the staging area");
+template <int MT, int W>
+void launch_wk_w(half *out, const half *x, const uint4 *wpk, const uint32_t *wsc, const float *alpha, int m, int n,
+                 int k, int n_tiles, cudaStream_t stream) {
+  constexpr int kBytes = W * MT * 8 * kRowStride * static_cast<int>(sizeof(uint4));
+  static_assert(kBytes >= (W - 1) * MT * 8 * 32 * static_cast<int>(sizeof(float)), "reduction must fit the staging area");
   if constexpr (kBytes > 48 * 1024) {
     static bool configured = false;
     if (!configured) {
-      cudaFuncSetAttribute(nvfp4_gemm_wk_kernel<MT>, cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes);
+      cudaFuncSetAttribute(nvfp4_gemm_wk_kernel<MT, W>, cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes);
       configured = true;
     }
   }
-  nvfp4_gemm_wk_kernel<MT><<<n_tiles, 256, kBytes, stream>>>(out, x, wpk, wsc, alpha, m, n, k);
+  nvfp4_gemm_wk_kernel<MT, W><<<n_tiles, W * 32, kBytes, stream>>>(out, x, wpk, wsc, alpha, m, n, k);
+}
+
+template <int MT>
+void launch_wk(half *out, const half *x, const uint4 *wpk, const uint32_t *wsc, const float *alpha, int m, int n,
+               int k, int n_tiles, cudaStream_t stream) {
+  if constexpr (MT >= 3) launch_wk_w<MT, 4>(out, x, wpk, wsc, alpha, m, n, k, n_tiles, stream);
+  else launch_wk_w<MT, 8>(out, x, wpk, wsc, alpha, m, n, k, n_tiles, stream);
 }
 
 __global__ void nvfp4_gemm_reduce_kernel(half *out, const float *ws, const float *alpha, int m, int n, int n_padded,
@@ -439,7 +445,7 @@ SEVENTY_API int seventy_nvfp4_gemm(void *out, const void *x, const void *wpk, co
   const auto *wp = static_cast<const uint4 *>(wpk);
   const auto *sp = static_cast<const uint32_t *>(wsc);
   static const bool wk_off = getenv("SEVENTY_GEMM_WK") != nullptr && atoi(getenv("SEVENTY_GEMM_WK")) == 0;
-  const bool use_wk = m <= 32 || ksteps <= 72 || (m <= 40 && n_tiles < 200);
+  const bool use_wk = m <= 40 || ksteps <= 72 || n_tiles < 200;
   if (!wk_off && use_wk && ksteps >= 8) {
     if (m > 56)
       launch_wk<8>(o, xh, wp, sp, alpha, m, n, k, n_tiles, stream);
