@@ -14,8 +14,9 @@ are matched on key_tokens, where image tokens stand for the image's content (sev
 
 Prompt snapshots: for prompts of SNAPSHOT_MIN tokens or more, prefill stops one token before the end of the prompt;
 the state at that point becomes an entry too, so the same prompt sent again computes only its last token (and a
-request that diverges inside its output still reuses its prompt). Eviction takes snapshots and entries that a newer
-entry extends (a conversation's earlier turns) first, then the least recently used.
+request that diverges inside its output still reuses its prompt). Eviction takes final entries that a newer entry
+extends (a conversation's earlier turns) first, then the least recently used. A snapshot is never superseded: only it
+serves the same prompt sent again.
 """
 
 from __future__ import annotations
@@ -158,7 +159,7 @@ class CacheEntry:
 
     @property
     def spare(self) -> bool:
-        return self.snapshot or self.superseded
+        return self.superseded
 
 
 class PrefixCache:
@@ -168,6 +169,7 @@ class PrefixCache:
         self.max_entries = max_entries
         self.entries: list[CacheEntry] = []
         self.clock = itertools.count()
+        self.pinned: CacheEntry | None = None
         self.hits = 0
         self.hit_tokens = 0
 
@@ -201,7 +203,7 @@ class PrefixCache:
                 self.slots.give(slot)
                 return
         for e in self.entries:
-            if len(e.tokens) < n and tokens[: len(e.tokens)] == e.tokens:
+            if not e.snapshot and len(e.tokens) < n and tokens[: len(e.tokens)] == e.tokens:
                 e.superseded = True
         while len(self.entries) >= self.max_entries:
             self.evict()
@@ -210,7 +212,10 @@ class PrefixCache:
     def evict(self) -> bool:
         if not self.entries:
             return False
-        e = min(self.entries, key=lambda x: (not x.spare, x.used))
+        candidates = [x for x in self.entries if x is not self.pinned]
+        if not candidates:
+            return False
+        e = min(candidates, key=lambda x: (not x.spare, x.used))
         self.entries.remove(e)
         self.blocks.give(e.blocks)
         self.slots.give(e.slot)
@@ -315,10 +320,10 @@ class Scheduler:
         r.blocks += got
         return True
 
-    def _reuse(self, r: Request) -> list[tuple[str, int, int]]:
-        """Start a fresh request from the longest matching prefix-cache entry, if any. Returns the copies to make."""
-        entry = self.cache.lookup(r.key_tokens)
-        if entry is None:
+    def _reuse(self, r: Request, entry: CacheEntry | None) -> list[tuple[str, int, int]]:
+        """Start a fresh request from a matching prefix-cache entry (found before its slot was taken, and pinned
+        meanwhile). Returns the copies to make."""
+        if entry is None or entry not in self.cache.entries:
             return []
         n = len(entry.tokens)
         full = n // self.block_size
@@ -377,11 +382,15 @@ class Scheduler:
             budget = self._plan_prefill(plan, r, budget)
         while self.waiting and budget > 0 and len(self.running) < self.max_running:
             r = self.waiting[0]
+            entry = self.cache.lookup(r.key_tokens) if r.computed == 0 and self.cache.max_entries else None
+            self.cache.pinned = entry
             slot = self._take_slot()
             if slot is None:
+                self.cache.pinned = None
                 break
             r.slot = slot
-            copies = self._reuse(r) if r.computed == 0 and self.cache.max_entries else []
+            copies = self._reuse(r, entry)
+            self.cache.pinned = None
             if not self._grow(r, min(r.length, r.computed + budget)):
                 self._release(r)
                 r.computed = 0
@@ -407,7 +416,7 @@ class Scheduler:
             same.used = next(self.cache.clock)
             return
         slot = self.slots.take()
-        while slot is None and any(e.spare for e in self.cache.entries) and self.cache.evict():
+        while slot is None and self.cache.entries and self.cache.evict():
             slot = self.slots.take()
         if slot is None:
             return

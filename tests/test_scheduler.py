@@ -196,3 +196,26 @@ def test_eviction_keeps_the_newest_turn_of_each_conversation():
     free_blocks = len(s.blocks.free)
     s.cache.clear()
     assert len(s.slots.free) == 8 and len(s.blocks.free) == 2000 and free_blocks < 2000
+
+
+def test_identical_prompts_hit_under_slot_pressure():
+    """The sweep pattern: send prompts once (1 token), then again; every second send must reuse all but one token,
+    with the cache full of older entries."""
+    s = Scheduler(num_blocks=20000, block_size=16, num_slots=12, max_model_len=65536, prefill_budget=4096,
+                  max_running=4, cache_entries=8)
+    base = 0
+    for round_size in (1, 4, 4, 1):
+        prompts = [list(range(base + i * 5000, base + i * 5000 + 2000 + 37 * i)) for i in range(round_size)]
+        base += 100_000
+        for p in prompts:
+            r = Request(f"w{base}{len(p)}", p, SamplingParams(max_tokens=1))
+            s.add(r)
+            run_to_end(s, r)
+        before = s.cache.hit_tokens
+        hot = [Request(f"h{base}{len(p)}", list(p), SamplingParams(max_tokens=5)) for p in prompts]
+        for r in hot:
+            s.add(r)
+        while any(r.status is not Status.FINISHED for r in hot):
+            run_step(s, s.schedule())
+        assert s.cache.hit_tokens - before == sum(len(p) - 1 for p in prompts), round_size
+    assert len(s.cache.entries) <= 8
