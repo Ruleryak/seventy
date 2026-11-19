@@ -1,5 +1,7 @@
 #include "common.cuh"
 
+#include <cstdlib>
+
 /*
  * NVFP4 weight GEMM for small batches: out[m, n] = alpha[n] * sum_k x[m, k] * q[n, k], with q = e2m1 * e4m3 the
  * unscaled NVFP4 weight. Volta tensor cores (mma.m8n8k4, FP16 inputs, FP32 accumulation).
@@ -8,6 +10,10 @@
  * i = (lane & 3) + 4 * (lane >= 16). The thread holds row i of A (k = 0..3), column i of B (k = 0..3), and the
  * 8 accumulators c[j] at row (i & 1) + 2 * ((j >> 1) & 1) + 4 * (i >> 2), column (j & 1) + 2 * ((i >> 1) & 1)
  * + 4 * (j >> 2).
+ *
+ * Two kernels. nvfp4_gemm_wk (up to 32 rows, the decode and verify batches; see its comment) gives each block one
+ * 32-column tile and splits k over the block's warps. nvfp4_gemm_kernel (33 to 64 rows, and short k) is described
+ * here. SEVENTY_GEMM_WK=0 selects nvfp4_gemm_kernel for all sizes.
  *
  * Work split: a warp owns a tile of 32 output columns (quad-pair p: columns 8 p .. 8 p + 7) and all batch rows
  * (8 per m-tile). A block of W warps owns W adjacent tiles. blockIdx.y takes a range of k, in steps of 64.
@@ -197,6 +203,104 @@ __global__ void __launch_bounds__(W * 32) nvfp4_gemm_kernel(half *out, float *ws
   }
 }
 
+/*
+ * nvfp4_gemm_wk (up to 32 rows, at least 8 k steps): one block of 8 warps per 32-column tile; the warps split k (contiguous ranges of
+ * 64-steps) and add their partial tiles in shared memory at the end, so there is no workspace and no reduce
+ * kernel, and no block barrier in the main loop. Each warp stages its own activations: the next step's 64 k of
+ * all rows are loaded into registers (coalesced, rows past m clamped to row m - 1, their outputs not written)
+ * while the current step computes from the warp's shared-memory buffer (step_mma, as nvfp4_gemm_kernel), then
+ * stored there after a warp barrier. On sm70 all of a warp's outstanding global loads wait together, so the
+ * prefetch is covered by one whole step of tensor-core work. Weights and scales are prefetched one step ahead.
+ */
+template <int MT>
+__global__ void __launch_bounds__(256, (MT >= 4 ? 1 : 2)) nvfp4_gemm_wk_kernel(half *out, const half *x, const uint4 *wpk,
+                                                              const uint32_t *wsc, const float *alpha, int m, int n,
+                                                              int k) {
+  constexpr int kW = 8;
+  constexpr int kRows = MT * 8;
+  constexpr int kLoads = kRows * 8 / 32;
+  __shared__ uint4 stage[kW][kRows * kRowStride];
+  float *red = reinterpret_cast<float *>(&stage[0][0]);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int ksteps = k / kStepK;
+  const int s0 = warp * ksteps / kW;
+  const int s1 = (warp + 1) * ksteps / kW;
+  const int steps = s1 - s0;
+  const int quad = (lane >> 2) & 3;
+  const int idx = (lane & 3) + ((lane >> 4) << 2);
+  const uint4 *wp = wpk + (static_cast<int64_t>(tile) * (k / 32) + 2 * s0) * 32 + lane;
+  const uint32_t *sp = wsc + (static_cast<int64_t>(tile) * ksteps + s0) * 32 + lane;
+  const uint4 *xbase = reinterpret_cast<const uint4 *>(x) + s0 * 8 + (lane & 7);
+  int xrow[kLoads];
+#pragma unroll
+  for (int l = 0; l < kLoads; ++l) xrow[l] = min((lane >> 3) + 4 * l, m - 1) * (k / 8);
+  const int dst0 = (lane >> 3) * kRowStride + (lane & 7);
+
+  float acc[MT][8];
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[t][j] = 0.0f;
+
+  uint4 *mine = stage[warp];
+  uint4 ar[kLoads];
+  uint4 w0 = make_uint4(0, 0, 0, 0), w1 = w0;
+  uint32_t sw = 0;
+  if (steps > 0) {
+#pragma unroll
+    for (int l = 0; l < kLoads; ++l) mine[dst0 + 4 * kRowStride * l] = __ldg(xbase + xrow[l]);
+    w0 = __ldg(wp);
+    w1 = __ldg(wp + 32);
+    sw = __ldg(sp);
+  }
+  __syncwarp();
+  for (int i = 0; i < steps; ++i) {
+    const bool more = i + 1 < steps;
+    uint4 nw0 = w0, nw1 = w1;
+    uint32_t nsw = sw;
+    if (more) {
+#pragma unroll
+      for (int l = 0; l < kLoads; ++l) ar[l] = __ldg(xbase + xrow[l] + (i + 1) * 8);
+      nw0 = __ldg(wp + static_cast<int64_t>(2 * (i + 1)) * 32);
+      nw1 = __ldg(wp + static_cast<int64_t>(2 * (i + 1) + 1) * 32);
+      nsw = __ldg(sp + static_cast<int64_t>(i + 1) * 32);
+    }
+    step_mma<MT>(acc, mine, w0, w1, sw, idx);
+    __syncwarp();
+    if (more) {
+#pragma unroll
+      for (int l = 0; l < kLoads; ++l) mine[dst0 + 4 * kRowStride * l] = ar[l];
+    }
+    __syncwarp();
+    w0 = nw0;
+    w1 = nw1;
+    sw = nsw;
+  }
+
+  __syncthreads();
+  if (warp > 0) {
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) red[((warp - 1) * kRows * 8 + t * 64 + j * 8) * 4 + lane] = acc[t][j];
+  }
+  __syncthreads();
+  if (warp > 0) return;
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float v = acc[t][j];
+#pragma unroll
+      for (int w = 0; w < kW - 1; ++w) v += red[(w * kRows * 8 + t * 64 + j * 8) * 4 + lane];
+      const int row = t * 8 + (idx & 1) + 2 * ((j >> 1) & 1) + 4 * (idx >> 2);
+      const int col = tile * 32 + quad * 8 + (j & 1) + 2 * ((idx >> 1) & 1) + 4 * (j >> 2);
+      if (row < m && col < n) out[static_cast<int64_t>(row) * n + col] = __float2half_rn(v * alpha[col]);
+    }
+}
+
 __global__ void nvfp4_gemm_reduce_kernel(half *out, const float *ws, const float *alpha, int m, int n, int n_padded,
                                          int splits) {
   const int quads = n_padded / 4;
@@ -316,6 +420,18 @@ SEVENTY_API int seventy_nvfp4_gemm(void *out, const void *x, const void *wpk, co
   const auto *xh = static_cast<const half *>(x);
   const auto *wp = static_cast<const uint4 *>(wpk);
   const auto *sp = static_cast<const uint32_t *>(wsc);
+  static const bool wk_off = getenv("SEVENTY_GEMM_WK") != nullptr && atoi(getenv("SEVENTY_GEMM_WK")) == 0;
+  if (!wk_off && m <= 32 && ksteps >= 8) {
+    if (m > 24)
+      nvfp4_gemm_wk_kernel<4><<<n_tiles, 256, 0, stream>>>(o, xh, wp, sp, alpha, m, n, k);
+    else if (m > 16)
+      nvfp4_gemm_wk_kernel<3><<<n_tiles, 256, 0, stream>>>(o, xh, wp, sp, alpha, m, n, k);
+    else if (m > 8)
+      nvfp4_gemm_wk_kernel<2><<<n_tiles, 256, 0, stream>>>(o, xh, wp, sp, alpha, m, n, k);
+    else
+      nvfp4_gemm_wk_kernel<1><<<n_tiles, 256, 0, stream>>>(o, xh, wp, sp, alpha, m, n, k);
+    return launch_status();
+  }
   switch ((m + 7) / 8) {
     case 1: launch_mt<1>(warps, o, ws, xh, wp, sp, alpha, m, n, n_tiles, k, used, stream); break;
     case 2: launch_mt<2>(warps, o, ws, xh, wp, sp, alpha, m, n, n_tiles, k, used, stream); break;
