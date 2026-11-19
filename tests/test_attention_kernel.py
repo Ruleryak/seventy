@@ -39,9 +39,10 @@ def setup(lengths, ctx, hq=6, hkv=2, bs=16, seed=0):
 
 
 @pytest.mark.parametrize("kv", ["fp16", "int8"])
-@pytest.mark.parametrize("lengths, ctx", [([1], [100]), ([1, 1, 1], [0, 37, 250]), ([9, 4], [600, 17])])
-def test_prep_and_attention_match_reference(lengths, ctx, kv):
-    hq, hkv, d, bs, eps = 6, 2, 256, 16, 1e-6
+@pytest.mark.parametrize("lengths, ctx, hkv", [([1], [100], 2), ([1, 1, 1], [0, 37, 250], 2), ([9, 4], [600, 17], 2),
+                                              ([8, 8, 8, 8], [5000, 3001, 70, 9000], 1), ([8, 3], [12345, 40], 1)])
+def test_prep_and_attention_match_reference(lengths, ctx, hkv, kv):
+    hq, d, bs, eps = 6, 256, 16, 1e-6
     qkv, starts, bt, k_cache, v_cache, positions = setup(lengths, ctx, hq, hkv, bs)
     ks = vs = None
     if kv == "int8":
