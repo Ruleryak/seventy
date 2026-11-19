@@ -20,6 +20,40 @@ def _tojson(value, indent=None, separators=None, sort_keys=False, ensure_ascii=F
     return json.dumps(value, indent=indent, separators=separators, sort_keys=sort_keys, ensure_ascii=ensure_ascii)
 
 
+def template_messages(messages: list[dict]) -> list[dict]:
+    """Messages as the chat template takes them. OpenAI clients send the arguments of earlier tool calls as JSON
+    text; the template iterates over them as a mapping, so they are parsed (an empty value becomes {}). The
+    request's own objects are not changed."""
+    out = []
+    for m in messages:
+        calls = m.get("tool_calls") if isinstance(m, dict) else None
+        if not isinstance(calls, list) or not calls:
+            out.append(m)
+            continue
+        fixed = []
+        for call in calls:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(fn, dict):
+                fixed.append(call)
+                continue
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                if args.strip():
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError as e:
+                        raise TemplateError(f"tool call {fn.get('name')!r}: the arguments are not valid JSON ({e})")
+                else:
+                    args = {}
+            elif args is None:
+                args = {}
+            if not isinstance(args, dict):
+                raise TemplateError(f"tool call {fn.get('name')!r}: the arguments must be a JSON object")
+            fixed.append({**call, "function": {**fn, "arguments": args}})
+        out.append({**m, "tool_calls": fixed})
+    return out
+
+
 class ChatTemplate:
     def __init__(self, model_path: str | Path):
         path = Path(model_path)
@@ -38,7 +72,7 @@ class ChatTemplate:
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
         try:
-            return self.template.render(messages=messages, tools=tools or None,
+            return self.template.render(messages=template_messages(messages), tools=tools or None,
                                         add_generation_prompt=add_generation_prompt, **kwargs)
         except TemplateError:
             raise
