@@ -206,8 +206,9 @@ __global__ void __launch_bounds__(W * 32) nvfp4_gemm_kernel(half *out, float *ws
 }
 
 /*
- * nvfp4_gemm_wk (at least 8 k steps; selection in seventy_nvfp4_gemm): one block of W warps (8 up to 16 rows, 4
- * from 17 rows: two such blocks share an SM and each warp gets twice the k range) per 32-column tile; the warps split k (contiguous ranges of
+ * nvfp4_gemm_wk (at least 8 k steps; selection in seventy_nvfp4_gemm): one block of W warps per 32-column tile
+ * (W = 8 up to 16 rows; from 17 rows W = 4, or 2 with 200 or more tiles: more blocks share an SM and each warp gets
+ * a longer k range; measured on V100); the warps split k (contiguous ranges of
  * 64-steps) and add their partial tiles in shared memory at the end, so there is no workspace and no reduce
  * kernel, and no block barrier in the main loop. Each warp stages its own activations: the next step's 64 k of
  * all rows are loaded into registers (coalesced, rows past m clamped to row m - 1, their outputs not written)
@@ -321,8 +322,12 @@ void launch_wk_w(half *out, const half *x, const uint4 *wpk, const uint32_t *wsc
 template <int MT>
 void launch_wk(half *out, const half *x, const uint4 *wpk, const uint32_t *wsc, const float *alpha, int m, int n,
                int k, int n_tiles, cudaStream_t stream) {
-  if constexpr (MT >= 3) launch_wk_w<MT, 4>(out, x, wpk, wsc, alpha, m, n, k, n_tiles, stream);
-  else launch_wk_w<MT, 8>(out, x, wpk, wsc, alpha, m, n, k, n_tiles, stream);
+  if constexpr (MT >= 3) {
+    if (n_tiles >= 200) launch_wk_w<MT, 2>(out, x, wpk, wsc, alpha, m, n, k, n_tiles, stream);
+    else launch_wk_w<MT, 4>(out, x, wpk, wsc, alpha, m, n, k, n_tiles, stream);
+  } else {
+    launch_wk_w<MT, 8>(out, x, wpk, wsc, alpha, m, n, k, n_tiles, stream);
+  }
 }
 
 __global__ void nvfp4_gemm_reduce_kernel(half *out, const float *ws, const float *alpha, int m, int n, int n_padded,
