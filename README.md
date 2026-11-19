@@ -36,25 +36,31 @@ seventy check-model /path/to/checkpoint
 
 ## Install
 
-1. Make a virtual environment:
+1. Make a virtual environment and install the wheel from the release. Use one of the two options.
+
+   With uv:
 
    ```
    uv venv --python 3.12 ~/seventy-env
    ```
 
-2. Install the wheel from the release. With uv:
-
    ```
    uv pip install -p ~/seventy-env "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.0.0/seventy-1.0.0-py3-none-linux_x86_64.whl" --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match
    ```
 
-   With pip:
+   With pip (a virtual environment from `uv venv` has no pip, thus use `venv` from Python):
+
+   ```
+   python3.12 -m venv ~/seventy-env
+   ```
 
    ```
    ~/seventy-env/bin/pip install "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.0.0/seventy-1.0.0-py3-none-linux_x86_64.whl" --extra-index-url https://download.pytorch.org/whl/cu129
    ```
 
-3. Check the GPUs, the driver and the kernel library:
+   You can run the install command again. It does not change an installation that is up to date.
+
+2. Check the GPUs, the driver and the kernel library:
 
    ```
    ~/seventy-env/bin/seventy info
