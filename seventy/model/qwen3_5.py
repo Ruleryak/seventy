@@ -291,7 +291,7 @@ class Qwen35TextModel:
             x, residual = self.par.reduce_norm(x, layer.post_norm, t.rms_norm_eps, residual)
             x = layer.mlp(x)
             nxt = self.layers[i + 1].input_norm if i + 1 < len(self.layers) else self.final_norm
-            x, residual = self.par.reduce_norm(x, nxt, t.rms_norm_eps, residual)
+            x, residual = self.par.reduce_norm(x, nxt, t.rms_norm_eps, residual, full_residual=i in capture)
             if i in capture:
                 captured[i] = residual.clone()
         if top:

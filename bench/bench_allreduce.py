@@ -34,7 +34,7 @@ def rank_main(rank: int, world: int, port: int, rows_list: list[int], iters: int
             def body():
                 for _ in range(iters):
                     if name == "custom":
-                        ar.norm(x, res, w, 1e-6)
+                        ar.norm(x, res, w, 1e-6, full_residual=os.environ.get("AR_GATHER", "0") == "1")
                     else:
                         y = x.clone()
                         torch.distributed.all_reduce(y)

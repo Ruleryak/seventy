@@ -179,6 +179,15 @@ SEVENTY_API int seventy_ar_open(const void *handle, void **ptr);
 SEVENTY_API int seventy_ar_context(int rank, int world, void *const *buffers, int64_t slot_bytes, void **ctx_out);
 SEVENTY_API int seventy_ar_norm(void *ctx, void *out, void *residual, const void *x, const float *weight, int rows,
                                 int dim, float eps, cudaStream_t stream);
+
+/*
+ * Two-shot all-reduce + residual add + RMS norm (csrc/allreduce.cu, ar_norm_2shot_kernel): rows <= 64 are split
+ * into world contiguous shards; each row is reduced and normed by its home rank and the normed rows are gathered.
+ * out is complete on every rank; residual is updated only on the home rank of each row, unless gather_residual is set
+ * (then every rank gets the full updated residual). weight is required. Same context and limits as seventy_ar_norm.
+ */
+SEVENTY_API int seventy_ar_norm_2shot(void *ctx_ptr, void *out, void *residual, const void *x, const float *weight,
+                                      int rows, int dim, float eps, int gather_residual, cudaStream_t stream);
 SEVENTY_API int seventy_ar_sum_f32(void *ctx, float *out, const float *x, int rows, int dim, cudaStream_t stream);
 
 /*
