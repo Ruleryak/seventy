@@ -3,6 +3,9 @@
 
 #include "common.cuh"
 
+#include <cstdlib>
+#include <cstring>
+
 /*
  * Attention over the paged KV cache (head size 256) on Volta tensor cores, in tiles of 64 keys with an online
  * softmax in FP32.
@@ -906,10 +909,303 @@ __global__ void __launch_bounds__(kPT, 1) flash_attention_wmma(
 }
 
 
+/*
+ * flash_attention_mma: prefill attention for INT8 caches on mma.m8n8k4 with shared-memory operands. On sm70 a
+ * WMMA fragment load moves twice the data it holds, and the S tile of flash_attention_wmma gives each warp one
+ * 16 x 16 tile per pair of loads; here the A operand of m8n8k4 is one broadcast load for the four quad-pairs and a
+ * warp computes larger tiles, so shared-memory traffic per multiply-add is about a third.
+ *
+ * One block of 8 warps per (64-token query tile of one sequence, query head); 64-key tiles. Shared memory: Q and
+ * the K-or-V tile [64, 256] FP16, P [64, 64] FP16, the second half of S [64, 64] FP32, and row statistics. The
+ * rows of Q, K and P are XOR-swizzled in 8-byte chunks with f(r) = (r & 3) | (((r >> 3) & 3) << 2), the rows of V
+ * with g(r) = (r & 1) | ((r & 2) << 2), so that the operand loads of a warp (A: rows r0 + idx; B of row.col:
+ * rows 8 quad + idx; B of row.row: rows k + (lane & 3), columns 8 quad + 4 (lane >> 4)) hit distinct banks.
+ *
+ * Per key tile: (1) stage K (dequantized with its scales); (2) S = Q K^T, warp w: rows 16 (w % 4) .. + 16, all 64
+ * keys, half w / 4 of the head dimension; warps 4..7 store their partial S; (3) warps 0..3 add it and run the
+ * online softmax of their rows in registers (P rounded to FP16, row sums of the rounded P), while warps 4..7
+ * stage V; (4) O += P V, warp w: rows 32 (w % 2) .. + 32, columns 64 (w / 2) .. + 64. The next K and V tiles are
+ * in registers while the current one computes. The epilogue is as in flash_attention_wmma: O / l rounded to FP16,
+ * times sigmoid of the gate.
+ */
+constexpr int kLdSM = kTile + 4;
+constexpr int kMmaSmem = (2 * kTile * kHead + kTile * kTile) * static_cast<int>(sizeof(half)) +
+                         (kTile * kLdSM + 3 * kTile) * static_cast<int>(sizeof(float));
+
+__device__ __forceinline__ int swz_f(int r) { return (r & 3) | (((r >> 3) & 3) << 2); }
+
+__device__ __forceinline__ int swz_g(int r) { return (r & 1) | ((r & 2) << 2); }
+
+template <int Cols>
+__device__ __forceinline__ uint2 lds_chunk(const half *base, int r, int chunk, int s) {
+  return *reinterpret_cast<const uint2 *>(base + r * Cols + ((chunk ^ s) << 2));
+}
+
+template <int Cols>
+__device__ __forceinline__ void sts_pair(half *base, int r, int pair, int s, uint4 v) {
+  *reinterpret_cast<uint2 *>(base + r * Cols + (((2 * pair) ^ s) << 2)) = make_uint2(v.x, v.y);
+  *reinterpret_cast<uint2 *>(base + r * Cols + (((2 * pair + 1) ^ s) << 2)) = make_uint2(v.z, v.w);
+}
+
+template <int Threads>
+struct Int8Tile {
+  static constexpr int kChunks = kTile * kHead / 16 / Threads;
+  uint4 v[kChunks];
+  float s[kChunks];
+};
+
+template <int Threads>
+__device__ __forceinline__ void int8_load(Int8Tile<Threads> &raw, int t, const int8_t *cache, const float *scales,
+                                          const int *table, int k0, int n, int block_size, int hkv, int kh) {
+#pragma unroll
+  for (int i = 0; i < Int8Tile<Threads>::kChunks; ++i) {
+    const int e = t + i * Threads;
+    const int j = e / (kHead / 16);
+    const int c = (e % (kHead / 16)) * 16;
+    raw.v[i] = make_uint4(0, 0, 0, 0);
+    raw.s[i] = 0.0f;
+    if (j < n) {
+      const int pos = k0 + j;
+      const int64_t vec = (static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size) * hkv + kh;
+      raw.v[i] = *reinterpret_cast<const uint4 *>(cache + vec * kHead + c);
+      raw.s[i] = scales[vec];
+    }
+  }
+}
+
+template <int Threads, bool IsV>
+__device__ __forceinline__ void int8_store(half *dst, const Int8Tile<Threads> &raw, int t) {
+#pragma unroll
+  for (int i = 0; i < Int8Tile<Threads>::kChunks; ++i) {
+    const int e = t + i * Threads;
+    const int j = e / (kHead / 16);
+    const int c = (e % (kHead / 16)) * 16;
+    half h[16];
+    int8x4_to_half(raw.v[i].x, raw.s[i], h);
+    int8x4_to_half(raw.v[i].y, raw.s[i], h + 4);
+    int8x4_to_half(raw.v[i].z, raw.s[i], h + 8);
+    int8x4_to_half(raw.v[i].w, raw.s[i], h + 12);
+    const int s = IsV ? swz_g(j) : swz_f(j);
+    sts_pair<kHead>(dst, j, c / 8, s, *reinterpret_cast<uint4 *>(h));
+    sts_pair<kHead>(dst, j, c / 8 + 1, s, *reinterpret_cast<uint4 *>(h + 8));
+  }
+}
+
+__global__ void __launch_bounds__(kPT, 1) flash_attention_mma(
+    half *out, const half *q, const int8_t *k_cache, const int8_t *v_cache, const float *k_scale,
+    const float *v_scale, const half *qkv, int ld, const int *tiles, const int *block_tables, int table_width,
+    const int *query_start, const int *context_lens, int block_size, int hq, int hkv, float scale) {
+  extern __shared__ __align__(16) unsigned char msm[];
+  half *qs = reinterpret_cast<half *>(msm);
+  half *kv = qs + kTile * kHead;
+  half *ps = kv + kTile * kHead;
+  float *sp = reinterpret_cast<float *>(ps + kTile * kTile);
+  float *m_s = sp + kTile * kLdSM;
+  float *l_s = m_s + kTile;
+  float *fac_s = l_s + kTile;
+
+  const int b = tiles[2 * blockIdx.x];
+  const int q0 = tiles[2 * blockIdx.x + 1];
+  const int head = blockIdx.y;
+  const int kh = head / (hq / hkv);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int quad = (lane >> 2) & 3;
+  const int idx = lane_idx();
+  const int t0 = query_start[b];
+  const int n_new = query_start[b + 1] - t0;
+  const int ctx = context_lens[b];
+  const int rows = min(kTile, n_new - q0);
+  const int key_end = ctx + q0 + rows;
+  const int *table = block_tables + static_cast<int64_t>(b) * table_width;
+
+  for (int e = threadIdx.x; e < kTile * (kHead / 8); e += kPT) {
+    const int r = e / (kHead / 8);
+    const int pair = e % (kHead / 8);
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (r < rows) v = *reinterpret_cast<const uint4 *>(q + (static_cast<int64_t>(t0 + q0 + r) * hq + head) * kHead + 8 * pair);
+    sts_pair<kHead>(qs, r, pair, swz_f(r), v);
+  }
+  for (int r = threadIdx.x; r < kTile; r += kPT) {
+    m_s[r] = -FLT_MAX;
+    l_s[r] = 0.0f;
+  }
+
+  const int qk_r0 = 16 * (warp & 3), qk_half = warp >> 2;
+  const int pv_r0 = 32 * (warp & 1), pv_c0 = 64 * (warp >> 1);
+  const int vk = lane & 3;
+  const int vn = 8 * quad + 4 * (lane >> 4);
+  float o[4][2][8];
+#pragma unroll
+  for (int t = 0; t < 4; ++t)
+#pragma unroll
+    for (int n = 0; n < 2; ++n)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) o[t][n][j] = 0.0f;
+
+  Int8Tile<kPT> rk;
+  Int8Tile<kPT / 2> rv;
+  const int vt = threadIdx.x - kPT / 2;
+  int8_load<kPT>(rk, threadIdx.x, k_cache, k_scale, table, 0, min(kTile, key_end), block_size, hkv, kh);
+  if (warp >= 4) int8_load<kPT / 2>(rv, vt, v_cache, v_scale, table, 0, min(kTile, key_end), block_size, hkv, kh);
+
+  for (int k0 = 0; k0 < key_end; k0 += kTile) {
+    const int k1 = k0 + kTile;
+    const int n1 = min(kTile, key_end - k1);
+    __syncthreads();
+    int8_store<kPT, false>(kv, rk, threadIdx.x);
+    __syncthreads();
+    if (k1 < key_end) int8_load<kPT>(rk, threadIdx.x, k_cache, k_scale, table, k1, n1, block_size, hkv, kh);
+
+    float sacc[2][2][8];
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+      for (int n = 0; n < 2; ++n)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sacc[t][n][j] = 0.0f;
+#pragma unroll 4
+    for (int c = qk_half * (kHead / 8); c < (qk_half + 1) * (kHead / 8); ++c) {
+      uint2 a[2], bk[2];
+#pragma unroll
+      for (int t = 0; t < 2; ++t) {
+        const int r = qk_r0 + 8 * t + idx;
+        a[t] = lds_chunk<kHead>(qs, r, c, swz_f(r));
+      }
+#pragma unroll
+      for (int n = 0; n < 2; ++n) {
+        const int r = 32 * n + 8 * quad + idx;
+        bk[n] = lds_chunk<kHead>(kv, r, c, swz_f(r));
+      }
+#pragma unroll
+      for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int n = 0; n < 2; ++n) mma_8x8x4(sacc[t][n], a[t], bk[n]);
+    }
+    if (qk_half == 1) {
+#pragma unroll
+      for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int n = 0; n < 2; ++n)
+#pragma unroll
+          for (int j = 0; j < 8; ++j)
+            sp[(qk_r0 + 8 * t + frag_row(j)) * kLdSM + 32 * n + frag_col(j)] = sacc[t][n][j];
+    }
+    __syncthreads();
+
+    if (qk_half == 0) {
+#pragma unroll
+      for (int t = 0; t < 2; ++t) {
+#pragma unroll
+        for (int hb = 0; hb < 2; ++hb) {
+          const int r = qk_r0 + 8 * t + (idx & 1) + 2 * hb + 4 * (idx >> 2);
+          const int limit = ctx + q0 + r;
+          float v[2][4];
+          float mx = -FLT_MAX;
+#pragma unroll
+          for (int n = 0; n < 2; ++n)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+              const int j = 2 * hb + (e & 1) + 4 * (e >> 1);
+              const int col = 32 * n + frag_col(j);
+              const int key = k0 + col;
+              const float x = sacc[t][n][j] + sp[r * kLdSM + col];
+              const bool ok = r < rows && key < key_end && key <= limit;
+              v[n][e] = ok ? x * scale : -FLT_MAX;
+              mx = fmaxf(mx, v[n][e]);
+            }
+          mx = row_reduce_max(mx);
+          const float m_old = m_s[r];
+          const float l_old = l_s[r];
+          const float m_new = fmaxf(m_old, mx);
+          const float corr = (m_old == -FLT_MAX) ? 0.0f : expf(m_old - m_new);
+          float sum = 0.0f;
+#pragma unroll
+          for (int n = 0; n < 2; ++n)
+#pragma unroll
+            for (int e = 0; e < 4; e += 2) {
+              const int j = 2 * hb + 4 * (e >> 1);
+              const int col = 32 * n + frag_col(j);
+              const half p0 = __float2half_rn(v[n][e] == -FLT_MAX ? 0.0f : expf(v[n][e] - m_new));
+              const half p1 = __float2half_rn(v[n][e + 1] == -FLT_MAX ? 0.0f : expf(v[n][e + 1] - m_new));
+              sum += __half2float(p0) + __half2float(p1);
+              *reinterpret_cast<half2 *>(ps + r * kTile + (((col >> 2) ^ swz_f(r)) << 2) + (col & 3)) =
+                  __halves2half2(p0, p1);
+            }
+          sum = row_reduce_sum(sum);
+          __syncwarp();
+          if ((lane & 0xe) == 0) {
+            m_s[r] = m_new;
+            l_s[r] = l_old * corr + sum;
+            fac_s[r] = corr;
+          }
+        }
+      }
+    } else {
+      int8_store<kPT / 2, true>(kv, rv, vt);
+      if (k1 < key_end) int8_load<kPT / 2>(rv, vt, v_cache, v_scale, table, k1, n1, block_size, hkv, kh);
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int t = 0; t < 4; ++t)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float f = fac_s[pv_r0 + 8 * t + frag_row(j)];
+#pragma unroll
+        for (int n = 0; n < 2; ++n) o[t][n][j] *= f;
+      }
+#pragma unroll 4
+    for (int k = 0; k < kTile; k += 4) {
+      uint2 a[4], bv[2];
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const int r = pv_r0 + 8 * t + idx;
+        a[t] = lds_chunk<kTile>(ps, r, k >> 2, swz_f(r));
+      }
+#pragma unroll
+      for (int n = 0; n < 2; ++n) bv[n] = lds_chunk<kHead>(kv, k + vk, (pv_c0 + 32 * n + vn) >> 2, swz_g(k + vk));
+#pragma unroll
+      for (int t = 0; t < 4; ++t)
+#pragma unroll
+        for (int n = 0; n < 2; ++n) mma_8x8x4_rr(o[t][n], a[t], bv[n]);
+    }
+  }
+
+#pragma unroll
+  for (int t = 0; t < 4; ++t)
+#pragma unroll
+    for (int n = 0; n < 2; ++n)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int row = pv_r0 + 8 * t + frag_row(j);
+        if (row >= rows) continue;
+        const int col = pv_c0 + 32 * n + frag_col(j);
+        const int64_t tok = t0 + q0 + row;
+        const float a = __half2float(__float2half_rn(o[t][n][j] / l_s[row]));
+        const float g = __half2float(qkv[tok * ld + head * 2 * kHead + kHead + col]);
+        out[(tok * hq + head) * kHead + col] = __float2half_rn(a / (1.0f + expf(-g)));
+      }
+}
+
 template <typename T>
 int launch(half *out, const half *q, const T *k, const T *v, const float *ks, const float *vs, const half *qkv,
            int ld, const int *tiles, int num_tiles, const int *block_tables, int table_width, const int *query_start,
            const int *context_lens, int block_size, int hq, int hkv, float scale, cudaStream_t stream) {
+  if constexpr (sizeof(T) == 1) {
+    static const bool wmma_only = [] {
+      const char *v = getenv("SEVENTY_PREFILL_ATTN");
+      return v != nullptr && strcmp(v, "wmma") == 0;
+    }();
+    if (!wmma_only) {
+      const cudaError_t e = cudaFuncSetAttribute(flash_attention_mma, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 kMmaSmem);
+      if (e != cudaSuccess) return static_cast<int>(e);
+      flash_attention_mma<<<dim3(num_tiles, hq), kPT, kMmaSmem, stream>>>(
+          out, q, reinterpret_cast<const int8_t *>(k), reinterpret_cast<const int8_t *>(v), ks, vs, qkv, ld, tiles,
+          block_tables, table_width, query_start, context_lens, block_size, hq, hkv, scale);
+      return launch_status();
+    }
+  }
   const cudaError_t e =
       cudaFuncSetAttribute(flash_attention_wmma<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, kPrefillSmem);
   if (e != cudaSuccess) return static_cast<int>(e);
