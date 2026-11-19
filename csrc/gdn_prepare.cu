@@ -12,9 +12,11 @@
  *      j = tj + 16 b, so the lower-triangular work is balanced and the k rows of a warp hit distinct banks (odd
  *      row pitch in words). P[t, j] = exp(G_t - G_j) q_t . k_j (j <= t) is written; A[t, j] =
  *      beta_t exp(G_t - G_j) k_t . k_j (j < t) stays in shared memory.
- *   4. T = (I + A)^-1 by forward substitution, four threads per column.
+ *   4. T = (I + A)^-1 by forward substitution, four threads per column. The rows of A and T are padded to a
+ *      multiple of 4 floats, so that step 5 reads a row of T with 16-byte broadcast loads.
  *   5. U' = T (beta V) and W = T (beta exp(G) K): a thread per output column (128 for U', 128 for W) keeps its
- *      right-hand-side column in registers and walks the rows of T.
+ *      right-hand-side column in registers (pinned: otherwise the compiler reloads it for every row) and walks
+ *      the rows of T.
  *
  * Outputs (FP16 unless noted) as gdn_chunk_scan reads them: w, u, gq [Hv, chunks, 64, 128], p [Hv, chunks, 64,
  * 64], klt [Hv, chunks, 128, 64], eg FP32 [Hv, chunks].
@@ -27,11 +29,11 @@ constexpr int kL = 64;
 constexpr int kD = 128;
 constexpr int kThreads = 256;
 constexpr int kPitch = kD + 2;
-constexpr int kLdA = kL + 1;
+constexpr int kLdA = kL + 4;
 constexpr int kSmem = 3 * kL * kPitch * static_cast<int>(sizeof(half)) +
                       (2 * kL * kLdA + 6 * kL) * static_cast<int>(sizeof(float));
 
-__global__ void __launch_bounds__(kThreads) gdn_prepare_kernel(
+__global__ void __launch_bounds__(kThreads, 1) gdn_prepare_kernel(
     half *w_out, half *u_out, half *gq_out, half *p_out, half *klt_out, float *eg_out, const half *qkv, int ld,
     const float *g, const float *beta, const int *chunk_row, const int *chunk_len, int chunks, int hk, int hv) {
   extern __shared__ __align__(16) unsigned char smem[];
@@ -58,6 +60,7 @@ __global__ void __launch_bounds__(kThreads) gdn_prepare_kernel(
   const int key_size = hk * kD;
   const int64_t slab = static_cast<int64_t>(h) * chunks + c;
 
+#pragma unroll
   for (int e = tid; e < kL * (kD / 2); e += kThreads) {
     const int r = e / (kD / 2);
     const int d2 = e % (kD / 2);
@@ -151,8 +154,8 @@ __global__ void __launch_bounds__(kThreads) gdn_prepare_kernel(
       for (int a = 0; a < 4; ++a)
 #pragma unroll
         for (int b = 0; b < 4; ++b) {
-          qk[a][b] += qa[a].x * kb[b].x + qa[a].y * kb[b].y;
-          kk[a][b] += ka[a].x * kb[b].x + ka[a].y * kb[b].y;
+          qk[a][b] = fmaf(qa[a].y, kb[b].y, fmaf(qa[a].x, kb[b].x, qk[a][b]));
+          kk[a][b] = fmaf(ka[a].y, kb[b].y, fmaf(ka[a].x, kb[b].x, kk[a][b]));
         }
     }
 #pragma unroll
@@ -186,18 +189,24 @@ __global__ void __launch_bounds__(kThreads) gdn_prepare_kernel(
     const half *src = is_u ? vs : ks;
     float r[kL];
 #pragma unroll
-    for (int jj = 0; jj < kL; ++jj) r[jj] = (is_u ? bt[jj] : rw[jj]) * __half2float(src[jj * kPitch + d]);
+    for (int jj = 0; jj < kL; ++jj) {
+      r[jj] = (is_u ? bt[jj] : rw[jj]) * __half2float(src[jj * kPitch + d]);
+      asm volatile("" : "+f"(r[jj]));
+    }
     half *dst = (is_u ? u_out : w_out) + slab * kL * kD + d;
 #pragma unroll 1
     for (int t = 0; t < kL; ++t) {
-      const float *trow = T + t * kLdA;
-      float acc0 = 0.0f, acc1 = 0.0f;
+      const float4 *trow = reinterpret_cast<const float4 *>(T + t * kLdA);
+      float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-      for (int jj = 0; jj < kL; jj += 2) {
-        acc0 += trow[jj] * r[jj];
-        acc1 += trow[jj + 1] * r[jj + 1];
+      for (int q = 0; q < kL / 4; ++q) {
+        const float4 tv = trow[q];
+        acc[0] = fmaf(tv.x, r[4 * q], acc[0]);
+        acc[1] = fmaf(tv.y, r[4 * q + 1], acc[1]);
+        acc[2] = fmaf(tv.z, r[4 * q + 2], acc[2]);
+        acc[3] = fmaf(tv.w, r[4 * q + 3], acc[3]);
       }
-      dst[t * kD] = __float2half_rn(acc0 + acc1);
+      dst[t * kD] = __float2half_rn((acc[0] + acc[1]) + (acc[2] + acc[3]));
     }
   }
 }
