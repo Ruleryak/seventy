@@ -11,9 +11,11 @@
  * 8 accumulators c[j] at row (i & 1) + 2 * ((j >> 1) & 1) + 4 * (i >> 2), column (j & 1) + 2 * ((i >> 1) & 1)
  * + 4 * (j >> 2).
  *
- * Two kernels. nvfp4_gemm_wk (up to 32 rows, the decode and verify batches; see its comment) gives each block one
- * 32-column tile and splits k over the block's warps. nvfp4_gemm_kernel (33 to 64 rows, and short k) is described
- * here. SEVENTY_GEMM_WK=0 selects nvfp4_gemm_kernel for all sizes.
+ * Two kernels. nvfp4_gemm_wk (see its comment) gives each block one 32-column tile and splits k over the block's
+ * warps; it runs up to 32 rows, and above that when k is at most 72 steps of 64 or up to 40 rows unless n is large
+ * (measured on V100: with 8 m-tiles and long k, one block per SM is slower than nvfp4_gemm_kernel). Below 8 steps
+ * of k and otherwise, nvfp4_gemm_kernel runs; it is described here. SEVENTY_GEMM_WK=0 selects nvfp4_gemm_kernel
+ * for all sizes.
  *
  * Work split: a warp owns a tile of 32 output columns (quad-pair p: columns 8 p .. 8 p + 7) and all batch rows
  * (8 per m-tile). A block of W warps owns W adjacent tiles. blockIdx.y takes a range of k, in steps of 64.
@@ -204,7 +206,7 @@ __global__ void __launch_bounds__(W * 32) nvfp4_gemm_kernel(half *out, float *ws
 }
 
 /*
- * nvfp4_gemm_wk (up to 32 rows, at least 8 k steps): one block of 8 warps per 32-column tile; the warps split k (contiguous ranges of
+ * nvfp4_gemm_wk (at least 8 k steps; selection in seventy_nvfp4_gemm): one block of 8 warps per 32-column tile; the warps split k (contiguous ranges of
  * 64-steps) and add their partial tiles in shared memory at the end, so there is no workspace and no reduce
  * kernel, and no block barrier in the main loop. Each warp stages its own activations: the next step's 64 k of
  * all rows are loaded into registers (coalesced, rows past m clamped to row m - 1, their outputs not written)
@@ -219,8 +221,9 @@ __global__ void __launch_bounds__(256, (MT >= 4 ? 1 : 2)) nvfp4_gemm_wk_kernel(h
   constexpr int kW = 8;
   constexpr int kRows = MT * 8;
   constexpr int kLoads = kRows * 8 / 32;
-  __shared__ uint4 stage[kW][kRows * kRowStride];
-  float *red = reinterpret_cast<float *>(&stage[0][0]);
+  extern __shared__ uint4 wk_smem[];
+  auto stage = reinterpret_cast<uint4 (*)[kRows * kRowStride]>(wk_smem);
+  float *red = reinterpret_cast<float *>(wk_smem);
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int tile = blockIdx.x;
@@ -299,6 +302,21 @@ __global__ void __launch_bounds__(256, (MT >= 4 ? 1 : 2)) nvfp4_gemm_wk_kernel(h
       const int col = tile * 32 + quad * 8 + (j & 1) + 2 * ((idx >> 1) & 1) + 4 * (j >> 2);
       if (row < m && col < n) out[static_cast<int64_t>(row) * n + col] = __float2half_rn(v * alpha[col]);
     }
+}
+
+template <int MT>
+void launch_wk(half *out, const half *x, const uint4 *wpk, const uint32_t *wsc, const float *alpha, int m, int n,
+               int k, int n_tiles, cudaStream_t stream) {
+  constexpr int kBytes = 8 * MT * 8 * kRowStride * static_cast<int>(sizeof(uint4));
+  static_assert(kBytes >= 7 * MT * 8 * 32 * static_cast<int>(sizeof(float)), "reduction must fit the staging area");
+  if constexpr (kBytes > 48 * 1024) {
+    static bool configured = false;
+    if (!configured) {
+      cudaFuncSetAttribute(nvfp4_gemm_wk_kernel<MT>, cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes);
+      configured = true;
+    }
+  }
+  nvfp4_gemm_wk_kernel<MT><<<n_tiles, 256, kBytes, stream>>>(out, x, wpk, wsc, alpha, m, n, k);
 }
 
 __global__ void nvfp4_gemm_reduce_kernel(half *out, const float *ws, const float *alpha, int m, int n, int n_padded,
@@ -421,15 +439,24 @@ SEVENTY_API int seventy_nvfp4_gemm(void *out, const void *x, const void *wpk, co
   const auto *wp = static_cast<const uint4 *>(wpk);
   const auto *sp = static_cast<const uint32_t *>(wsc);
   static const bool wk_off = getenv("SEVENTY_GEMM_WK") != nullptr && atoi(getenv("SEVENTY_GEMM_WK")) == 0;
-  if (!wk_off && m <= 32 && ksteps >= 8) {
-    if (m > 24)
-      nvfp4_gemm_wk_kernel<4><<<n_tiles, 256, 0, stream>>>(o, xh, wp, sp, alpha, m, n, k);
+  const bool use_wk = m <= 32 || ksteps <= 72 || (m <= 40 && n_tiles < 200);
+  if (!wk_off && use_wk && ksteps >= 8) {
+    if (m > 56)
+      launch_wk<8>(o, xh, wp, sp, alpha, m, n, k, n_tiles, stream);
+    else if (m > 48)
+      launch_wk<7>(o, xh, wp, sp, alpha, m, n, k, n_tiles, stream);
+    else if (m > 40)
+      launch_wk<6>(o, xh, wp, sp, alpha, m, n, k, n_tiles, stream);
+    else if (m > 32)
+      launch_wk<5>(o, xh, wp, sp, alpha, m, n, k, n_tiles, stream);
+    else if (m > 24)
+      launch_wk<4>(o, xh, wp, sp, alpha, m, n, k, n_tiles, stream);
     else if (m > 16)
-      nvfp4_gemm_wk_kernel<3><<<n_tiles, 256, 0, stream>>>(o, xh, wp, sp, alpha, m, n, k);
+      launch_wk<3>(o, xh, wp, sp, alpha, m, n, k, n_tiles, stream);
     else if (m > 8)
-      nvfp4_gemm_wk_kernel<2><<<n_tiles, 256, 0, stream>>>(o, xh, wp, sp, alpha, m, n, k);
+      launch_wk<2>(o, xh, wp, sp, alpha, m, n, k, n_tiles, stream);
     else
-      nvfp4_gemm_wk_kernel<1><<<n_tiles, 256, 0, stream>>>(o, xh, wp, sp, alpha, m, n, k);
+      launch_wk<1>(o, xh, wp, sp, alpha, m, n, k, n_tiles, stream);
     return launch_status();
   }
   switch ((m + 7) / 8) {
