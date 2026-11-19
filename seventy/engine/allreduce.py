@@ -14,7 +14,7 @@ from ..ops._lib import check, lib
 class CustomAllReduce:
     def __init__(self, rank: int, world: int, device: torch.device, max_rows: int = 64, dim: int = 5120):
         self.rank, self.world, self.max_rows, self.dim = rank, world, max_rows, dim
-        slot = -(-max_rows * dim * 2 // 16) * 16
+        slot = -(-max_rows * dim * 4 // 16) * 16
         nbytes = lib().seventy_ar_buffer_bytes(world, slot)
         ptr = ctypes.c_void_p()
         handle = (ctypes.c_char * 64)()
@@ -37,7 +37,8 @@ class CustomAllReduce:
         dist.barrier()
 
     def fits(self, x: torch.Tensor) -> bool:
-        return x.is_cuda and x.dtype == torch.float16 and x.shape[-1] == self.dim and x.shape[0] <= self.max_rows
+        return (x.is_cuda and x.dtype in (torch.float16, torch.float32) and x.dim() == 2 and x.shape[-1] == self.dim
+                and x.shape[0] <= self.max_rows)
 
     def norm(self, x: torch.Tensor, residual: torch.Tensor | None, weight: torch.Tensor, eps: float):
         """(rms_norm(residual + all_reduce(x)) * weight, the new residual)."""
@@ -50,8 +51,13 @@ class CustomAllReduce:
         return out, residual
 
     def reduce(self, x: torch.Tensor) -> torch.Tensor:
-        """all_reduce(x) (FP16, FP32 sum rounded once)."""
+        """all_reduce(x): FP16 (FP32 sum rounded once) or FP32."""
         x = x.contiguous()
+        if x.dtype == torch.float32:
+            out = torch.empty_like(x)
+            check("ar_sum_f32", lib().seventy_ar_sum_f32(self.ctx, out.data_ptr(), x.data_ptr(), x.shape[0], x.shape[1],
+                                                         torch.cuda.current_stream(x.device).cuda_stream))
+            return out
         out = torch.empty_like(x)
         code = lib().seventy_ar_norm(self.ctx, out.data_ptr(), None, x.data_ptr(), None, x.shape[0], x.shape[1], 0.0,
                                      torch.cuda.current_stream(x.device).cuda_stream)

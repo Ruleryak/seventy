@@ -168,6 +168,7 @@ SEVENTY_API int seventy_ar_open(const void *handle, void **ptr);
 SEVENTY_API int seventy_ar_context(int rank, int world, void *const *buffers, int64_t slot_bytes, void **ctx_out);
 SEVENTY_API int seventy_ar_norm(void *ctx, void *out, void *residual, const void *x, const float *weight, int rows,
                                 int dim, float eps, cudaStream_t stream);
+SEVENTY_API int seventy_ar_sum_f32(void *ctx, float *out, const float *x, int rows, int dim, cudaStream_t stream);
 
 /*
  * FP16 weight GEMM for 1 to 64 rows (see csrc/dense_gemm.cu): out[m, n] = x[m, k] w[n, k]^T, FP32 accumulation,

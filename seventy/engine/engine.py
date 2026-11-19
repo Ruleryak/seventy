@@ -109,7 +109,7 @@ class Engine:
             from ..model.dflash2 import Drafter
 
             _stage("drafter", f"loading {display_name(config.draft_model)}")
-            self.drafter = Drafter(config.draft_model, self.model, self.device, torch.float16, par=Parallel(0, tp))
+            self.drafter = Drafter(config.draft_model, self.model, self.device, torch.float16, par=self.model.par)
         torch.cuda.synchronize()
         drafter_bytes = torch.cuda.memory_allocated(self.device) - weights
         budgets = [distributed.memory_budget(self.device, config.gpu_memory_utilization, reserve)]

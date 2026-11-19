@@ -160,6 +160,62 @@ __global__ void __launch_bounds__(kThreads) ar_norm_kernel(ArContext ctx, half *
   }
 }
 
+/*
+ * Plain FP32 all-reduce of [rows, dim] (the drafter's partial sums), with the same buffers, epochs and barrier as
+ * ar_norm_kernel. Each rank's FP32 slice fits the slot because the slot is sized for max_rows FP32 rows.
+ */
+__global__ void __launch_bounds__(kThreads) ar_sum_f32_kernel(ArContext ctx, float *out, const float *x, int rows,
+                                                              int dim) {
+  __shared__ uint32_t epoch_s;
+  const int b = blockIdx.x;
+  if (threadIdx.x == 0) {
+    epoch_s = ctx.counters[b] + 1;
+    ctx.counters[b] = epoch_s;
+  }
+  __syncthreads();
+  const uint32_t epoch = epoch_s;
+  const int64_t signal_bytes = static_cast<int64_t>(kMaxBlocks) * kMaxRanks * sizeof(uint32_t);
+  const int64_t area = static_cast<int64_t>(ctx.world) * ctx.slot_bytes;
+  const int64_t data_off = signal_bytes + (epoch & 1) * area;
+  const int vec_per_row = dim / 4;
+  const int64_t slot_vecs = ctx.slot_bytes / static_cast<int64_t>(sizeof(float4));
+  for (int row = b; row < rows; row += gridDim.x) {
+    const float4 *src = reinterpret_cast<const float4 *>(x) + static_cast<int64_t>(row) * vec_per_row;
+    for (int i = threadIdx.x; i < vec_per_row; i += kThreads) {
+      const float4 v = src[i];
+      for (int p = 0; p < ctx.world; ++p)
+        reinterpret_cast<float4 *>(ctx.buffers[p] + data_off)[ctx.rank * slot_vecs + static_cast<int64_t>(row) *
+                                                                   vec_per_row + i] = v;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x < ctx.world) {
+    __threadfence_system();
+    uint32_t *flag = reinterpret_cast<uint32_t *>(ctx.buffers[threadIdx.x]) + b * kMaxRanks + ctx.rank;
+    store_volatile(flag, epoch);
+    const uint32_t *mine = reinterpret_cast<const uint32_t *>(ctx.buffers[ctx.rank]) + b * kMaxRanks + threadIdx.x;
+    while (load_volatile(mine) != epoch) {
+    }
+    __threadfence_system();
+  }
+  __syncthreads();
+  const float4 *local = reinterpret_cast<const float4 *>(ctx.buffers[ctx.rank] + data_off);
+  for (int row = b; row < rows; row += gridDim.x) {
+    float4 *dst = reinterpret_cast<float4 *>(out) + static_cast<int64_t>(row) * vec_per_row;
+    for (int i = threadIdx.x; i < vec_per_row; i += kThreads) {
+      float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      for (int p = 0; p < ctx.world; ++p) {
+        const float4 v = local[p * slot_vecs + static_cast<int64_t>(row) * vec_per_row + i];
+        acc.x += v.x;
+        acc.y += v.y;
+        acc.z += v.z;
+        acc.w += v.w;
+      }
+      dst[i] = acc;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace seventy
 
@@ -217,5 +273,18 @@ SEVENTY_API int seventy_ar_norm(void *ctx_ptr, void *out, void *residual, const 
   const int blocks = rows < kMaxBlocks ? rows : kMaxBlocks;
   ar_norm_kernel<<<blocks, kThreads, 0, stream>>>(*ctx, static_cast<half *>(out), static_cast<half *>(residual),
                                                   static_cast<const half *>(x), weight, rows, dim, eps);
+  return launch_status();
+}
+
+SEVENTY_API int seventy_ar_sum_f32(void *ctx_ptr, float *out, const float *x, int rows, int dim, cudaStream_t stream) {
+  using namespace seventy;
+  auto *ctx = static_cast<ArContext *>(ctx_ptr);
+  if (ctx == nullptr || out == nullptr || x == nullptr || rows <= 0 || dim <= 0 || dim % 4)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (static_cast<int64_t>(rows) * dim * static_cast<int64_t>(sizeof(float)) > ctx->slot_bytes)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (!aligned(x, 16) || !aligned(out, 16)) return SEVENTY_ERR_MISALIGNED;
+  const int blocks = rows < kMaxBlocks ? rows : kMaxBlocks;
+  ar_sum_f32_kernel<<<blocks, kThreads, 0, stream>>>(*ctx, out, x, rows, dim);
   return launch_status();
 }

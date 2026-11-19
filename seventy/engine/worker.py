@@ -75,7 +75,7 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
         if draft_path:
             from ..model.dflash2 import Drafter
 
-            drafter = Drafter(draft_path, model, device, dtype, par=Parallel(rank, size))
+            drafter = Drafter(draft_path, model, device, dtype, par=model.par)
         budget = distributed.memory_budget(device, utilization, reserve_bytes) if device.type == "cuda" else 1 << 40
         conn.send(("ready", budget))
         kind, num_blocks, block_size, slots, kv_name = conn.recv()
