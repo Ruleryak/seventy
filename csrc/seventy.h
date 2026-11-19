@@ -198,3 +198,6 @@ SEVENTY_API int seventy_drafter_attention(void *out, const void *q, const void *
                                           void *workspace, int64_t workspace_bytes, cudaStream_t stream);
 SEVENTY_API int seventy_silu_mul_scale(void *out, float *scale, const float *gate_up, int rows, int inter,
                                        cudaStream_t stream);
+
+/* silu(gate) * up for FP16 gate_up [rows, 2 * inter] (csrc/activation.cu). */
+SEVENTY_API int seventy_silu_mul(void *out, const void *gate_up, int64_t rows, int inter, cudaStream_t stream);

@@ -389,3 +389,12 @@ def silu_mul_scale(gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     check("silu_mul_scale", lib().seventy_silu_mul_scale(out.data_ptr(), scale.data_ptr(), gate_up.data_ptr(), rows,
                                                          two // 2, _stream(gate_up)))
     return out, scale
+
+
+def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    """silu(gate) * up of FP16 [rows, 2 * inter] = [gate | up] -> FP16 [rows, inter]."""
+    _expect(gate_up, "gate_up", torch.float16)
+    rows, two = gate_up.shape
+    out = torch.empty(rows, two // 2, dtype=torch.float16, device=gate_up.device)
+    check("silu_mul", lib().seventy_silu_mul(out.data_ptr(), gate_up.data_ptr(), rows, two // 2, _stream(gate_up)))
+    return out

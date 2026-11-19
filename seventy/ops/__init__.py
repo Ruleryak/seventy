@@ -19,7 +19,6 @@ from .reference import (
     paged_attention,
     rotary_cos_sin,
     sigmoid_gate,
-    silu_mul,
     write_kv,
 )
 
@@ -55,3 +54,11 @@ def nvfp4_dequantize(w: Nvfp4Weight) -> torch.Tensor:
     if w.packed.is_cuda:
         return kernels.nvfp4_dequantize(w)
     return reference.nvfp4_dequantize(w)
+
+
+def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    """silu(gate) * up, where gate_up holds [gate | up] along the last dimension."""
+    if gate_up.is_cuda and gate_up.dtype == torch.float16 and gate_up.dim() == 2 and gate_up.is_contiguous() \
+            and gate_up.shape[1] % 4 == 0:
+        return kernels.silu_mul(gate_up)
+    return reference.silu_mul(gate_up)

@@ -67,3 +67,13 @@ def test_kernel_rejects_bad_arguments():
         kernels.rms_norm(torch.ones(2, 6, device="cuda"), w, 1e-6)
     with pytest.raises(Exception, match="invalid argument"):
         kernels.rms_norm(torch.ones(2, 5, device="cuda", dtype=torch.float16), torch.ones(5, device="cuda"), 1e-6)
+
+
+@pytest.mark.gpu
+def test_silu_mul_matches_reference():
+    from seventy import ops
+    from seventy.ops import reference as R
+
+    torch.manual_seed(4)
+    x = (torch.randn(37, 2 * 4352) * 4).half()
+    assert torch.equal(ops.silu_mul(x.cuda()).cpu(), R.silu_mul(x.cuda()).cpu())
