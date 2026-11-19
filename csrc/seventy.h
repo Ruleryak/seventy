@@ -129,6 +129,17 @@ SEVENTY_API int seventy_gdn_chunk_scan(void *out, float *state, const void *w, c
                                        int num_seqs, int hv, int64_t total_chunks, cudaStream_t stream);
 
 /*
+ * Gated DeltaNet prefill, parallel part (see csrc/gdn_prepare.cu): the per-chunk inputs of seventy_gdn_chunk_scan
+ * (outputs as listed there) from the convolution output qkv FP16 [T, ld] = [q (hk * 128) | k (hk * 128) |
+ * v (hv * 128) | ...], g and beta FP32 [T, hv]. Chunk c covers rows chunk_row[c] .. + chunk_len[c] (1 to 64),
+ * int32 [chunks] on the device. ld even, dk = dv = 128, hv a multiple of hk.
+ */
+SEVENTY_API int seventy_gdn_prepare(void *w, void *u, void *gq, void *p, void *klt, float *eg, const void *qkv,
+                                    int ld, const float *g, const float *beta, const int *chunk_row,
+                                    const int *chunk_len, int chunks, int hk, int hv, int dk, int dv,
+                                    cudaStream_t stream);
+
+/*
  * Prefill attention (head size 256) over the paged caches (kv_type as in seventy_attn_prep), causal, with the
  * output gate (see csrc/flash_attention.cu). tiles: int32 [num_tiles, 2] = (sequence, first new token of a
  * 64-token query tile). out: FP16 [T, hq * 256].
