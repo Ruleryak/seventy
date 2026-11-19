@@ -63,3 +63,22 @@ def test_cut_at_stops_matches_host():
             want = cut_host(int(n[i]), new[i].tolist(), {t for t in stop[i].tolist() if t >= 0}, int(limit[i]))
             assert int(got[i]) == want
             assert int(got[i]) <= int(n[i]) and int(got[i]) + 1 <= max(1, int(limit[i]))
+
+
+def test_merge_top_of_shards_matches_full_logits():
+    from seventy.engine.spec import merge_top, top_of
+
+    g = torch.Generator().manual_seed(9)
+    logits = torch.randn(6, 9, 400, generator=g)
+    logits[0, 0, 7] = logits[0, 0, 301] = 50.0
+    shards = logits.split(100, dim=-1)
+    vals, ids = [], []
+    for s, part in enumerate(shards):
+        v, i = torch.topk(part, 16, dim=-1)
+        vals.append(v)
+        ids.append(i + 100 * s)
+    pred, v, i = merge_top(vals, ids, 16)
+    want_pred, want_v, want_i = top_of(logits, 16)
+    assert torch.equal(pred, want_pred) and pred[0, 0] == 7
+    assert torch.equal(v, want_v)
+    assert torch.equal(torch.gather(logits, -1, i), want_v)

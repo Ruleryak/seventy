@@ -73,25 +73,50 @@ def accept(logits: torch.Tensor, drafts: list[int], q: torch.Tensor | None, cand
 KMAX = 64
 
 
+def merge_top(vals: list[torch.Tensor], ids: list[torch.Tensor], k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(argmax, top values, top ids) of a vocabulary from each shard's top values and ids [..., k] (descending).
+    The argmax is the smallest id among the maximal values, as argmax over the full logits."""
+    v = torch.cat(vals, dim=-1)
+    i = torch.cat(ids, dim=-1)
+    top, sel = torch.topk(v, k, dim=-1)
+    big = torch.iinfo(i.dtype).max
+    pred = torch.where(v == top[..., :1], i, torch.full_like(i, big)).min(-1).values
+    return pred.long(), top, i.gather(-1, sel).long()
+
+
+def top_of(logits: torch.Tensor, kmax: int = KMAX) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(argmax, top values, top token ids) of FP32 logits [..., V], as device_accept_top takes them."""
+    vals, idx = torch.topk(logits, min(kmax, logits.shape[-1]), dim=-1)
+    return logits.argmax(-1), vals, idx
+
+
 def device_accept(logits: torch.Tensor, drafts: torch.Tensor, q: torch.Tensor, cand: torch.Tensor,
                   temp: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor, min_p: torch.Tensor,
                   u_accept: torch.Tensor, u_residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """device_accept_top on full FP32 logits [B, k + 1, V]."""
+    return device_accept_top(*top_of(logits), drafts, q, cand, temp, top_k, top_p, min_p, u_accept, u_residual)
+
+
+def device_accept_top(pred: torch.Tensor, vals: torch.Tensor, idx: torch.Tensor, drafts: torch.Tensor,
+                      q: torch.Tensor, cand: torch.Tensor, temp: torch.Tensor, top_k: torch.Tensor,
+                      top_p: torch.Tensor, min_p: torch.Tensor, u_accept: torch.Tensor,
+                      u_residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Acceptance for a batch of verify blocks on the device, without host synchronization (CUDA-graph safe).
 
-    logits: FP32 [B, k + 1, V]; drafts: [B, k]; q, cand: [B, k, C] (draft probabilities over candidates);
-    temp, top_p, min_p: [B]; top_k: int [B] in 1..KMAX (sampled rows); u_accept: [B, k], u_residual: [B, k + 1],
-    uniform random numbers. Rows with temp == 0 are greedy. Returns (accepted drafts [B], new tokens [B, k + 1],
-    of which the first accepted + 1 are valid).
+    pred: [B, k + 1] argmax of each row's target logits; vals, idx: [B, k + 1, KMAX] the top logits (descending) and
+    their token ids; drafts: [B, k]; q, cand: [B, k, C] (draft probabilities over candidates); temp, top_p, min_p:
+    [B]; top_k: int [B] in 1..KMAX (sampled rows); u_accept: [B, k], u_residual: [B, k + 1], uniform random numbers.
+    Rows with temp == 0 are greedy. Returns (accepted drafts [B], new tokens [B, k + 1], of which the first
+    accepted + 1 are valid).
     """
-    b, k1, _ = logits.shape
+    b, k1 = pred.shape
     k = k1 - 1
-    pred = logits.argmax(-1)
     greedy_match = (drafts == pred[:, :k]).long().cumprod(-1)
     n_greedy = greedy_match.sum(-1)
 
-    kmax = min(KMAX, logits.shape[-1])
-    vals, idx = torch.topk(logits, kmax, dim=-1)
-    ranks = torch.arange(kmax, device=logits.device)
+    kmax = vals.shape[-1]
+    vals = vals.clone()
+    ranks = torch.arange(kmax, device=vals.device)
     safe_t = torch.where(temp > 0, temp, torch.ones_like(temp))
     vals = vals / safe_t[:, None, None]
     vals = vals.masked_fill(ranks >= top_k[:, None, None], float("-inf"))
@@ -107,7 +132,7 @@ def device_accept(logits: torch.Tensor, drafts: torch.Tensor, q: torch.Tensor, c
     n_sampled = ok.long().cumprod(-1).sum(-1)
     q_on_idx = ((idx[:, :k, :, None] == cand[:, :, None, :]) * q[:, :, None, :]).sum(-1)
     q_on_idx = torch.cat((q_on_idx, torch.zeros_like(q_on_idx[:, :1])), dim=1)
-    rows = torch.arange(b, device=logits.device)
+    rows = torch.arange(b, device=pred.device)
     p_n = probs[rows, n_sampled]
     resid = (p_n - q_on_idx[rows, n_sampled]).clamp(min=0)
     resid = torch.where((n_sampled < k)[:, None] & (resid.sum(-1, keepdim=True) > 0), resid, p_n)

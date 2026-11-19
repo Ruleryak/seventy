@@ -18,6 +18,7 @@ from .. import ops
 from ..checkpoint import Checkpoint
 from ..config import ModelConfig, TextConfig
 from ..engine.cache import ModelCache
+from ..engine.spec import merge_top
 from ..engine.step import StepInput
 from ..ops import gdn_prefill, kernels
 from ..parallel import SINGLE, Parallel
@@ -227,27 +228,46 @@ class Qwen35TextModel:
         return torch.cat([dense_gemm(x[i : i + 64], self.lm_head_packed) for i in range(0, x.shape[0], 64)]) \
             if x.shape[0] else torch.empty(0, self.lm_head_packed.n, dtype=torch.float32, device=x.device)
 
+    def local_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's FP32 logits [rows, vocab shard] of final hidden states (FP16 products, FP32 accumulation)."""
+        if self.lm_head_packed is not None:
+            return self.head(x)
+        out = torch.empty(x.shape[0], self.lm_head.shape[0], dtype=torch.float32, device=x.device)
+        xf = x.float()
+        for s in range(0, self.lm_head.shape[0], 32768):
+            out[:, s : s + 32768] = xf @ self.lm_head[s : s + 32768].float().T
+        return out
+
     def logits(self, x: torch.Tensor) -> torch.Tensor:
         """FP32 logits [rows, vocab] of final hidden states (FP16 products, FP32 accumulation and output)."""
-        if self.lm_head_packed is not None:
-            out = self.head(x)
-        else:
-            out = torch.empty(x.shape[0], self.lm_head.shape[0], dtype=torch.float32, device=x.device)
-            xf = x.float()
-            for s in range(0, self.lm_head.shape[0], 32768):
-                out[:, s : s + 32768] = xf @ self.lm_head[s : s + 32768].float().T
+        out = self.local_logits(x)
         if self.par.size == 1:
             return out
         parts = [torch.empty_like(out) for _ in range(self.par.size)]
         torch.distributed.all_gather(parts, out)
         return torch.cat(parts, dim=-1)
 
+    def head_top(self, x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(argmax, top k logits, their token ids) of final hidden states x, from each rank's vocabulary shard: only
+        the shards' top k values and ids (one all-gather) cross the ranks, not the full logits."""
+        local = self.local_logits(x)
+        v, i = torch.topk(local, min(k, local.shape[-1]), dim=-1)
+        i = (i + self.vocab_span[0]).int()
+        if self.par.size == 1:
+            return merge_top([v], [i], v.shape[-1])
+        both = torch.cat((v, i.view(torch.float32)), dim=-1)
+        parts = [torch.empty_like(both) for _ in range(self.par.size)]
+        torch.distributed.all_gather(parts, both)
+        kk = v.shape[-1]
+        return merge_top([p[:, :kk] for p in parts], [p[:, kk:].view(torch.int32) for p in parts], kk)
+
     @torch.inference_mode()
     def forward(
-        self, step: StepInput, cache: ModelCache, capture: tuple[int, ...] = (), stash: dict | None = None
+        self, step: StepInput, cache: ModelCache, capture: tuple[int, ...] = (), stash: dict | None = None,
+        top: int = 0,
     ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
-        """Run one step. Returns the logits of step.logit_rows, and the output hidden states (all rows) of the
-        layers listed in capture.
+        """Run one step. Returns the logits of step.logit_rows (or, with top, head_top of those rows), and the
+        output hidden states (all rows) of the layers listed in capture.
 
         With stash (a dict, speculative verify): Gated DeltaNet layers leave their state unchanged and keep their
         in_proj outputs in stash; commit() then writes the state for the accepted rows."""
@@ -274,6 +294,8 @@ class Qwen35TextModel:
             x, residual = self.par.reduce_norm(x, nxt, t.rms_norm_eps, residual)
             if i in capture:
                 captured[i] = residual.clone()
+        if top:
+            return self.head_top(x[step.logit_rows], top), captured
         return self.logits(x[step.logit_rows]), captured
 
     @torch.inference_mode()

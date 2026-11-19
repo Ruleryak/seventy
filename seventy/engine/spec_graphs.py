@@ -1,7 +1,7 @@
 """CUDA graphs of whole speculative decoding steps, one per batch bucket B.
 
 One replay runs: the target's verify step over [anchor, d1 .. d7] for B sequences, acceptance on the device
-(seventy.engine.spec.device_accept, cut at stop tokens and token limits), the Gated DeltaNet commit of the
+(seventy.engine.spec.device_accept_top on each rank's vocabulary top k, cut at stop tokens and token limits), the Gated DeltaNet commit of the
 accepted rows, the drafter context of all
 eight rows (rows past the accepted ones are overwritten by the next block before anything reads them), and the
 next draft from the new anchor. The host reads back the accepted counts, new tokens and next drafts once.
@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from .cache import ModelCache
-from .spec import KMAX, STOP_SLOTS, cut_at_stops, device_accept
+from .spec import KMAX, STOP_SLOTS, cut_at_stops, device_accept_top
 from .step import StepInput
 
 
@@ -88,9 +88,10 @@ class SpecGraphs:
             max_blocks=0,
         )
         stash: dict = {}
-        logits, cap = self.model.forward(step, self.cache, capture=self.layers, stash=stash)
-        n, new = device_accept(logits.view(b, blk, -1), x["tokens"][:, 1:], x["q"], x["cand"], x["temp"],
-                               x["top_k"], x["top_p"], x["min_p"], x["u_accept"], x["u_residual"])
+        (pred, vals, idx), cap = self.model.forward(step, self.cache, capture=self.layers, stash=stash, top=KMAX)
+        n, new = device_accept_top(pred.view(b, blk), vals.view(b, blk, -1), idx.view(b, blk, -1),
+                                   x["tokens"][:, 1:], x["q"], x["cand"], x["temp"], x["top_k"], x["top_p"],
+                                   x["min_p"], x["u_accept"], x["u_residual"])
         n = cut_at_stops(n, new, x["stop"], x["limit"])
         self.model.commit(step, self.cache, stash, (n + 1).int())
         feats = torch.cat([cap[i] for i in self.layers], dim=-1)
