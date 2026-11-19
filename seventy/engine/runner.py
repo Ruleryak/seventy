@@ -62,8 +62,9 @@ class ModelRunner:
                 raise RuntimeError(f"a worker failed to capture CUDA graphs: {reply}")
 
     def spec_step(self, rows: list[dict]) -> dict:
-        self._send(("spec", rows))
-        return self.spec_graphs.run(rows)
+        packed = self.spec_graphs.pack(rows)
+        self._send(("spec", packed))
+        return self.spec_graphs.run_packed(*packed)
 
     def _send(self, msg) -> None:
         if self.peers:

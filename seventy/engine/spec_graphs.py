@@ -9,10 +9,15 @@ next draft from the new anchor. The host reads back the accepted counts, new tok
 Every rank replays the same graph on the same inputs, which come from the host (including the random numbers
 drawn from each request's generator), so all ranks compute the same acceptance without extra communication.
 Rows beyond the real batch point at the scratch block and slot and are greedy.
+
+Inputs: all but the block tables live in one device buffer per bucket (the graph reads views of it). Rank 0 fills the
+matching pinned host buffer through numpy views and sends its bytes to the other ranks; every rank copies them with
+one transfer. The block tables are copied up to the widest row.
 """
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from .cache import ModelCache
@@ -30,30 +35,43 @@ class SpecGraphs:
         self.layers = drafter.cfg.target_layers
         self.buckets = tuple(sorted(buckets))
         self.graphs: dict[int, tuple] = {}
+        self.packed: dict[int, tuple] = {}
 
     def bucket(self, n: int) -> int | None:
         return next((b for b in self.buckets if b >= n), None)
 
+    def _fields(self, b: int) -> list[tuple[str, tuple[int, ...], torch.dtype, float]]:
+        """(name, shape, dtype, padding value) of the packed inputs of bucket b."""
+        k, c = self.block - 1, self.top
+        return [
+            ("tokens", (b, self.block), torch.long, 0), ("starts", (b,), torch.long, 0), ("delta", (b,), torch.long, 0),
+            ("slots", (b,), torch.long, self.cache.scratch_slot), ("temp", (b,), torch.float32, 0.0),
+            ("top_k", (b,), torch.long, 1), ("top_p", (b,), torch.float32, 1.0), ("min_p", (b,), torch.float32, 0.0),
+            ("q", (b, k, c), torch.float32, 0.0), ("cand", (b, k, c), torch.long, 0),
+            ("u_accept", (b, k), torch.float32, 0.0), ("u_residual", (b, k + 1), torch.float32, 0.0),
+            ("gumbel", (b, k, c), torch.float32, 0.0), ("stop", (b, STOP_SLOTS), torch.long, -1),
+            ("limit", (b,), torch.long, self.block),
+        ]
+
     def _inputs(self, b: int) -> dict[str, torch.Tensor]:
-        dev, k, c = self.device, self.block - 1, self.top
-        return {
-            "tokens": torch.zeros(b, self.block, dtype=torch.long, device=dev),
-            "starts": torch.zeros(b, dtype=torch.long, device=dev),
-            "delta": torch.zeros(b, dtype=torch.long, device=dev),
-            "slots": torch.full((b,), self.cache.scratch_slot, dtype=torch.long, device=dev),
-            "tables": torch.full((b, self.width), self.cache.scratch_block, dtype=torch.int32, device=dev),
-            "temp": torch.zeros(b, device=dev),
-            "top_k": torch.ones(b, dtype=torch.long, device=dev),
-            "top_p": torch.ones(b, device=dev),
-            "min_p": torch.zeros(b, device=dev),
-            "q": torch.zeros(b, k, c, device=dev),
-            "cand": torch.zeros(b, k, c, dtype=torch.long, device=dev),
-            "u_accept": torch.zeros(b, k, device=dev),
-            "u_residual": torch.zeros(b, k + 1, device=dev),
-            "gumbel": torch.zeros(b, k, c, device=dev),
-            "stop": torch.full((b, STOP_SLOTS), -1, dtype=torch.long, device=dev),
-            "limit": torch.full((b,), self.block, dtype=torch.long, device=dev),
-        }
+        fields = self._fields(b)
+        offsets, total = [], 0
+        for _, shape, dtype, _ in fields:
+            nbytes = int(np.prod(shape)) * torch.tensor([], dtype=dtype).element_size()
+            offsets.append(total)
+            total += -(-nbytes // 16) * 16
+        dev_buf = torch.zeros(total, dtype=torch.uint8, device=self.device)
+        host_buf = torch.zeros(total, dtype=torch.uint8).pin_memory()
+        x, views, defaults = {}, {}, host_buf.numpy().copy()
+        for (name, shape, dtype, pad), off in zip(fields, offsets):
+            nbytes = int(np.prod(shape)) * torch.tensor([], dtype=dtype).element_size()
+            x[name] = dev_buf[off : off + nbytes].view(dtype).view(shape)
+            views[name] = host_buf[off : off + nbytes].view(dtype).view(shape).numpy()
+            defaults[off : off + nbytes].view(views[name].dtype)[:] = pad
+        x["tables"] = torch.full((b, self.width), self.cache.scratch_block, dtype=torch.int32, device=self.device)
+        self.packed[b] = (dev_buf, host_buf, views, defaults)
+        dev_buf.copy_(torch.from_numpy(defaults))
+        return x
 
     def _body(self, b: int, x: dict[str, torch.Tensor]):
         blk, bs, dev = self.block, self.cache.block_size, self.device
@@ -102,40 +120,48 @@ class SpecGraphs:
             self.graphs[b] = (graph, x, out)
         torch.cuda.synchronize(self.device)
 
-    def run(self, rows: list[dict]) -> dict[str, torch.Tensor]:
+    def pack(self, rows: list[dict]) -> tuple:
         """rows: per sequence {tokens [block], start, delta (rotary position minus token index), slot, table, temp,
         top_k, top_p, min_p, q, cand, u_accept, u_residual, gumbel, stop (up to STOP_SLOTS ids), limit (most new
-        tokens)} (host values). Returns the bucket's output tensors (valid for the first len(rows))."""
+        tokens)} (host values). Returns what run_packed takes (and what rank 0 sends to the other ranks)."""
         b = self.bucket(len(rows))
-        graph, x, out = self.graphs[b]
-        n = len(rows)
-        host = {k: torch.zeros_like(v, device="cpu") for k, v in x.items() if k != "tables"}
-        host["slots"].fill_(self.cache.scratch_slot)
-        host["top_k"].fill_(1)
-        host["top_p"].fill_(1.0)
-        host["stop"].fill_(-1)
-        host["limit"].fill_(self.block)
-        width = max(len(r["table"]) for r in rows)
-        table = torch.full((b, width), self.cache.scratch_block, dtype=torch.int32)
+        _, host_buf, views, defaults = self.packed[b]
+        flat = host_buf.numpy()
+        flat[:] = defaults
         for i, r in enumerate(rows):
-            host["tokens"][i] = torch.as_tensor(r["tokens"])
-            host["starts"][i] = r["start"]
-            host["delta"][i] = r.get("delta", 0)
-            host["slots"][i] = r["slot"]
-            table[i, : len(r["table"])] = torch.as_tensor(r["table"], dtype=torch.int32)
-            for key in ("temp", "top_k", "top_p", "min_p"):
-                host[key][i] = r[key]
+            views["tokens"][i] = r["tokens"]
+            views["starts"][i] = r["start"]
+            views["delta"][i] = r.get("delta", 0)
+            views["slots"][i] = r["slot"]
+            views["temp"][i] = r["temp"]
+            views["top_k"][i] = r["top_k"]
+            views["top_p"][i] = r["top_p"]
+            views["min_p"][i] = r["min_p"]
             stops = r.get("stop", ())
-            host["stop"][i, : len(stops)] = torch.as_tensor(list(stops), dtype=torch.long)
-            host["limit"][i] = r.get("limit", self.block)
+            views["stop"][i, : len(stops)] = stops
+            views["limit"][i] = r.get("limit", self.block)
             for key in ("q", "cand", "u_accept", "u_residual", "gumbel"):
-                if r.get(key) is not None:
-                    host[key][i] = torch.as_tensor(r[key])
-        for k, v in host.items():
-            x[k].copy_(v, non_blocking=True)
-        x["tables"][:, :width].copy_(table, non_blocking=True)
+                v = r.get(key)
+                if v is not None:
+                    views[key][i] = v.numpy() if isinstance(v, torch.Tensor) else v
+        tables = [np.asarray(r["table"], dtype=np.int32) for r in rows]
+        return b, len(rows), flat.tobytes(), tables
+
+    def run_packed(self, b: int, n: int, data: bytes, tables: list) -> dict[str, torch.Tensor]:
+        graph, x, out = self.graphs[b]
+        dev_buf, host_buf, _, _ = self.packed[b]
+        host_buf.numpy()[:] = np.frombuffer(data, dtype=np.uint8)
+        dev_buf.copy_(host_buf, non_blocking=True)
+        width = max(len(t) for t in tables)
+        table = np.full((b, width), self.cache.scratch_block, dtype=np.int32)
+        for i, t in enumerate(tables):
+            table[i, : len(t)] = t
+        x["tables"][:, :width].copy_(torch.from_numpy(table), non_blocking=True)
         graph.replay()
         return {k: v[:n] for k, v in out.items()}
+
+    def run(self, rows: list[dict]) -> dict[str, torch.Tensor]:
+        return self.run_packed(*self.pack(rows))
 
 
 def eligible(params, top_k_max: int = KMAX) -> bool:

@@ -113,7 +113,7 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
             elif msg[0] == "release":
                 runner.release_local(msg[1])
             elif msg[0] == "spec":
-                runner.spec_graphs.run(msg[1])
+                runner.spec_graphs.run_packed(*msg[1])
             elif msg[0] == "capture_spec":
                 from .spec_graphs import SpecGraphs
 
