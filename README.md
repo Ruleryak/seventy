@@ -34,6 +34,55 @@ To check a checkpoint folder before you start it:
 seventy check-model /path/to/checkpoint
 ```
 
+## Speed
+
+These charts show the speed of seventy on 4 Tesla V100-SXM2-32GB GPUs with NVLink (tensor parallel 4). The engine
+uses the NVFP4 27B model, the DFlash2 drafter and the INT8 KV cache. Thinking is on. Each request makes 512 tokens.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/speed-total-dark.svg">
+  <img alt="Total decode speed in tokens per second for 1, 4 and 8 streams at 2K, 32K and 100K tokens of context" src="docs/images/speed-total-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/speed-stream-dark.svg">
+  <img alt="Decode speed per stream in tokens per second for 1, 4 and 8 streams at 2K, 32K and 100K tokens of context" src="docs/images/speed-stream-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/speed-prefill-dark.svg">
+  <img alt="Prefill speed in tokens per second for prompts of 2K, 32K and 100K tokens" src="docs/images/speed-prefill-light.svg">
+</picture>
+
+- A stream is one request. With 4 streams, 4 requests run at the same time.
+- In the decode tests, the prompt is in the prefix cache. Thus the decode tests measure only the generation of tokens.
+- In the prefill test, the prompt is not in the cache.
+- The bar at a point shows the range of the runs.
+- Contexts longer than 100K tokens are not measured yet.
+
+<details>
+<summary>The numbers in tables</summary>
+
+| Context (tokens) | Streams | Tokens/s per stream | Tokens/s in total |
+|---:|---:|---:|---:|
+| 2,000 | 1 | 237 | 237 |
+| 2,000 | 4 | 190 | 758 |
+| 2,000 | 8 | 97 | 778 |
+| 32,000 | 1 | 158 | 158 |
+| 32,000 | 4 | 108 | 432 |
+| 32,000 | 8 | 62 | 497 |
+| 100,000 | 1 | 132 | 132 |
+| 100,000 | 4 | 76 | 304 |
+| 100,000 | 8 | 42 | 332 |
+
+| Prompt (tokens) | Prefill tokens/s | Time to the first token |
+|---:|---:|---:|
+| 2,000 | 2,829 | 0.7 s |
+| 32,000 | 3,156 | 10.1 s |
+| 100,000 | 2,256 | 44.3 s |
+
+</details>
+
 ## Install
 
 1. Make a virtual environment and install the wheel from the release. Use one of the two options.

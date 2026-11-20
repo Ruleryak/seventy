@@ -102,3 +102,25 @@ compiled for sm70.
 - Each kernel has a PyTorch reference in `seventy/ops/reference.py`, and a test in `tests/` that compares the two.
 - For profiling, build with line information: add `--config-settings=cmake.define.SEVENTY_LINEINFO=ON` to the
   install command.
+
+## Speed charts
+
+`bench/results/` has one results file for each release. The docstring of `bench/report.py` gives the format.
+
+To make the README charts again (light and dark) from the newest results file:
+
+```
+python bench/report.py --images docs/images
+```
+
+To print the README tables:
+
+```
+python bench/report.py --markdown
+```
+
+To make a page that shows each release over the release before it:
+
+```
+python bench/report.py --html speed-sheet.html
+```
