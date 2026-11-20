@@ -8,15 +8,15 @@
  *   1. q, k (key head h / (Hv / Hk)) and v rows go to shared memory; per row the L2 inverse norms (q also
  *      scaled by 1 / sqrt(Dk)), G = cumsum(g) over the chunk, and beta. Padded rows (past the sequence) are zero.
  *   2. Gamma Q = exp(G) Q, (K Lambda)^T = (K exp(G_last - G))^T and exp(G_last) are written.
- *   3. One pass over Dk gives q_t . k_j and k_t . k_j: each thread owns 16 (t, j) pairs, t = ti + 16 a and
- *      j = tj + 16 b, so the lower-triangular work is balanced and the k rows of a warp hit distinct banks (odd
- *      row pitch in words). P[t, j] = exp(G_t - G_j) q_t . k_j (j <= t) is written; A[t, j] =
- *      beta_t exp(G_t - G_j) k_t . k_j (j < t) stays in shared memory.
- *   4. T = (I + A)^-1 by forward substitution, four threads per column. The rows of A and T are padded to a
- *      multiple of 4 floats, so that step 5 reads a row of T with 16-byte broadcast loads.
- *   5. U' = T (beta V) and W = T (beta exp(G) K): a thread per output column (128 for U', 128 for W) keeps its
- *      right-hand-side column in registers (pinned: otherwise the compiler reloads it for every row) and walks
- *      the rows of T.
+ *   3. q_t . k_j and k_t . k_j on the tensor cores (mma.m8n8k4, FP16 inputs, FP32 sums; the products of FP16
+ *      values are exact in FP32): warp w takes rows t = 8 w .. 8 w + 7 of both 64 x 64 products.
+ *      P[t, j] = exp(G_t - G_j) q_t . k_j (j <= t) is written; A[t, j] = beta_t exp(G_t - G_j) k_t . k_j (j < t)
+ *      stays in shared memory. The q, k and v rows have a pitch of 132 halves (8-byte aligned fragment loads;
+ *      the 8 rows of a load hit distinct banks).
+ *   4. U' = (I + A)^-1 (beta V) and W = (I + A)^-1 (beta exp(G) K) by forward substitution on the right-hand
+ *      sides, X[t] = R[t] - sum_{j < t} A[t, j] X[j]: a thread per output column (128 for U', 128 for W) keeps its
+ *      column of X in registers and reads the rows of A with 16-byte broadcast loads (rows padded to a multiple of
+ *      4 floats; A[t, j] = 0 for j >= t).
  *
  * Outputs (FP16 unless noted) as gdn_chunk_scan reads them: w, u, gq [Hv, chunks, 64, 128], p [Hv, chunks, 64,
  * 64], klt [Hv, chunks, 128, 64], eg FP32 [Hv, chunks].
@@ -28,10 +28,18 @@ namespace {
 constexpr int kL = 64;
 constexpr int kD = 128;
 constexpr int kThreads = 256;
-constexpr int kPitch = kD + 2;
+constexpr int kPitch = kD + 4;
 constexpr int kLdA = kL + 4;
 constexpr int kSmem = 3 * kL * kPitch * static_cast<int>(sizeof(half)) +
-                      (2 * kL * kLdA + 6 * kL) * static_cast<int>(sizeof(float));
+                      (kL * kLdA + 6 * kL) * static_cast<int>(sizeof(float));
+
+__device__ __forceinline__ void mma_8x8x4(float (&c)[8], uint2 a, uint2 b) {
+  asm volatile(
+      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+      : "r"(a.x), "r"(a.y), "r"(b.x), "r"(b.y));
+}
 
 __global__ void __launch_bounds__(kThreads, 1) gdn_prepare_kernel(
     half *w_out, half *u_out, half *gq_out, half *p_out, half *klt_out, float *eg_out, const half *qkv, int ld,
@@ -41,8 +49,7 @@ __global__ void __launch_bounds__(kThreads, 1) gdn_prepare_kernel(
   half *ks = qs + kL * kPitch;
   half *vs = ks + kL * kPitch;
   float *A = reinterpret_cast<float *>(vs + kL * kPitch);
-  float *T = A + kL * kLdA;
-  float *G = T + kL * kLdA;
+  float *G = A + kL * kLdA;
   float *bt = G + kL;
   float *qn = bt + kL;
   float *kn = qn + kL;
@@ -135,51 +142,34 @@ __global__ void __launch_bounds__(kThreads, 1) gdn_prepare_kernel(
   }
 
   {
-    const int ti = tid / 16, tj = tid % 16;
-    float qk[4][4], kk[4][4];
+    const int quad = (lane >> 2) & 3;
+    const int idx = (lane & 3) + ((lane >> 4) << 2);
+    float qk[2][8], kk[2][8];
 #pragma unroll
-    for (int a = 0; a < 4; ++a)
+    for (int n = 0; n < 2; ++n)
 #pragma unroll
-      for (int b = 0; b < 4; ++b) qk[a][b] = kk[a][b] = 0.0f;
-#pragma unroll 2
-    for (int d2 = 0; d2 < kD / 2; ++d2) {
-      float2 qa[4], ka[4], kb[4];
+      for (int jj = 0; jj < 8; ++jj) qk[n][jj] = kk[n][jj] = 0.0f;
+#pragma unroll 4
+    for (int k = 0; k < kD; k += 4) {
+      const uint2 aq = *reinterpret_cast<const uint2 *>(qs + (8 * warp + idx) * kPitch + k);
+      const uint2 ak = *reinterpret_cast<const uint2 *>(ks + (8 * warp + idx) * kPitch + k);
 #pragma unroll
-      for (int a = 0; a < 4; ++a) {
-        qa[a] = __half22float2(reinterpret_cast<const half2 *>(qs + (ti + 16 * a) * kPitch)[d2]);
-        ka[a] = __half22float2(reinterpret_cast<const half2 *>(ks + (ti + 16 * a) * kPitch)[d2]);
-        kb[a] = __half22float2(reinterpret_cast<const half2 *>(ks + (tj + 16 * a) * kPitch)[d2]);
+      for (int n = 0; n < 2; ++n) {
+        const uint2 bk = *reinterpret_cast<const uint2 *>(ks + (32 * n + 8 * quad + idx) * kPitch + k);
+        mma_8x8x4(qk[n], aq, bk);
+        mma_8x8x4(kk[n], ak, bk);
       }
-#pragma unroll
-      for (int a = 0; a < 4; ++a)
-#pragma unroll
-        for (int b = 0; b < 4; ++b) {
-          qk[a][b] = fmaf(qa[a].y, kb[b].y, fmaf(qa[a].x, kb[b].x, qk[a][b]));
-          kk[a][b] = fmaf(ka[a].y, kb[b].y, fmaf(ka[a].x, kb[b].x, kk[a][b]));
-        }
     }
 #pragma unroll
-    for (int a = 0; a < 4; ++a)
+    for (int n = 0; n < 2; ++n)
 #pragma unroll
-      for (int b = 0; b < 4; ++b) {
-        const int t = ti + 16 * a, j = tj + 16 * b;
+      for (int jj = 0; jj < 8; ++jj) {
+        const int t = 8 * warp + (idx & 1) + 2 * ((jj >> 1) & 1) + 4 * (idx >> 2);
+        const int j = 32 * n + 8 * quad + (jj & 1) + 2 * ((idx >> 1) & 1) + 4 * (jj >> 2);
         const float decay = j <= t ? expf(G[t] - G[j]) : 0.0f;
-        p_out[slab * kL * kL + t * kL + j] = __float2half_rn(j <= t ? decay * (qn[t] * kn[j] * qk[a][b]) : 0.0f);
-        A[t * kLdA + j] = j < t ? bt[t] * decay * (kn[t] * kn[j] * kk[a][b]) : 0.0f;
+        p_out[slab * kL * kL + t * kL + j] = __float2half_rn(j <= t ? decay * (qn[t] * kn[j] * qk[n][jj]) : 0.0f);
+        A[t * kLdA + j] = j < t ? bt[t] * decay * (kn[t] * kn[j] * kk[n][jj]) : 0.0f;
       }
-  }
-  __syncthreads();
-
-  {
-    const int j = tid / 4, part = tid % 4;
-    for (int t = 0; t < kL; ++t) {
-      float s = 0.0f;
-      for (int i = j + part; i < t; i += 4) s += A[t * kLdA + i] * T[i * kLdA + j];
-      s += __shfl_xor_sync(0xffffffffu, s, 1);
-      s += __shfl_xor_sync(0xffffffffu, s, 2);
-      if (part == 0) T[t * kLdA + j] = t < j ? 0.0f : (t == j ? 1.0f : -s);
-      __syncwarp();
-    }
   }
   __syncthreads();
 
@@ -187,27 +177,28 @@ __global__ void __launch_bounds__(kThreads, 1) gdn_prepare_kernel(
     const bool is_u = tid < kD;
     const int d = tid & (kD - 1);
     const half *src = is_u ? vs : ks;
-    float r[kL];
+    float x[kL];
 #pragma unroll
-    for (int jj = 0; jj < kL; ++jj) {
-      r[jj] = (is_u ? bt[jj] : rw[jj]) * __half2float(src[jj * kPitch + d]);
-      asm volatile("" : "+f"(r[jj]));
-    }
-    half *dst = (is_u ? u_out : w_out) + slab * kL * kD + d;
-#pragma unroll 1
+    for (int t = 0; t < kL; ++t) x[t] = 0.0f;
+#pragma unroll
     for (int t = 0; t < kL; ++t) {
-      const float4 *trow = reinterpret_cast<const float4 *>(T + t * kLdA);
-      float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      float acc[4] = {(is_u ? bt[t] : rw[t]) * __half2float(src[t * kPitch + d]), 0.0f, 0.0f, 0.0f};
+      const float4 *arow = reinterpret_cast<const float4 *>(A + t * kLdA);
 #pragma unroll
       for (int q = 0; q < kL / 4; ++q) {
-        const float4 tv = trow[q];
-        acc[0] = fmaf(tv.x, r[4 * q], acc[0]);
-        acc[1] = fmaf(tv.y, r[4 * q + 1], acc[1]);
-        acc[2] = fmaf(tv.z, r[4 * q + 2], acc[2]);
-        acc[3] = fmaf(tv.w, r[4 * q + 3], acc[3]);
+        if (4 * q < t) {
+          const float4 a = arow[q];
+          acc[0] = fmaf(-a.x, x[4 * q], acc[0]);
+          acc[1] = fmaf(-a.y, x[4 * q + 1], acc[1]);
+          acc[2] = fmaf(-a.z, x[4 * q + 2], acc[2]);
+          acc[3] = fmaf(-a.w, x[4 * q + 3], acc[3]);
+        }
       }
-      dst[t * kD] = __float2half_rn((acc[0] + acc[1]) + (acc[2] + acc[3]));
+      x[t] = (acc[0] + acc[1]) + (acc[2] + acc[3]);
     }
+    half *dst = (is_u ? u_out : w_out) + slab * kL * kD + d;
+#pragma unroll
+    for (int t = 0; t < kL; ++t) dst[t * kD] = __float2half_rn(x[t]);
   }
 }
 
