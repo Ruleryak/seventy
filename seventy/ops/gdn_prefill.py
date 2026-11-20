@@ -10,7 +10,9 @@ normalized queries Q, values V, and state S at the chunk start:
 
 Everything that does not depend on S is computed for all chunks at once (FP32): by the gdn_prepare kernel when q,
 k and v are the column blocks of one convolution output (the model's layout), else by prepare() here in PyTorch
-(the reference for the kernel). The sequential part runs in the gdn_chunk_scan kernel.
+(the reference for the kernel). The sequential part runs in seventy_gdn_chunk_scan: the state recurrence alone,
+4 blocks per value head, then the outputs of all chunks in parallel (SEVENTY_GDN_SCAN=single: one kernel, one
+block per value head, as before).
 """
 
 from __future__ import annotations
@@ -134,11 +136,15 @@ def gated_delta_rule(q, k, v, g, beta, state, query_start, query_start_t, contex
     else:
         prep = prepare(q, k, v, g, beta, query_start)
     out = torch.empty(t, hv, d, dtype=torch.float16, device=v.device)
+    split = os.environ.get("SEVENTY_GDN_SCAN") != "single"
+    nc = prep["chunks"]
+    hs = torch.empty(hv, nc, d, d, dtype=torch.float16, device=v.device) if split else None
+    vt = torch.empty(hv, nc, d, CHUNK, dtype=torch.float16, device=v.device) if split else None
     code = kernels.lib().seventy_gdn_chunk_scan(
         out.data_ptr(), state.data_ptr(), prep["w"].data_ptr(), prep["u"].data_ptr(), prep["gq"].data_ptr(),
         prep["p"].data_ptr(), prep["klt"].data_ptr(), prep["eg"].data_ptr(), prep["chunk_start"].data_ptr(),
         query_start_t.data_ptr(), context_lens_t.data_ptr(), state_slots_t.data_ptr(), len(query_start) - 1, hv,
-        prep["chunks"], kernels._stream(v),
+        nc, hs.data_ptr() if split else None, vt.data_ptr() if split else None, kernels._stream(v),
     )
     kernels.check("gdn_chunk_scan", code)
     return out

@@ -121,12 +121,15 @@ SEVENTY_API int seventy_decode_attention(void *out, const void *q, const void *k
  * sequence's chunks of 64 tokens with the FP32 state, from inputs prepared per chunk by seventy.ops.gdn_prefill.
  * out: FP16 [T, hv, 128]. state: FP32 [slots, hv, 128, 128]. w, u, gq: FP16 [hv, total_chunks, 64, 128];
  * p: FP16 [hv, total_chunks, 64, 64]; klt: FP16 [hv, total_chunks, 128, 64]; eg: FP32 [hv, total_chunks].
- * chunk_start: int32 [num_seqs], the index of each sequence's first chunk.
+ * chunk_start: int32 [num_seqs], the index of each sequence's first chunk. With the workspaces hs FP16
+ * [hv, total_chunks, 128, 128] and vt FP16 [hv, total_chunks, 128, 64], the state recurrence runs alone (4 blocks per
+ * value head) and the outputs of all chunks follow in parallel; with null workspaces, one kernel does both.
  */
 SEVENTY_API int seventy_gdn_chunk_scan(void *out, float *state, const void *w, const void *u, const void *gq,
                                        const void *p, const void *klt, const float *eg, const int *chunk_start,
                                        const int *query_start, const int *context_lens, const int *state_slots,
-                                       int num_seqs, int hv, int64_t total_chunks, cudaStream_t stream);
+                                       int num_seqs, int hv, int64_t total_chunks, void *hs, void *vt,
+                                       cudaStream_t stream);
 
 /*
  * Gated DeltaNet prefill, parallel part (see csrc/gdn_prepare.cu): the per-chunk inputs of seventy_gdn_chunk_scan
