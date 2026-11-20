@@ -130,22 +130,34 @@ class GatedDeltaNetLayer:
                 stash[layer] = y
             return self.out_proj(o)
         conv_dim = 2 * key + val
-        qkv = ops.causal_conv1d(y[:, :conv_dim].contiguous(), self.conv_weight, cache.conv[layer],
-                                step.query_start, step.context_lens, step.state_slots)
+        fast = y.is_cuda and y.dtype == torch.float16 and self.dv == 128
+        if fast:
+            qkv = kernels.gdn_conv(y, conv_dim, self.conv_weight, cache.conv[layer], step.query_start_t,
+                                   step.context_lens_t, step.state_slots_t)
+        else:
+            qkv = ops.causal_conv1d(y[:, :conv_dim].contiguous(), self.conv_weight, cache.conv[layer],
+                                    step.query_start, step.context_lens, step.state_slots)
         z = y[:, conv_dim : conv_dim + val]
         b = y[:, conv_dim + val : conv_dim + val + self.hv]
         a = y[:, conv_dim + val + self.hv :]
         q = qkv[:, :key].view(t, self.hk, self.dk)
         k = qkv[:, key : 2 * key].view(t, self.hk, self.dk)
         v = qkv[:, 2 * key :].view(t, self.hv, self.dv)
-        g, beta = ops.gdn_gates(a, b, self.a_log, self.dt_bias)
+        if fast:
+            g, beta = kernels.gdn_gates(y, conv_dim + val + self.hv, conv_dim + val, self.hv, self.a_log, self.dt_bias)
+        else:
+            g, beta = ops.gdn_gates(a, b, self.a_log, self.dt_bias)
         if v.is_cuda:
             o = gdn_prefill.gated_delta_rule(q, k, v, g, beta, cache.state[layer], step.query_start,
                                              step.query_start_t, step.context_lens_t, step.state_slots_t)
         else:
             o = ops.gated_delta_rule(q, k, v, g, beta, cache.state[layer], step.query_start, step.context_lens,
                                      step.state_slots)
-        o = ops.gated_rms_norm(o.reshape(t * self.hv, self.dv), z.reshape(t * self.hv, self.dv), self.norm, self.eps)
+        if fast:
+            o = kernels.gated_rms_norm(o.view(t, self.hv, self.dv), y, conv_dim, self.norm, self.eps)
+        else:
+            o = ops.gated_rms_norm(o.reshape(t * self.hv, self.dv), z.reshape(t * self.hv, self.dv), self.norm,
+                                   self.eps)
         return self.out_proj(o.view(t, val))
 
 

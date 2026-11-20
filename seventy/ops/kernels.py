@@ -124,6 +124,45 @@ def nvfp4_gemm_dequantize(w: GemmWeight, out: torch.Tensor | None = None) -> tor
     return out
 
 
+def gdn_conv(y: torch.Tensor, channels: int, conv_w: torch.Tensor, conv_state: torch.Tensor, query_start_t: torch.Tensor,
+             context_lens_t: torch.Tensor, state_slots_t: torch.Tensor) -> torch.Tensor:
+    """silu(causal depthwise convolution) of the first `channels` columns of y FP16 [T, ld], FP16 [T, channels],
+    continuing each sequence from its history in conv_state (updated in place)."""
+    _expect(y, "y", torch.float16)
+    t = y.shape[0]
+    out = torch.empty(t, channels, dtype=torch.float16, device=y.device)
+    code = lib().seventy_gdn_conv(out.data_ptr(), conv_state.data_ptr(), y.data_ptr(), y.stride(0), conv_w.data_ptr(),
+                                  query_start_t.data_ptr(), context_lens_t.data_ptr(), state_slots_t.data_ptr(),
+                                  context_lens_t.numel(), t, channels, conv_w.shape[1], _stream(y))
+    check("gdn_conv", code)
+    return out
+
+
+def gdn_gates(y: torch.Tensor, a_off: int, b_off: int, hv: int, a_log: torch.Tensor,
+              dt_bias: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """g = -exp(a_log) * softplus(a + dt_bias) and beta = sigmoid(b), FP32 [T, hv], from columns of y FP16."""
+    _expect(y, "y", torch.float16)
+    t = y.shape[0]
+    g = torch.empty(t, hv, dtype=torch.float32, device=y.device)
+    beta = torch.empty_like(g)
+    code = lib().seventy_gdn_gates(g.data_ptr(), beta.data_ptr(), y.data_ptr(), y.stride(0), a_off, b_off,
+                                   a_log.data_ptr(), dt_bias.data_ptr(), t, hv, _stream(y))
+    check("gdn_gates", code)
+    return g, beta
+
+
+def gated_rms_norm(x: torch.Tensor, y: torch.Tensor, z_off: int, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """rms_norm(x) * weight * silu(z) for x FP16 [T, hv, 128], z = columns z_off + h * 128 of y FP16 [T, ld]."""
+    _expect(x, "x", torch.float16)
+    t, hv, dv = x.shape
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    code = lib().seventy_gated_rms_norm(out.data_ptr(), x.data_ptr(), y.data_ptr(), y.stride(0), z_off,
+                                        weight.data_ptr(), t, hv, dv, eps, _stream(x))
+    check("gated_rms_norm", code)
+    return out
+
+
 def gdn_recurrent(
     y: torch.Tensor,
     conv_weight: torch.Tensor,

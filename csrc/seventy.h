@@ -140,6 +140,23 @@ SEVENTY_API int seventy_gdn_prepare(void *w, void *u, void *gq, void *p, void *k
                                     cudaStream_t stream);
 
 /*
+ * Gated DeltaNet prefill, element-wise parts (see csrc/gdn_glue.cu). seventy_gdn_conv: out FP16 [T, channels] =
+ * silu(causal depthwise convolution of the first channels columns of y [T, ld] with conv_w FP32 [channels, taps]),
+ * continuing each sequence from its history in conv_state FP16 [slots, channels, taps - 1] (none if its context
+ * length is 0), which it then updates. seventy_gdn_gates: g and beta FP32 [T, hv] from the a and b columns of y
+ * (offsets a_off, b_off). seventy_gated_rms_norm: out = rms_norm(x) * weight * silu(z) for x FP16 [T * hv, 128]
+ * and z the columns z_off + h * 128 of y-like rows (row stride z_ld). Sequence arrays as in seventy_gdn_recurrent.
+ */
+SEVENTY_API int seventy_gdn_conv(void *out, void *conv_state, const void *y, int ld, const float *conv_w,
+                                 const int *query_start, const int *context_lens, const int *state_slots,
+                                 int num_seqs, int tokens, int channels, int taps, cudaStream_t stream);
+SEVENTY_API int seventy_gdn_gates(float *g, float *beta, const void *y, int ld, int a_off, int b_off,
+                                  const float *a_log, const float *dt_bias, int tokens, int hv, cudaStream_t stream);
+SEVENTY_API int seventy_gated_rms_norm(void *out, const void *x, const void *z, int z_ld, int z_off,
+                                       const float *weight, int tokens, int hv, int dv, float eps,
+                                       cudaStream_t stream);
+
+/*
  * Prefill attention (head size 256) over the paged caches (kv_type as in seventy_attn_prep), causal, with the
  * output gate (see csrc/flash_attention.cu). tiles: int32 [num_tiles, 2] = (sequence, first new token of a
  * 64-token query tile). out: FP16 [T, hq * 256].
