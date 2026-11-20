@@ -28,7 +28,7 @@ def engine_process_main(config: dict, req_addr: str, out_addr: str, ready) -> No
     tensor-parallel ranks tear down together. It also stops when the API process is gone."""
     import signal
 
-    from ..engine.engine import Engine
+    from ..engine.engine import Engine, display_name
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     parent = os.getppid()
@@ -40,7 +40,9 @@ def engine_process_main(config: dict, req_addr: str, out_addr: str, ready) -> No
         raise
     c = engine.config
     ready.send(("ready", {"kv_tokens": engine.kv_capacity_tokens, "pid": os.getpid(), "vision": engine.vision,
-                          "draft": engine.drafter is not None, "tensor_parallel": c.tensor_parallel,
+                          "draft": engine.drafter is not None, "model_name": display_name(c.model),
+                          "draft_name": display_name(c.draft_model) if engine.drafter is not None else None,
+                          "tensor_parallel": c.tensor_parallel,
                           "max_model_len": c.max_model_len, "max_num_seqs": c.max_num_seqs,
                           "kv_dtype": c.kv_dtype, "memory": engine.memory}))
     ctx = zmq.Context()

@@ -107,6 +107,19 @@ compiled for sm70.
 
 `bench/results/` has one results file for each release. The docstring of `bench/report.py` gives the format.
 
+To measure a running server and write a results file (2K, 32K and 100K tokens of context with 1, 4 and 8 streams,
+two runs of each, about 90 minutes on 4 GPUs):
+
+```
+.venv/bin/python bench/sweep.py --url http://127.0.0.1:8000 --release 1.1.0 --out bench/results/1.1.0.json
+```
+
+To measure longer contexts too, give the context lengths. The KV cache must hold all streams of the largest cell:
+
+```
+.venv/bin/python bench/sweep.py --url http://127.0.0.1:8000 --contexts 2000,32000,100000,128000,192000,256000 --release 1.1.0 --out bench/results/1.1.0.json
+```
+
 To make the README charts again (light and dark) from the newest results file:
 
 ```

@@ -13,8 +13,8 @@ Each file in bench/results/ (or the folder that --results gives) holds the speed
      "prefill": [{"context": 2000, "tokens_per_s": [2796, 2846]}, ...]}
 
 decode: requests of `context` prompt tokens that are already in the prefix cache, `streams` of them at the same time.
-per_stream is the output tokens/s of one request (first to last token), total the sum over the streams while they
-all run; each list has one value per run. prefill: prompt tokens/s of one cold prompt.
+per_stream is the output tokens/s of one request (first to last token), total the output tokens/s of all requests
+together while all of them run; each list has one value per run. prefill: prompt tokens/s of one cold prompt.
 
 --markdown prints the tables of the newest release for the README. --images writes the README charts of the newest release (sorted by date), light and dark, with the release before
 it as lighter lines. --html writes one self-contained page with every release; each release is drawn over the one
@@ -104,7 +104,9 @@ def chart(kind: str, run: dict, prev: dict | None, theme: str, width: int, heigh
     cur, old = series(run, kind), series(prev, kind) if prev else {}
     values = [p[3] for pts in list(cur.values()) + list(old.values()) for p in pts]
     step, top_v = axis_top(max(values) if values else 1.0)
-    left, right, bottom = (46 if narrow else 58), 16, 48
+    measured = max((p[0] for pts in cur.values() for p in pts), default=0)
+    labels = max((7.6 * len(stream_name(k)) + 22 for k in cur), default=0) if len(cur) > 1 else 0
+    left, right, bottom = (46 if narrow else 58), 16 + (labels if measured > CONTEXT_MAX * 0.8 else 0), 48
     names = [stream_name(k) for k in cur] if len(cur) > 1 else []
     lighter = f"Lighter lines: {prev['name']}" if prev and not narrow else ""
     row_end = left + sum(24 + 7.4 * len(n) + 18 for n in names)
@@ -128,7 +130,6 @@ def chart(kind: str, run: dict, prev: dict | None, theme: str, width: int, heigh
         out.append(text(left - 34 if not narrow else 16, 34, CHARTS[kind][0], pal, 19, "ink", weight=600))
         out.append(text(left - 34 if not narrow else 16, 56, CHARTS[kind][1], pal, 14, "ink2"))
         out.append(text(width - right - 4, 34, name, pal, 13, "muted", "end"))
-    measured = max((p[0] for pts in cur.values() for p in pts), default=0)
     if measured < CONTEXT_MAX * 0.95:
         zx = px(measured) + 18
         out.append(f'<rect x="{zx:.1f}" y="{top}" width="{left + pw - zx:.1f}" height="{ph}" fill="{pal["zone"]}"/>')
@@ -140,7 +141,7 @@ def chart(kind: str, run: dict, prev: dict | None, theme: str, width: int, heigh
                    f'stroke="{pal["axis"] if v == 0 else pal["grid"]}" stroke-width="1"/>')
         out.append(text(left - 8, y + 4.5, f"{v:,.0f}", pal, 13, "muted", "end"))
         v += step
-    tick = 65536 if narrow else 32768
+    tick = 65536 if pw < 440 else 32768
     for c in range(0, CONTEXT_MAX + 1, tick):
         anchor = "end" if c == CONTEXT_MAX else ("start" if c == 0 else "middle")
         out.append(text(px(c), top + ph + 20, k_label(c), pal, 13, "muted", anchor))
@@ -395,7 +396,7 @@ th:first-child,td:first-child{text-align:left}
 .scroll{overflow-x:auto;margin-top:10px}
 .how{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,22em),1fr));gap:8px 40px}
 .how p,.how li{color:var(--ink2);max-width:40em}
-pre{overflow-x:auto;background:var(--pale);padding:12px 14px;border-radius:8px;font-size:14px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--pale);padding:12px 14px;border-radius:8px;font-size:14px}
 code{overflow-wrap:anywhere}
 #tip{position:fixed;z-index:9;pointer-events:none;background:var(--ink);color:var(--bg);font-size:14px;line-height:1.45;padding:8px 10px;border-radius:8px;max-width:280px}
 [data-tip]{cursor:default;outline:none}
@@ -406,11 +407,14 @@ code{overflow-wrap:anywhere}
 <main>__RUNS__
 <section class="band how"><div><h2>How the speed is measured</h2>
 <p>Each decode test sends requests whose prompt is already in the prefix cache, so the test measures only the
-generation of tokens. Per stream is the output rate of one request from its first to its last token. Total is the sum
-of the rates while all streams run. Each cell runs two times; the bar at a point shows the range.</p>
+generation of tokens. Per stream is the output rate of one request from its first to its last token. Total is the output
+rate of all requests together while all of them run (results made before bench/sweep.py add up the per-stream rates
+instead, which gives more when the streams start far apart). When a cell runs more than one time, the bar at a point shows the range of the
+runs.</p>
 <p>The prefill test sends one prompt that is not in the cache and measures the time to its first token.</p></div>
-<div><h2>Add a release</h2><p>Put one results file per release in <code>bench/results/</code>, then make the charts
-and this page again:</p><pre><code>python bench/report.py --images docs/images --html speed-sheet.html</code></pre>
+<div><h2>Add a release</h2><p>Measure a running server into a results file in <code>bench/results/</code>, then make
+the charts and this page again:</p><pre><code>python bench/sweep.py --release 1.1.0 --out bench/results/1.1.0.json
+python bench/report.py --images docs/images --html speed-sheet.html</code></pre>
 <p>Each release is drawn over the release before it. The format is in the docstring of <code>bench/report.py</code>.</p></div></section>
 </main><div id="tip" hidden></div>
 <script>
