@@ -1,5 +1,5 @@
 """The NVLink all-reduce kernels (csrc/allreduce.cu) on 2 or 4 GPUs: one-shot against a reference, two-shot
-against one-shot."""
+against one-shot, and 400 calls in a row with changing row counts mixed with the FP32 all-reduce (slot reuse)."""
 
 import pytest
 import torch
@@ -54,6 +54,23 @@ def run_rank(rank, world, port, queue):
             errors.append(f"rows {rows}: two-shot with gathered residual differs from one-shot")
         if not (torch.equal(out_c, out_a) and torch.equal(res_c[own], res_a[own])):
             errors.append(f"rows {rows}: two-shot (sharded residual) differs from one-shot")
+    g = torch.Generator().manual_seed(1234)
+    for it in range(400):
+        rows = (1, 16, 32, 64, 7, 24)[it % 6]
+        x = (torch.randn(rows, 5120, generator=g) * 2).half().to(dev) * (rank + 1)
+        res0 = (torch.randn(rows, 5120, generator=g) * 20).half().to(dev)
+        stream = torch.cuda.current_stream(dev).cuda_stream
+        res_a, out_a = res0.clone(), torch.empty_like(x)
+        check("ar_norm", lib().seventy_ar_norm(ar.ctx, out_a.data_ptr(), res_a.data_ptr(), x.data_ptr(), wd.data_ptr(),
+                                               rows, 5120, 1e-6, stream))
+        res_b, out_b = res0.clone(), torch.empty_like(x)
+        check("ar_norm_2shot", lib().seventy_ar_norm_2shot(ar.ctx, out_b.data_ptr(), res_b.data_ptr(), x.data_ptr(),
+                                                           wd.data_ptr(), rows, 5120, 1e-6, it % 2, stream))
+        if it % 5 == 0:
+            ar.reduce(x.float())
+        if not torch.equal(out_b, out_a):
+            errors.append(f"repeat {it}: two-shot out differs from one-shot")
+            break
     queue.put((rank, errors))
     distributed.shutdown()
 

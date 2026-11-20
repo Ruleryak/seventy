@@ -18,11 +18,10 @@ TWO_SHOT_MIN = int(os.environ.get("SEVENTY_AR_TWO_SHOT_MIN", "16"))
 class CustomAllReduce:
     def __init__(self, rank: int, world: int, device: torch.device, max_rows: int = 64, dim: int = 5120):
         self.rank, self.world, self.max_rows, self.dim = rank, world, max_rows, dim
-        slot = -(-max_rows * dim * 4 // 16) * 16
-        nbytes = lib().seventy_ar_buffer_bytes(world, slot)
+        slot = -(-max_rows * dim * 4 // 32) * 32
         ptr = ctypes.c_void_p()
         handle = (ctypes.c_char * 64)()
-        check("ar_alloc", lib().seventy_ar_alloc(nbytes, ctypes.byref(ptr), handle))
+        check("ar_alloc", lib().seventy_ar_alloc(world, slot, ctypes.byref(ptr), handle))
         handles = [None] * world
         dist.all_gather_object(handles, bytes(handle))
         ptrs = []

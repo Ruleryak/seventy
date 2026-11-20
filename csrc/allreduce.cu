@@ -1,5 +1,8 @@
 #include "common.cuh"
 
+#include <cstdlib>
+#include <cstring>
+
 /*
  * Tensor-parallel all-reduce for small batches over peer-to-peer GPU memory (NVLink), fused with the residual add
  * and RMS norm that follow it in the model.
@@ -31,10 +34,75 @@ constexpr int64_t kSignalBytes = 2 * static_cast<int64_t>(kMaxBlocks) * kMaxRank
 struct ArContext {
   char *buffers[kMaxRanks];
   uint32_t *counters;
+  uint32_t *push_epochs;
   int64_t slot_bytes;
   int rank;
   int world;
 };
+
+/*
+ * Push protocol (ar_norm_push_kernel). The data is its own flag: an empty slot holds the FP16 NaN 0x7f7f in every
+ * half, a sender writes its 16-byte packs straight into the receiver's slot, and the receiver spins on its own
+ * slots until no half is 0x7f7f, then writes 0x7f7f back. A payload half equal to 0x7f7f is sent as the NaN 0x7e00.
+ * There is no separate flag store and no fence, so a call costs one NVLink write latency per phase. This is the
+ * protocol of 1Cat-vLLM's sm70_cross_device_reduce_1stage_push (Apache-2.0), as the lab's fused all-reduce and
+ * Gemma RMS norm kernel used it. The push slots have their own region of the buffer (after the flag-protocol data
+ * areas), filled with 0x7f7f by seventy_ar_alloc, and every row block has its own epoch bit (push_epochs, local),
+ * so the two halves of the region alternate per row from call to call.
+ */
+__host__ __device__ inline int64_t push_slot_bytes(int64_t slot_bytes) { return slot_bytes / 2; }
+
+__host__ __device__ inline int64_t push_p1_offset(int world, int64_t slot_bytes) {
+  return kSignalBytes + 2 * static_cast<int64_t>(world) * slot_bytes;
+}
+
+__host__ __device__ inline int64_t push_p2_offset(int world, int64_t slot_bytes) {
+  return push_p1_offset(world, slot_bytes) + 2 * static_cast<int64_t>(world) * push_slot_bytes(slot_bytes);
+}
+
+__host__ __device__ inline int64_t push_end(int world, int64_t slot_bytes) {
+  return push_p2_offset(world, slot_bytes) + 4 * push_slot_bytes(slot_bytes);
+}
+
+constexpr uint32_t kEmpty = 0x7f7f7f7fu;
+
+__device__ __forceinline__ void st_vol(void *p, const uint4 &v) {
+  asm volatile("st.volatile.global.v4.b32 [%4], {%0, %1, %2, %3};" ::"r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w),
+               "l"(p));
+}
+
+__device__ __forceinline__ uint4 ld_vol(const void *p) {
+  uint4 v;
+  asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p));
+  return v;
+}
+
+__device__ __forceinline__ bool is_empty(const uint4 &v) {
+  const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+  bool e = false;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) e |= ((w[i] & 0xffffu) == 0x7f7fu) | ((w[i] >> 16) == 0x7f7fu);
+  return e;
+}
+
+__device__ __forceinline__ uint4 escape(uint4 v) {
+  uint32_t *w = reinterpret_cast<uint32_t *>(&v);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    if ((w[i] & 0xffffu) == 0x7f7fu) w[i] = (w[i] & 0xffff0000u) | 0x7e00u;
+    if ((w[i] >> 16) == 0x7f7fu) w[i] = (w[i] & 0x0000ffffu) | 0x7e000000u;
+  }
+  return v;
+}
+
+__device__ __forceinline__ uint4 wait_full(const void *p) {
+  uint4 v;
+  do {
+    v = ld_vol(p);
+  } while (is_empty(v));
+  return v;
+}
 
 __device__ __forceinline__ void store_release(uint32_t *p, uint32_t v) {
   asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
@@ -294,6 +362,117 @@ __global__ void __launch_bounds__(kThreads) ar_norm_2shot_kernel(ArContext ctx, 
 }
 
 /*
+ * ar_norm_push_kernel: the two-shot all-reduce and norm of ar_norm_2shot_kernel (same rows per home rank, same
+ * rounding, same sharded residual) on the push protocol above. One block per row b; thread i handles 16-byte packs
+ * i and i + 1024 of the row.
+ *   1. Every rank writes its partial row b into slot `rank` of the home rank's phase-1 area.
+ *   2. The home rank waits for its world slots, adds them in FP32 in rank order (rounded once to FP16), adds its
+ *      residual row, writes the residual and the RMS-normed row, empties its slots, and writes the normed row (and,
+ *      with gather_residual, the residual row) into every other rank's phase-2 area.
+ *   3. Every other rank waits for the row(s) in its phase-2 area, copies them and empties the slots.
+ */
+__global__ void __launch_bounds__(kThreads) ar_norm_push_kernel(ArContext ctx, half *out, half *residual,
+                                                                const half *x, const float *weight, int rows,
+                                                                int dim, float eps, int gather_residual) {
+  __shared__ float scratch[32];
+  const int b = blockIdx.x;
+  const uint32_t parity = ctx.push_epochs[b] & 1u;
+  const int64_t ps = push_slot_bytes(ctx.slot_bytes);
+  const int64_t p1 = push_p1_offset(ctx.world, ctx.slot_bytes) + parity * ctx.world * ps;
+  const int64_t p2 = push_p2_offset(ctx.world, ctx.slot_bytes) + parity * 2 * ps;
+  const int vec_per_row = dim / 8;
+  const int64_t slot_vecs = ps / static_cast<int64_t>(sizeof(uint4));
+  const int per = (rows + ctx.world - 1) / ctx.world;
+  const int home = b / per;
+  const bool mine = home == ctx.rank;
+  const int64_t row_off = static_cast<int64_t>(b) * vec_per_row;
+  const uint4 empty = make_uint4(kEmpty, kEmpty, kEmpty, kEmpty);
+
+  {
+    const uint4 *src = reinterpret_cast<const uint4 *>(x) + row_off;
+    uint4 *dst = reinterpret_cast<uint4 *>(ctx.buffers[home] + p1) + ctx.rank * slot_vecs + row_off;
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      if (i < vec_per_row) st_vol(dst + i, escape(src[i]));
+    }
+  }
+  uint4 *res = residual != nullptr ? reinterpret_cast<uint4 *>(residual) + row_off : nullptr;
+  uint4 *dst = reinterpret_cast<uint4 *>(out) + row_off;
+  if (mine) {
+    uint4 *local = reinterpret_cast<uint4 *>(ctx.buffers[ctx.rank] + p1) + row_off;
+    float r[kVecs][8];
+    uint4 rnew[kVecs];
+    float sumsq = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      if (i >= vec_per_row) break;
+      float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+      for (int p = 0; p < ctx.world; ++p) {
+        float f[8];
+        unpack8(wait_full(local + p * slot_vecs + i), f);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) acc[k] += f[k];
+      }
+      for (int p = 0; p < ctx.world; ++p) st_vol(local + p * slot_vecs + i, empty);
+      uint4 sum16 = pack8(acc);
+      unpack8(sum16, r[j]);
+      if (res != nullptr) {
+        float old[8];
+        unpack8(res[i], old);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) r[j][k] += old[k];
+        sum16 = pack8(r[j]);
+        unpack8(sum16, r[j]);
+      }
+      rnew[j] = sum16;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) sumsq += r[j][k] * r[j][k];
+    }
+    const float total = block_sum(sumsq, scratch);
+    const float inv = 1.0f / sqrtf(total / dim + eps);
+    const float4 *w4 = reinterpret_cast<const float4 *>(weight);
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      if (i >= vec_per_row) break;
+      const float4 wa = w4[2 * i], wb = w4[2 * i + 1];
+      const float w[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w};
+      float o[8];
+#pragma unroll
+      for (int k = 0; k < 8; ++k) o[k] = r[j][k] * inv * w[k];
+      const uint4 o16 = pack8(o);
+      dst[i] = o16;
+      if (res != nullptr) res[i] = rnew[j];
+      const uint4 o_esc = escape(o16), r_esc = escape(rnew[j]);
+      for (int p = 0; p < ctx.world; ++p) {
+        if (p == ctx.rank) continue;
+        uint4 *g = reinterpret_cast<uint4 *>(ctx.buffers[p] + p2) + row_off;
+        st_vol(g + i, o_esc);
+        if (gather_residual) st_vol(g + slot_vecs + i, r_esc);
+      }
+    }
+  } else {
+    uint4 *g = reinterpret_cast<uint4 *>(ctx.buffers[ctx.rank] + p2) + row_off;
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) {
+      const int i = threadIdx.x + j * kThreads;
+      if (i >= vec_per_row) break;
+      dst[i] = wait_full(g + i);
+      st_vol(g + i, empty);
+      if (gather_residual) {
+        const uint4 rv = wait_full(g + slot_vecs + i);
+        st_vol(g + slot_vecs + i, empty);
+        if (res != nullptr) res[i] = rv;
+      }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) ctx.push_epochs[b] += 1;
+}
+
+/*
  * Plain FP32 all-reduce of [rows, dim] (the drafter's partial sums), with the same buffers, epochs and barrier as
  * ar_norm_kernel. Each rank's FP32 slice fits the slot because the slot is sized for max_rows FP32 rows.
  */
@@ -352,13 +531,19 @@ __global__ void __launch_bounds__(kThreads) ar_sum_f32_kernel(ArContext ctx, flo
 
 SEVENTY_API int64_t seventy_ar_buffer_bytes(int world, int64_t slot_bytes) {
   using namespace seventy;
-  return kSignalBytes + 2 * static_cast<int64_t>(world) * slot_bytes;
+  return push_end(world, slot_bytes);
 }
 
-SEVENTY_API int seventy_ar_alloc(int64_t bytes, void **ptr, void *handle) {
+SEVENTY_API int seventy_ar_alloc(int world, int64_t slot_bytes, void **ptr, void *handle) {
+  using namespace seventy;
+  if (world < 2 || world > kMaxRanks || slot_bytes <= 0 || slot_bytes % 32) return SEVENTY_ERR_INVALID_ARGUMENT;
+  const int64_t bytes = push_end(world, slot_bytes);
   cudaError_t e = cudaMalloc(ptr, bytes);
   if (e != cudaSuccess) return static_cast<int>(e);
-  e = cudaMemset(*ptr, 0, bytes);
+  const int64_t p1 = push_p1_offset(world, slot_bytes);
+  e = cudaMemset(*ptr, 0, p1);
+  if (e == cudaSuccess) e = cudaMemset(static_cast<char *>(*ptr) + p1, 0x7f, bytes - p1);
+  if (e == cudaSuccess) e = cudaDeviceSynchronize();
   if (e != cudaSuccess) return static_cast<int>(e);
   e = cudaIpcGetMemHandle(static_cast<cudaIpcMemHandle_t *>(handle), *ptr);
   return static_cast<int>(e);
@@ -379,8 +564,9 @@ SEVENTY_API int seventy_ar_context(int rank, int world, void *const *buffers, in
   ctx->rank = rank;
   ctx->world = world;
   ctx->slot_bytes = slot_bytes;
-  cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&ctx->counters), kMaxBlocks * sizeof(uint32_t));
-  if (e == cudaSuccess) e = cudaMemset(ctx->counters, 0, kMaxBlocks * sizeof(uint32_t));
+  cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&ctx->counters), 2 * kMaxBlocks * sizeof(uint32_t));
+  if (e == cudaSuccess) e = cudaMemset(ctx->counters, 0, 2 * kMaxBlocks * sizeof(uint32_t));
+  ctx->push_epochs = ctx->counters + kMaxBlocks;
   if (e != cudaSuccess) {
     delete ctx;
     return static_cast<int>(e);
@@ -431,8 +617,17 @@ SEVENTY_API int seventy_ar_norm_2shot(void *ctx_ptr, void *out, void *residual, 
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (!aligned(x, 16) || !aligned(out, 16) || (residual != nullptr && !aligned(residual, 16)) || !aligned(weight, 16))
     return SEVENTY_ERR_MISALIGNED;
-  ar_norm_2shot_kernel<<<rows, kThreads, 0, stream>>>(*ctx, static_cast<half *>(out), static_cast<half *>(residual),
-                                                      static_cast<const half *>(x), weight, rows, dim, eps,
-                                                      gather_residual);
+  static const bool flags = [] {
+    const char *v = getenv("SEVENTY_AR");
+    return v != nullptr && strcmp(v, "flags") == 0;
+  }();
+  if (flags || static_cast<int64_t>(rows) * dim * static_cast<int64_t>(sizeof(half)) > push_slot_bytes(ctx->slot_bytes))
+    ar_norm_2shot_kernel<<<rows, kThreads, 0, stream>>>(*ctx, static_cast<half *>(out),
+                                                        static_cast<half *>(residual), static_cast<const half *>(x),
+                                                        weight, rows, dim, eps, gather_residual);
+  else
+    ar_norm_push_kernel<<<rows, kThreads, 0, stream>>>(*ctx, static_cast<half *>(out),
+                                                       static_cast<half *>(residual), static_cast<const half *>(x),
+                                                       weight, rows, dim, eps, gather_residual);
   return launch_status();
 }

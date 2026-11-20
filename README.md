@@ -240,6 +240,14 @@ curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/jso
 
 To turn off thinking for one request, add `"chat_template_kwargs": {"enable_thinking": false}` to the request.
 
+## Credits
+
+seventy uses methods from these projects. Each source file that holds such a method names the project in its header.
+
+| Project | What seventy uses | License |
+|---|---|---|
+| [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), a fork of [vLLM](https://github.com/vllm-project/vllm) | The push protocol of its tensor-parallel all-reduce for sm70: the data in a slot is also its ready flag (`csrc/allreduce.cu`) | Apache-2.0 |
+
 ## License
 
 seventy is licensed under the Apache License 2.0. See [LICENSE](LICENSE). The libraries that seventy installs

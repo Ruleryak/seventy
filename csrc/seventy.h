@@ -181,15 +181,15 @@ SEVENTY_API int seventy_grouped_attention(void *out, const void *q, const void *
 
 /*
  * Small-batch tensor-parallel all-reduce over peer GPU memory, fused with the residual add and RMS norm
- * (see csrc/allreduce.cu). seventy_ar_alloc allocates this rank's buffer of seventy_ar_buffer_bytes() bytes and
- * returns its 64-byte CUDA IPC handle; seventy_ar_open maps a peer's handle; seventy_ar_context builds the
+ * (see csrc/allreduce.cu). seventy_ar_alloc allocates this rank's buffer of seventy_ar_buffer_bytes(world,
+ * slot_bytes) bytes (slot_bytes a multiple of 32), prepares it, and returns its 64-byte CUDA IPC handle; seventy_ar_open maps a peer's handle; seventy_ar_context builds the
  * per-rank context from all ranks' buffer pointers (in rank order).
  * seventy_ar_norm: s = all-reduce of x [rows, dim] (FP16, FP32 sum rounded once). With weight: residual += s
  * (FP16), out = rms_norm(residual) * weight (residual may be null: out = rms_norm(s) * weight). Without weight:
  * out = s. rows * dim * 2 must fit in slot_bytes. Every rank must make the same calls in the same order.
  */
 SEVENTY_API int64_t seventy_ar_buffer_bytes(int world, int64_t slot_bytes);
-SEVENTY_API int seventy_ar_alloc(int64_t bytes, void **ptr, void *handle);
+SEVENTY_API int seventy_ar_alloc(int world, int64_t slot_bytes, void **ptr, void *handle);
 SEVENTY_API int seventy_ar_open(const void *handle, void **ptr);
 SEVENTY_API int seventy_ar_context(int rank, int world, void *const *buffers, int64_t slot_bytes, void **ctx_out);
 SEVENTY_API int seventy_ar_norm(void *ctx, void *out, void *residual, const void *x, const float *weight, int rows,
