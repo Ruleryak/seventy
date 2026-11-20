@@ -1,11 +1,11 @@
 """Measure the decode and prefill speed of a running seventy server and write a results file for bench/report.py.
 
-For each context length and number of streams, the sweep makes one prompt per stream from Python source code (the
+For each context length, the sweep makes one prompt per stream of the largest cell from Python source code (the
 standard library of the Python that runs this script). It sends each prompt once with max_tokens 1: this is the
-cold prefill, and the prompt is then in the prefix cache. Then it sends all the prompts at the same time and
-times the output tokens of each request (ignore_eos, thinking on, temperature 0.6, top_p 0.95). Per stream is the
-output rate of one request from its first to its last token; total is the output rate of all requests together
-while all of them run.
+cold prefill, and the prompt is then in the prefix cache. Then, for each number of streams N and each run, it
+sends the first N prompts at the same time and times the output tokens of each request (ignore_eos, thinking on,
+temperature 0.6, top_p 0.95). Per stream is the output rate of one request from its first to its last token;
+total is the output rate of all requests together while all of them run.
 
     python bench/sweep.py --url http://127.0.0.1:8000 --release 1.1.0 --out bench/results/1.1.0.json
 
@@ -166,16 +166,18 @@ def main() -> None:
     prompts = Prompts(url, key)
     decode, prefill = {}, {}
     started = None
+    counts = [int(x) for x in args.streams.split(",")]
     for ctx in (int(x) for x in args.contexts.split(",")):
-        for streams in (int(x) for x in args.streams.split(",")):
+        msgs = [messages(prompts.body(ctx, 100_000 * args.seed + 7919 * i + ctx), i, args.seed)
+                for i in range(max(counts))]
+        started = started or time.time()
+        for m in msgs:
+            warm = request(url, key, model, m, 1, think)
+            if warm["ttft"]:
+                prefill.setdefault(ctx, []).append(round(warm["prompt"] / warm["ttft"]))
+        print(f"context {ctx:>7,}: cold prefill {statistics.mean(prefill.get(ctx, [0])):,.0f} tok/s", flush=True)
+        for streams in counts:
             for rep in range(args.repeats):
-                seeds = [100_000 * args.seed + 7919 * (100 * streams + 1000 * rep + i) + ctx for i in range(streams)]
-                msgs = [messages(prompts.body(ctx, s), i, args.seed) for i, s in enumerate(seeds)]
-                started = started or time.time()
-                warm = [request(url, key, model, m, 1, think) for m in msgs]
-                cold = sum(w["ttft"] for w in warm if w["ttft"])
-                if cold:
-                    prefill.setdefault(ctx, []).append(round(sum(w["prompt"] for w in warm if w["ttft"]) / cold))
                 res: list = [None] * streams
                 threads = [threading.Thread(target=lambda j=j: res.__setitem__(
                     j, request(url, key, model, msgs[j], args.output_tokens, think))) for j in range(streams)]
@@ -193,7 +195,7 @@ def main() -> None:
                 cell["ttft_cached"].append(round(statistics.mean(r["ttft"] for r in res if r["ttft"]), 3))
                 print(f"context {ctx:>7,} streams {streams} run {rep + 1}: "
                       f"{cell['per_stream'][-1] if rates else 0:6.1f} tok/s per stream, {total or 0:6.1f} in total, "
-                      f"cold prefill {prefill.get(ctx, [0])[-1]:,} tok/s", flush=True)
+                      f"first token {cell['ttft_cached'][-1]:.2f} s", flush=True)
 
     draft = info.get("draft_name") or ("yes" if info.get("draft") else "none")
     results = {
