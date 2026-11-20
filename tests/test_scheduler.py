@@ -219,3 +219,26 @@ def test_identical_prompts_hit_under_slot_pressure():
             run_step(s, s.schedule())
         assert s.cache.hit_tokens - before == sum(len(p) - 1 for p in prompts), round_size
     assert len(s.cache.entries) <= 8
+
+
+def test_prompt_logprobs_rows_per_step_are_capped():
+    """Requests with prompt_logprobs get FP32 logits for every prompt row: all of them together take at most
+    PROMPT_LOGPROBS_CHUNK rows per step, and other requests keep the rest of the budget."""
+    from seventy.engine.scheduler import PROMPT_LOGPROBS_CHUNK
+
+    s = Scheduler(num_blocks=512, block_size=16, num_slots=4, max_model_len=8192, prefill_budget=4096)
+    a = Request("a", list(range(1500)), SamplingParams(max_tokens=1, prompt_logprobs=1))
+    b = Request("b", list(range(900)), SamplingParams(max_tokens=1, prompt_logprobs=1))
+    c = Request("c", list(range(2000)), SamplingParams(max_tokens=1))
+    for r in (a, b, c):
+        s.add(r)
+    steps = 0
+    while not all(r.status is Status.FINISHED for r in (a, b, c)):
+        plan = s.schedule()
+        rows = sum(w.count for w in plan.prefill if w.logits == "all")
+        assert rows <= PROMPT_LOGPROBS_CHUNK
+        if steps == 0:
+            assert [(w.request.id, w.count) for w in plan.prefill] == [("a", PROMPT_LOGPROBS_CHUNK), ("c", 2000)]
+        run_step(s, plan)
+        steps += 1
+        assert steps < 20

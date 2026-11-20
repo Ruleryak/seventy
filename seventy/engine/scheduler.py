@@ -146,6 +146,9 @@ class SlotAllocator:
 
 
 SNAPSHOT_MIN = 512
+PROMPT_LOGPROBS_CHUNK = 512
+"""Most prompt tokens per step of all requests with prompt_logprobs together: every row of their chunks gets FP32
+logits over the whole vocabulary (about 1 MB per row for Qwen3.5)."""
 
 
 @dataclass
@@ -434,6 +437,8 @@ class Scheduler:
         if point is not None and r.computed < point:
             remaining = point - r.computed
         count = min(remaining, budget)
+        if r.params.prompt_logprobs is not None:
+            count = min(count, PROMPT_LOGPROBS_CHUNK - sum(w.count for w in plan.prefill if w.logits == "all"))
         if count <= 0 or not self._grow(r, r.computed + count):
             return budget
         last = r.computed + count == r.length

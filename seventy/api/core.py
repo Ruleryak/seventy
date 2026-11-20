@@ -79,6 +79,7 @@ def engine_process_main(config: dict, req_addr: str, out_addr: str, ready) -> No
         }
 
     alive = True
+    failed = False
     try:
         while alive:
             if not engine.has_work():
@@ -97,10 +98,27 @@ def engine_process_main(config: dict, req_addr: str, out_addr: str, ready) -> No
             step_ms = 0.9 * step_ms + 0.1 * (time.perf_counter() - t0) * 1000 if step_ms else (time.perf_counter() - t0) * 1000
             counters["finished"] += sum(1 for o in outputs if o.finished)
             push.send(pickle.dumps(("out", outputs, snapshot())))
+    except BaseException:
+        failed = True
+        traceback.print_exc()
+        raise
     finally:
         print("seventy: stopping the engine", flush=True)
+        _exit_after(60 if failed else 300, 70)
         engine.close()
         print("seventy: engine stopped", flush=True)
+
+
+def _exit_after(seconds: float, code: int) -> None:
+    """End this process if it still runs after `seconds`: after a failed step the workers may wait in a collective
+    that never completes, and the shutdown would wait for them. The workers and the API process end when this
+    process is gone."""
+    import threading
+
+    timer = threading.Timer(seconds, lambda: (print("seventy: the engine did not stop; exiting", flush=True),
+                                              os._exit(code)))
+    timer.daemon = True
+    timer.start()
 
 
 class Histogram:

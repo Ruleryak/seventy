@@ -93,16 +93,21 @@ def _filter(logits: torch.Tensor, p: SamplingParams) -> torch.Tensor:
     return logits
 
 
-def logprobs_of(logits: torch.Tensor, tokens: torch.Tensor, n: int) -> list[TokenLogprobs]:
-    """Raw log probabilities of `tokens` (one per row) and the top-n of each row."""
-    lp = torch.log_softmax(logits.float(), dim=-1)
-    chosen = lp.gather(1, tokens[:, None])[:, 0]
-    rank = (lp > chosen[:, None]).sum(-1) + 1
-    top_v, top_i = torch.topk(lp, max(n, 1), dim=-1)
+def logprobs_of(logits: torch.Tensor, tokens: torch.Tensor, n: int, rows: int = 128) -> list[TokenLogprobs]:
+    """Raw log probabilities of `tokens` (one per row) and the top-n of each row, `rows` rows at a time (the
+    temporaries are rows x vocabulary)."""
     out = []
-    for r in range(logits.shape[0]):
-        top = list(zip(top_i[r, :n].tolist(), top_v[r, :n].tolist())) if n else []
-        out.append(TokenLogprobs(int(tokens[r]), float(chosen[r]), int(rank[r]), top))
+    for r0 in range(0, logits.shape[0], rows):
+        lp = torch.log_softmax(logits[r0 : r0 + rows].float(), dim=-1)
+        tok = tokens[r0 : r0 + rows]
+        chosen = lp.gather(1, tok[:, None])[:, 0]
+        rank = (lp > chosen[:, None]).sum(-1) + 1
+        top_v, top_i = torch.topk(lp, max(n, 1), dim=-1)
+        chosen_l, rank_l, tok_l = chosen.tolist(), rank.tolist(), tok.tolist()
+        top_i_l, top_v_l = top_i[:, :n].tolist(), top_v[:, :n].tolist()
+        for r in range(lp.shape[0]):
+            top = list(zip(top_i_l[r], top_v_l[r])) if n else []
+            out.append(TokenLogprobs(tok_l[r], chosen_l[r], rank_l[r], top))
     return out
 
 

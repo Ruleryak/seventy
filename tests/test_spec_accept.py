@@ -82,3 +82,18 @@ def test_merge_top_of_shards_matches_full_logits():
     assert torch.equal(pred, want_pred) and pred[0, 0] == 7
     assert torch.equal(v, want_v)
     assert torch.equal(torch.gather(logits, -1, i), want_v)
+
+
+def test_logprobs_of_in_row_blocks_matches_one_block():
+    import torch
+
+    from seventy.engine.sampling import logprobs_of
+
+    torch.manual_seed(0)
+    logits = torch.randn(300, 1000) * 3
+    tokens = torch.randint(0, 1000, (300,))
+    a = logprobs_of(logits, tokens, 3, rows=128)
+    b = logprobs_of(logits, tokens, 3, rows=1000)
+    assert len(a) == 300
+    assert [(x.token, x.rank, [t for t, _ in x.top]) for x in a] == [(x.token, x.rank, [t for t, _ in x.top]) for x in b]
+    assert max(abs(x.logprob - y.logprob) for x, y in zip(a, b)) < 1e-5
