@@ -14,10 +14,12 @@ other side's taps; the same around the MLP. Each mask position predicts the toke
 Numerics: the drafter was trained in BF16, and its residual stream grows past the FP16 range. The residual stream,
 the convolutions and every large intermediate stay in FP32; the tensor cores see FP16 inputs that fit (norm
 outputs, attention outputs, and the MLP's down-projection input scaled per row), with FP32 outputs. On GPUs the
-candidate logits come from an FP8 E4M3 copy of the target's LM head shard (one scale per vocabulary row; half the
-traffic of the drafter's largest GEMM; SEVENTY_DRAFTER_FP8=0 uses the FP16 head). Acceptance uses this drafter's
-own draft probabilities, so the target's output distribution is unchanged, and the measured acceptance is the same
-as with FP16. FP8 drafter layers (per-row scales) were tried: acceptance fell from 0.314 to 0.29, so they stay FP16.
+layers' weights and the candidate head (a copy of the target's LM head shard) are FP8 E4M3 with one scale per
+output row: half the weight traffic, and half the drafter's memory, which goes to the KV cache.
+SEVENTY_DRAFTER_FP8=0 keeps them FP16. Acceptance uses this drafter's own draft probabilities, so the target's
+output distribution is unchanged whatever the drafter's precision. Measured with sampling (thinking on,
+temperature 0.6, 2K and 32K prompts, 4 streams): 31.9% of the drafted tokens accepted with FP16 weights and 32.0%
+with FP8 (two runs each; runs of one setting differ by about 3 points).
 
 Selector: the top-k tokens of each mask position (from the LM head), and edge scores
 score[l, p, c] = logit[l, c] + sum_r pred[token before (l, p)]_r * hidden[l]_r * succ[candidate (l, c)]_r,
@@ -144,11 +146,16 @@ class Drafter:
             for layer in self.layers:
                 if self.fused:
                     layer.q_cols = layer.q.shape[0]
+                    layer.qkv_src_q, layer.qkv_src_kv = layer.q, layer.kv_w
                     layer.qkv = DenseWeight(torch.cat((layer.q, layer.kv_w)))
                     layer.q = layer.kv_w = None
+                lossy = self.fp8
+                if lossy and self.fused:
+                    layer.qkv = DenseWeightFP8(torch.cat((layer.qkv_src_q, layer.qkv_src_kv)))
                 for name in ("q", "kv_w", "o", "gate_up", "down"):
                     if getattr(layer, name) is not None:
-                        setattr(layer, name, DenseWeight(getattr(layer, name)))
+                        setattr(layer, name, (DenseWeightFP8 if lossy else DenseWeight)(getattr(layer, name)))
+                layer.qkv_src_q = layer.qkv_src_kv = None
                 layer.conv = {side: (base, DenseWeight(proj)) for side, (base, proj) in layer.conv.items()}
             self.fc, self.kv_all, self.sel_hidden = DenseWeight(self.fc), DenseWeight(self.kv_all), DenseWeight(self.sel_hidden)
             if self.fp8 and target.lm_head_packed is not None:
