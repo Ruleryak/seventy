@@ -70,7 +70,7 @@ class AttentionLayer:
             else:
                 o = kernels.flash_attention(q, qkv, cache.k[layer], cache.v[layer], step.block_tables,
                                             step.query_start, step.query_start_t, step.context_lens_t, self.scale,
-                                            ks, vs)
+                                            ks, vs, step.context_lens)
             return self.o_proj(o)
         qg = qkv[:, : 2 * d * self.heads].view(t, self.heads, 2, d)
         q = qg[:, :, 0].contiguous()

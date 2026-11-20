@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from ..nvfp4 import GemmWeight, Nvfp4Weight
@@ -239,13 +241,69 @@ def prefill_tiles(query_start: list[int], device) -> torch.Tensor:
     return torch.tensor(tiles, dtype=torch.int32, device=device).view(-1, 2)
 
 
+GROUPED_ROWS = 48
+GROUPED_MIN_BLOCKS = 1024
+
+
+_last_groups: tuple = (None, None)
+
+
+def prefill_groups(query_start: list[int], context_lens: list[int], size: int, device) -> tuple[torch.Tensor, int]:
+    """Groups of at most `size` new tokens per sequence for seventy_grouped_attention, int32 [3, groups + 1] on the
+    device: block-table rows, first token rows (and the end), cached keys before the first token. The last result
+    is kept, so the layers of one step copy it to the device once."""
+    global _last_groups
+    key = (tuple(query_start), tuple(context_lens), size, str(device))
+    if _last_groups[0] == key:
+        return _last_groups[1]
+    rows, start, ctx = [], [0], []
+    for b in range(len(query_start) - 1):
+        q0, q1 = query_start[b], query_start[b + 1]
+        for t in range(q0, q1, size):
+            rows.append(b)
+            ctx.append(context_lens[b] + t - q0)
+            start.append(min(t + size, q1))
+    rows.append(0)
+    ctx.append(0)
+    result = torch.tensor([rows, start, ctx], dtype=torch.int32).to(device), len(rows) - 1
+    _last_groups = (key, result)
+    return result
+
+
+def grouped_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                      block_tables: torch.Tensor, query_start: list[int], context_lens: list[int], scale: float,
+                      k_scale: torch.Tensor, v_scale: torch.Tensor, splits: int | None = None) -> torch.Tensor:
+    """Gated causal attention output [T, hq * 256] for prefill steps over INT8 caches, on the verify kernel."""
+    t, hq, _ = q.shape
+    hkv, block_size = k_cache.shape[2], k_cache.shape[1]
+    size = GROUPED_ROWS // (hq // hkv)
+    groups, n = prefill_groups(query_start, context_lens, size, q.device)
+    if splits is None:
+        splits = max(1, min(64, -(-GROUPED_MIN_BLOCKS // (n * hkv))))
+    ws = torch.empty(t * hq * splits * 258 + 1, dtype=torch.float32, device=q.device)
+    out = torch.empty(t, hq * 256, dtype=torch.float16, device=q.device)
+    code = lib().seventy_grouped_attention(
+        out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), k_scale.data_ptr(), v_scale.data_ptr(),
+        qkv.data_ptr(), qkv.shape[1], block_tables.data_ptr(), block_tables.shape[1], groups[0].data_ptr(),
+        groups[1].data_ptr(), groups[2].data_ptr(), n, t, size, block_size, hq, hkv, 256, splits,
+        VERIFY_MIN_SPLIT_KEYS, scale, ws.data_ptr(), ws.numel() * 4, _stream(q),
+    )
+    check("grouped_attention", code)
+    return out
+
+
 def flash_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                     block_tables: torch.Tensor, query_start: list[int], query_start_t: torch.Tensor,
                     context_lens_t: torch.Tensor, scale: float, k_scale: torch.Tensor | None = None,
-                    v_scale: torch.Tensor | None = None) -> torch.Tensor:
-    """Gated causal attention output [T, hq * 256] for prefill steps."""
+                    v_scale: torch.Tensor | None = None, context_lens: list[int] | None = None) -> torch.Tensor:
+    """Gated causal attention output [T, hq * 256] for prefill steps. With INT8 caches and the host context lengths,
+    it runs on the verify kernel (grouped_attention); SEVENTY_PREFILL_ATTN=tiles keeps the per-head prefill kernel."""
     t, hq, _ = q.shape
     hkv, block_size = k_cache.shape[2], k_cache.shape[1]
+    if (k_cache.dtype == torch.int8 and context_lens is not None and hq % hkv == 0 and hq // hkv <= GROUPED_ROWS
+            and block_size & (block_size - 1) == 0 and os.environ.get("SEVENTY_PREFILL_ATTN") != "tiles"):
+        return grouped_attention(q, qkv, k_cache, v_cache, block_tables, query_start, context_lens, scale, k_scale,
+                                 v_scale)
     tiles = prefill_tiles(query_start, q.device)
     out = torch.empty(t, hq * 256, dtype=torch.float16, device=q.device)
     ks, vs, kind = _kv_args(k_cache, v_cache, k_scale, v_scale)

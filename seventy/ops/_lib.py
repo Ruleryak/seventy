@@ -31,6 +31,8 @@ SIGNATURES = {
                                        _I32, _I32, _I32, _F32, _P]),
     "seventy_verify_attention": (_I32, [_P, _P, _P, _P, _P, _P, _I32, _P, _I32, _P, _I32, _P, _P, _I32, _I32, _I32,
                                         _I32, _I32, _I32, _I32, _I32, _I32, _F32, _P, _I64, _P]),
+    "seventy_grouped_attention": (_I32, [_P, _P, _P, _P, _P, _P, _P, _I32, _P, _I32, _P, _P, _P, _I32, _I32, _I32,
+                                         _I32, _I32, _I32, _I32, _I32, _I32, _F32, _P, _I64, _P]),
     "seventy_ar_buffer_bytes": (_I64, [_I32, _I64]),
     "seventy_ar_alloc": (_I32, [_I64, ctypes.POINTER(ctypes.c_void_p), _P]),
     "seventy_ar_open": (_I32, [_P, ctypes.POINTER(ctypes.c_void_p)]),

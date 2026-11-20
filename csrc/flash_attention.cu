@@ -1302,8 +1302,8 @@ SEVENTY_API int seventy_verify_attention(void *out, const void *q, const void *k
     if (!legacy && verify_int8_supported(hq, hkv, max_query_len, block_size)) {
       const int code = launch_verify_int8(po, pml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
                                           static_cast<const int8_t *>(v_cache), k_scale, v_scale, block_tables,
-                                          table_width, query_start, context_lens, num_seqs, block_size, hq, hkv,
-                                          splits, min_split_keys, scale, stream);
+                                          table_width, nullptr, query_start, context_lens, num_seqs, block_size, hq,
+                                          hkv, splits, min_split_keys, scale, stream);
       if (code != 0) return code;
     } else if (wide) {
       e = cudaFuncSetAttribute(verify_attention_wmma<int8_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, kWmmaSmem);
@@ -1339,6 +1339,35 @@ SEVENTY_API int seventy_verify_attention(void *out, const void *q, const void *k
           block_size, hq, hkv, splits, max(1, min_split_keys), scale);
     }
   }
+  verify_combine_kernel<<<dim3(tokens, hq), kHead, 0, stream>>>(static_cast<half *>(out), po, pml,
+                                                                static_cast<const half *>(qkv), ld, hq, splits);
+  return launch_status();
+}
+
+SEVENTY_API int seventy_grouped_attention(void *out, const void *q, const void *k_cache, const void *v_cache,
+                                          const float *k_scale, const float *v_scale, const void *qkv, int ld,
+                                          const int *block_tables, int table_width, const int *group_rows,
+                                          const int *group_start, const int *group_context, int num_groups,
+                                          int tokens, int max_group_tokens, int block_size, int hq, int hkv,
+                                          int head_dim, int splits, int min_split_keys, float scale, void *workspace,
+                                          int64_t workspace_bytes, cudaStream_t stream) {
+  using namespace seventy;
+  if (out == nullptr || q == nullptr || k_cache == nullptr || v_cache == nullptr || k_scale == nullptr ||
+      v_scale == nullptr || qkv == nullptr || block_tables == nullptr || group_rows == nullptr ||
+      group_start == nullptr || group_context == nullptr || workspace == nullptr)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (head_dim != kHead || splits < 1 || !verify_int8_supported(hq, hkv, max_group_tokens, block_size))
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  const int64_t need = static_cast<int64_t>(tokens) * hq * splits * (kHead + 2) * static_cast<int64_t>(sizeof(float));
+  if (workspace_bytes < need) return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (num_groups == 0 || tokens == 0) return SEVENTY_OK;
+  auto *po = static_cast<float *>(workspace);
+  auto *pml = po + static_cast<int64_t>(tokens) * hq * splits * kHead;
+  const int code = launch_verify_int8(po, pml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
+                                      static_cast<const int8_t *>(v_cache), k_scale, v_scale, block_tables,
+                                      table_width, group_rows, group_start, group_context, num_groups, block_size, hq,
+                                      hkv, splits, min_split_keys, scale, stream);
+  if (code != 0) return code;
   verify_combine_kernel<<<dim3(tokens, hq), kHead, 0, stream>>>(static_cast<half *>(out), po, pml,
                                                                 static_cast<const half *>(qkv), ld, hq, splits);
   return launch_status();

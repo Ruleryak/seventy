@@ -89,14 +89,15 @@ def test_prep_and_attention_match_reference(lengths, ctx, hkv, kv):
     assert err < 3e-3, err
 
 
-@pytest.mark.parametrize("kv", ["fp16", "int8"])
-@pytest.mark.parametrize("lengths, ctx", [([64], [0]), ([100, 37], [0, 130]), ([200], [70])])
-def test_flash_attention_matches_reference(lengths, ctx, kv):
-    hq, hkv, d, bs = 6, 2, 256, 16
+@pytest.mark.parametrize("kv", ["fp16", "int8", "int8-grouped"])
+@pytest.mark.parametrize("lengths, ctx, hkv", [([64], [0], 2), ([100, 37], [0, 130], 2), ([200], [70], 2),
+                                              ([700, 9, 300], [5000, 0, 63], 1), ([1000], [20000], 1)])
+def test_flash_attention_matches_reference(lengths, ctx, hkv, kv):
+    hq, d, bs = 6, 256, 16
     qkv, starts, bt, k_cache, v_cache, positions = setup(lengths, ctx, hq, hkv, bs, seed=3)
     t = qkv.shape[0]
     ks = vs = None
-    if kv == "int8":
+    if kv != "fp16":
         k_cache, ks = R.quantize_int8(k_cache)
         v_cache, vs = R.quantize_int8(v_cache)
     q = (torch.randn(t, hq, d) * 0.7).half()
@@ -106,7 +107,7 @@ def test_flash_attention_matches_reference(lengths, ctx, kv):
     i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=dev)
     out = kernels.flash_attention(q.to(dev), qkv.to(dev), k_cache.to(dev), v_cache.to(dev), bt.to(dev), starts,
                                   i32(starts), i32(ctx), 1 / math.sqrt(d), None if ks is None else ks.to(dev),
-                                  None if vs is None else vs.to(dev))
+                                  None if vs is None else vs.to(dev), ctx if kv == "int8-grouped" else None)
     err = (out.cpu().float() - ref.float()).abs().max().item()
     assert err < 4e-3, err
 

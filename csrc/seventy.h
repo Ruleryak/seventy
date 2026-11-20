@@ -165,6 +165,21 @@ SEVENTY_API int seventy_verify_attention(void *out, const void *q, const void *k
                                          cudaStream_t stream);
 
 /*
+ * Prefill attention over the INT8 caches on the verify kernel (csrc/verify_int8.cu): the new tokens of each
+ * sequence are cut into groups of at most max_group_tokens (with (hq / hkv) * max_group_tokens <= 48), and every
+ * group runs as a verify sequence of its own. Group g owns token rows [group_start[g], group_start[g + 1]), sees
+ * group_context[g] cached keys before its first token, and reads block-table row group_rows[g]. Workspace and
+ * result as in seventy_verify_attention (tokens = group_start[num_groups]).
+ */
+SEVENTY_API int seventy_grouped_attention(void *out, const void *q, const void *k_cache, const void *v_cache,
+                                          const float *k_scale, const float *v_scale, const void *qkv, int ld,
+                                          const int *block_tables, int table_width, const int *group_rows,
+                                          const int *group_start, const int *group_context, int num_groups,
+                                          int tokens, int max_group_tokens, int block_size, int hq, int hkv,
+                                          int head_dim, int splits, int min_split_keys, float scale, void *workspace,
+                                          int64_t workspace_bytes, cudaStream_t stream);
+
+/*
  * Small-batch tensor-parallel all-reduce over peer GPU memory, fused with the residual add and RMS norm
  * (see csrc/allreduce.cu). seventy_ar_alloc allocates this rank's buffer of seventy_ar_buffer_bytes() bytes and
  * returns its 64-byte CUDA IPC handle; seventy_ar_open maps a peer's handle; seventy_ar_context builds the

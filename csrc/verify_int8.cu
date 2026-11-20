@@ -9,8 +9,10 @@
  * sequence and KV head, on Volta WMMA tiles. It writes the same partial outputs as verify_attention_wmma
  * (csrc/flash_attention.cu), which verify_combine_kernel merges and gates.
  *
- * One block of 16 warps per (split, sequence, KV head), 1 block per SM. Rows: r = token * group + head, as in
- * verify_attention_wmma. Each split takes a range of whole 64-key tiles. Per tile:
+ * One block of 16 warps per (split, sequence, KV head), 1 block per SM; the last sequence's blocks start first. Rows:
+ * r = token * group + head, as in verify_attention_wmma. Each split takes a range of whole 64-key tiles. Prefill
+ * runs the kernel on groups of new tokens as sequences of their own (seventy_grouped_attention): table_rows then
+ * gives each group the block-table row of its sequence. Per tile:
  *   - K and V (64 keys x 256 bytes each) and their scales are in registers from the previous iteration. K goes to
  *     shared memory as exact FP16 integers; V stays INT8 and is converted while its B fragments load, so each V
  *     value is converted once per block.
@@ -115,12 +117,12 @@ __global__ void __launch_bounds__(kThreads, 1)
     verify_int8_kernel(float *__restrict__ partial_o, float *__restrict__ partial_ml, const half *__restrict__ q,
                        const int8_t *__restrict__ k_cache, const int8_t *__restrict__ v_cache,
                        const float *__restrict__ k_scale, const float *__restrict__ v_scale,
-                       const int *__restrict__ block_tables, int table_width, const int *__restrict__ query_start,
-                       const int *__restrict__ context_lens, int block_shift, int hq, int hkv, int splits,
-                       int min_split_keys, float qk_scale) {
+                       const int *__restrict__ block_tables, int table_width, const int *__restrict__ table_rows,
+                       const int *__restrict__ query_start, const int *__restrict__ context_lens, int block_shift,
+                       int hq, int hkv, int splits, int min_split_keys, float qk_scale) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   Smem &s = *reinterpret_cast<Smem *>(smem_raw);
-  const int split = blockIdx.x, b = blockIdx.y, kh = blockIdx.z;
+  const int split = blockIdx.x, b = gridDim.y - 1 - blockIdx.y, kh = blockIdx.z;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int group = hq / hkv;
   const int t0 = query_start[b];
@@ -161,7 +163,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     s.row_sum[tid] = 0.f;
   }
 
-  const int *table = block_tables + static_cast<int64_t>(b) * table_width;
+  const int *table = block_tables + static_cast<int64_t>(table_rows != nullptr ? table_rows[b] : b) * table_width;
   const int last_block = (total - 1) >> block_shift;
   const int bmask = (1 << block_shift) - 1;
   const int my_tok = tid >> 4, chunk = tid & 15;
@@ -410,16 +412,17 @@ bool verify_int8_supported(int hq, int hkv, int max_query_len, int block_size) {
 
 int launch_verify_int8(float *partial_o, float *partial_ml, const half *q, const int8_t *k_cache,
                        const int8_t *v_cache, const float *k_scale, const float *v_scale, const int *block_tables,
-                       int table_width, const int *query_start, const int *context_lens, int num_seqs, int block_size,
-                       int hq, int hkv, int splits, int min_split_keys, float scale, cudaStream_t stream) {
+                       int table_width, const int *table_rows, const int *query_start, const int *context_lens,
+                       int num_seqs, int block_size, int hq, int hkv, int splits, int min_split_keys, float scale,
+                       cudaStream_t stream) {
   cudaError_t e = cudaFuncSetAttribute(verify_int8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem));
   if (e == cudaSuccess) e = cudaFuncSetAttribute(verify_int8_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   if (e != cudaSuccess) return static_cast<int>(e);
   int shift = 0;
   while ((1 << shift) < block_size) ++shift;
   verify_int8_kernel<<<dim3(splits, num_seqs, hkv), kThreads, sizeof(Smem), stream>>>(
-      partial_o, partial_ml, q, k_cache, v_cache, k_scale, v_scale, block_tables, table_width, query_start,
-      context_lens, shift, hq, hkv, splits, max(1, min_split_keys), scale);
+      partial_o, partial_ml, q, k_cache, v_cache, k_scale, v_scale, block_tables, table_width, table_rows,
+      query_start, context_lens, shift, hq, hkv, splits, max(1, min_split_keys), scale);
   return launch_status();
 }
 
