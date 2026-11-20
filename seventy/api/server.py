@@ -22,6 +22,7 @@ from .chat import ChatTemplate, TemplateError
 from .core import EngineClient
 from .detok import IncrementalDecoder
 from .parsing import OutputParser
+from .prefix_tokens import PrefixTokenizer
 
 
 @dataclass
@@ -76,6 +77,7 @@ class StopFilter:
 def create_app(config: ServerConfig) -> FastAPI:
     model_path = Path(config.engine.model)
     tokenizer = Tokenizer.from_file(str(model_path / "tokenizer.json"))
+    prompt_tokens = PrefixTokenizer(tokenizer)
     template = ChatTemplate(model_path)
     defaults = _generation_defaults(model_path)
     client = EngineClient(config.engine)
@@ -156,7 +158,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         text = template.render(multimodal.template_messages(messages) if urls else messages, tools=tools,
                                add_generation_prompt=True, **kwargs)
         thinking = kwargs.get("enable_thinking", True) is not False
-        ids = tokenizer.encode(text, add_special_tokens=False).ids
+        ids = prompt_tokens.encode(text)
         if not urls:
             return ids, thinking, tools, None
         media = [multimodal.Media("image", [multimodal.load_image(u, images_cfg)]) if kind == "image"
