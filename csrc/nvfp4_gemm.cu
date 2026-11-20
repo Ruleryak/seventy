@@ -372,39 +372,66 @@ int launch_mt(int warps, half *out, float *ws, const half *x, const uint4 *wpk, 
   return launch<MT, 2>(out, ws, x, wpk, wsc, alpha, m, n, n_tiles, k, splits, stream);
 }
 
-__global__ void nvfp4_gemm_dequantize_kernel(half *out, const uint4 *wpk, const uint32_t *wsc, const float *alpha,
-                                             int n, int k, int64_t words) {
-  const int64_t g = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (g >= words) return;
+/*
+ * nvfp4_gemm_dequantize_kernel: the FP16 weight [n, k] from the packed GEMM layout, for prefill's dense GEMMs. One
+ * block of 8 warps per (32-column tile, 8 chunks of 32 k): warp w reads chunk w of the 32 columns (one 16-byte word
+ * per lane, coalesced), decodes it into a shared-memory tile [32 columns, 256 k], and then each warp writes 4 rows
+ * of 512 contiguous bytes. E2M1 decoding without a table: the sign at bit 15 and the 3 other bits at bits 11..9 of an
+ * FP16 value give the E2M1 value times 2^-14 exactly (subnormals included), and the scale times 2^14 multiplies it
+ * in FP32, so each result is the same FP32 product, rounded once to FP16.
+ */
+constexpr int kDqChunks = 8;
+constexpr int kDqPitch = kDqChunks * 32 + 8;
+
+__device__ __forceinline__ float e2m1_scaled(uint32_t nibble, float s14) {
+  const uint16_t bits = static_cast<uint16_t>(((nibble & 8u) << 12) | ((nibble & 7u) << 9));
+  return __half2float(__ushort_as_half(bits)) * s14;
+}
+
+__global__ void __launch_bounds__(256) nvfp4_gemm_dequantize_kernel(half *out, const uint4 *wpk, const uint32_t *wsc,
+                                                                    const float *alpha, int n, int k) {
+  __shared__ __align__(16) half tile_s[32 * kDqPitch];
   const int chunks = k / 32;
-  const int lane = static_cast<int>(g & 31);
-  const int64_t tc = g >> 5;
-  const int chunk = static_cast<int>(tc % chunks);
-  const int tile = static_cast<int>(tc / chunks);
-  const int col = tile * 32 + 8 * ((lane >> 2) & 3) + (lane & 3) + 4 * (lane >> 4);
-  if (col >= n) return;
-  const uint4 w = wpk[g];
-  const uint32_t sw = wsc[(static_cast<int64_t>(tile) * (k / 64) + (chunk >> 1)) * 32 + lane] >> ((chunk & 1) * 16);
-  const float a = alpha[col] * (1.0f / 128.0f);
-  const float s0 = e4m3_to_float(sw & 0xffu) * a;
-  const float s1 = e4m3_to_float((sw >> 8) & 0xffu) * a;
-  const uint32_t words4[4] = {w.x, w.y, w.z, w.w};
-  const int pos[8] = {3, 7, 2, 6, 1, 5, 0, 4};
-  uint32_t outw[16];
+  const int tile = blockIdx.x;
+  const int c0 = blockIdx.y * kDqChunks;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int chunk = c0 + warp;
+  const int col_local = 8 * ((lane >> 2) & 3) + (lane & 3) + 4 * (lane >> 4);
+  const int col = tile * 32 + col_local;
+  if (chunk < chunks) {
+    const uint4 w = wpk[(static_cast<int64_t>(tile) * chunks + chunk) * 32 + lane];
+    const uint32_t sw = wsc[(static_cast<int64_t>(tile) * (k / 64) + (chunk >> 1)) * 32 + lane] >> ((chunk & 1) * 16);
+    const float a = (col < n ? alpha[col] : 0.0f) * (1.0f / 128.0f) * 16384.0f;
+    const float s0 = e4m3_to_float(sw & 0xffu) * a;
+    const float s1 = e4m3_to_float((sw >> 8) & 0xffu) * a;
+    const uint32_t words4[4] = {w.x, w.y, w.z, w.w};
+    const int pos[8] = {3, 7, 2, 6, 1, 5, 0, 4};
+    uint32_t outw[16];
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const float s = (j < 2) ? s0 : s1;
+    for (int j = 0; j < 4; ++j) {
+      const float sc = (j < 2) ? s0 : s1;
 #pragma unroll
-    for (int p = 0; p < 4; ++p) {
-      const float lo = e2m1_to_float((words4[j] >> (4 * pos[2 * p])) & 0xfu) * s;
-      const float hi = e2m1_to_float((words4[j] >> (4 * pos[2 * p + 1])) & 0xfu) * s;
-      const half2 h = __floats2half2_rn(lo, hi);
-      outw[j * 4 + p] = *reinterpret_cast<const uint32_t *>(&h);
+      for (int p = 0; p < 4; ++p) {
+        const half2 h = __floats2half2_rn(e2m1_scaled((words4[j] >> (4 * pos[2 * p])) & 0xfu, sc),
+                                          e2m1_scaled((words4[j] >> (4 * pos[2 * p + 1])) & 0xfu, sc));
+        outw[j * 4 + p] = *reinterpret_cast<const uint32_t *>(&h);
+      }
     }
-  }
-  uint4 *dst = reinterpret_cast<uint4 *>(out + static_cast<int64_t>(col) * k + chunk * 32);
+    uint4 *dst = reinterpret_cast<uint4 *>(tile_s + col_local * kDqPitch + warp * 32);
 #pragma unroll
-  for (int q = 0; q < 4; ++q) dst[q] = make_uint4(outw[4 * q], outw[4 * q + 1], outw[4 * q + 2], outw[4 * q + 3]);
+    for (int q = 0; q < 4; ++q) dst[q] = make_uint4(outw[4 * q], outw[4 * q + 1], outw[4 * q + 2], outw[4 * q + 3]);
+  }
+  __syncthreads();
+  const int width = min(kDqChunks, chunks - c0) * 32;
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    const int row = warp * 4 + r;
+    const int gcol = tile * 32 + row;
+    if (gcol >= n) continue;
+    const uint4 *src = reinterpret_cast<const uint4 *>(tile_s + row * kDqPitch);
+    uint4 *g = reinterpret_cast<uint4 *>(out + static_cast<int64_t>(gcol) * k + c0 * 32);
+    for (int v = lane; v < width / 8; v += 32) g[v] = src[v];
+  }
 }
 
 }  // namespace
@@ -417,10 +444,9 @@ SEVENTY_API int seventy_nvfp4_gemm_dequantize(void *out, const void *wpk, const 
       n_padded % 32 || k <= 0 || k % kStepK)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (!aligned(out, 16) || !aligned(wpk, 16) || !aligned(wsc, 4)) return SEVENTY_ERR_MISALIGNED;
-  const int64_t words = static_cast<int64_t>(n_padded / 32) * (k / 32) * 32;
-  nvfp4_gemm_dequantize_kernel<<<static_cast<unsigned>((words + 255) / 256), 256, 0, stream>>>(
-      static_cast<half *>(out), static_cast<const uint4 *>(wpk), static_cast<const uint32_t *>(wsc), alpha, n, k,
-      words);
+  const dim3 grid(n_padded / 32, (k / 32 + kDqChunks - 1) / kDqChunks);
+  nvfp4_gemm_dequantize_kernel<<<grid, 256, 0, stream>>>(static_cast<half *>(out), static_cast<const uint4 *>(wpk),
+                                                         static_cast<const uint32_t *>(wsc), alpha, n, k);
   return launch_status();
 }
 
