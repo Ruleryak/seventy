@@ -2,6 +2,7 @@
 #include <mma.h>
 
 #include "common.cuh"
+#include "verify_int8.cuh"
 
 #include <cstdlib>
 #include <cstring>
@@ -19,7 +20,9 @@
  * (row r: token r / group, head r % group), so every K/V tile load serves the whole group. Each sequence's cache is
  * split into `splits` ranges on the device; blocks write unnormalized partial outputs with their row maxima and
  * sums, which verify_combine_kernel merges and gates. The WMMA kernel takes up to 48 rows; the m8n8k4 kernel
- * (fragment layout: see csrc/nvfp4_gemm.cu) takes larger blocks.
+ * (fragment layout: see csrc/nvfp4_gemm.cu) takes larger blocks. For the INT8 cache with up to 48 rows,
+ * seventy_verify_attention uses verify_int8 (csrc/verify_int8.cu) instead; SEVENTY_VERIFY_ATTN=wmma selects
+ * verify_attention_wmma.
  */
 
 namespace seventy {
@@ -1292,7 +1295,17 @@ SEVENTY_API int seventy_verify_attention(void *out, const void *q, const void *k
   constexpr int kVerifySmem =
       (kTile * kLdQ + kTile * kLdVR + kTile * kLdV) * static_cast<int>(sizeof(half)) + 2 * kTile * 4;
   if (kv_type == 1) {
-    if (wide) {
+    static const bool legacy = [] {
+      const char *v = getenv("SEVENTY_VERIFY_ATTN");
+      return v != nullptr && strcmp(v, "wmma") == 0;
+    }();
+    if (!legacy && verify_int8_supported(hq, hkv, max_query_len, block_size)) {
+      const int code = launch_verify_int8(po, pml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
+                                          static_cast<const int8_t *>(v_cache), k_scale, v_scale, block_tables,
+                                          table_width, query_start, context_lens, num_seqs, block_size, hq, hkv,
+                                          splits, min_split_keys, scale, stream);
+      if (code != 0) return code;
+    } else if (wide) {
       e = cudaFuncSetAttribute(verify_attention_wmma<int8_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, kWmmaSmem);
       if (e != cudaSuccess) return static_cast<int>(e);
       verify_attention_wmma<int8_t><<<grid, kVT, kWmmaSmem, stream>>>(
