@@ -41,45 +41,58 @@ uses the NVFP4 27B model, the DFlash2 drafter and the INT8 KV cache. Thinking is
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/speed-total-dark.svg">
-  <img alt="Total decode speed in tokens per second for 1, 4 and 8 streams at 2K, 32K and 100K tokens of context" src="docs/images/speed-total-light.svg">
+  <img alt="Total decode speed in tokens per second for 1, 4 and 8 streams from 2K to 256K tokens of context" src="docs/images/speed-total-light.svg">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/speed-stream-dark.svg">
-  <img alt="Decode speed per stream in tokens per second for 1, 4 and 8 streams at 2K, 32K and 100K tokens of context" src="docs/images/speed-stream-light.svg">
+  <img alt="Decode speed per stream in tokens per second for 1, 4 and 8 streams from 2K to 256K tokens of context" src="docs/images/speed-stream-light.svg">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/speed-prefill-dark.svg">
-  <img alt="Prefill speed in tokens per second for prompts of 2K, 32K and 100K tokens" src="docs/images/speed-prefill-light.svg">
+  <img alt="Prefill speed in tokens per second for prompts from 2K to 256K tokens" src="docs/images/speed-prefill-light.svg">
 </picture>
 
 - A stream is one request. With 4 streams, 4 requests run at the same time.
 - In the decode tests, the prompt is in the prefix cache. Thus the decode tests measure only the generation of tokens.
 - In the prefill test, the prompt is not in the cache.
-- The bar at a point shows the range of the runs.
-- Contexts longer than 100K tokens are not measured yet.
+- Each test runs two times. The bar at a point shows the range of the runs. The speed of one stream changes most
+  from run to run, because the number of draft tokens that the model accepts changes with the text.
+- To measure your own GPUs, see "Speed charts" in [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
 <details>
 <summary>The numbers in tables</summary>
 
 | Context (tokens) | Streams | Tokens/s per stream | Tokens/s in total |
 |---:|---:|---:|---:|
-| 2,000 | 1 | 237 | 237 |
-| 2,000 | 4 | 190 | 758 |
-| 2,000 | 8 | 97 | 778 |
-| 32,000 | 1 | 158 | 158 |
-| 32,000 | 4 | 108 | 432 |
-| 32,000 | 8 | 62 | 497 |
-| 100,000 | 1 | 132 | 132 |
-| 100,000 | 4 | 76 | 304 |
-| 100,000 | 8 | 42 | 332 |
+| 2,000 | 1 | 195 | 195 |
+| 2,000 | 4 | 181 | 731 |
+| 2,000 | 8 | 110 | 859 |
+| 32,000 | 1 | 165 | 165 |
+| 32,000 | 4 | 120 | 468 |
+| 32,000 | 8 | 68 | 541 |
+| 100,000 | 1 | 133 | 134 |
+| 100,000 | 4 | 80 | 311 |
+| 100,000 | 8 | 44 | 345 |
+| 128,000 | 1 | 183 | 183 |
+| 128,000 | 4 | 70 | 277 |
+| 128,000 | 8 | 36 | 280 |
+| 192,000 | 1 | 131 | 131 |
+| 192,000 | 4 | 64 | 244 |
+| 192,000 | 8 | 28 | 215 |
+| 256,000 | 1 | 110 | 110 |
+| 256,000 | 4 | 44 | 175 |
+| 256,000 | 8 | 23 | 180 |
 
 | Prompt (tokens) | Prefill tokens/s | Time to the first token |
 |---:|---:|---:|
-| 2,000 | 2,829 | 0.7 s |
-| 32,000 | 3,156 | 10.1 s |
-| 100,000 | 2,256 | 44.3 s |
+| 2,000 | 2,821 | 0.7 s |
+| 32,000 | 3,268 | 9.8 s |
+| 100,000 | 2,485 | 40.2 s |
+| 128,000 | 2,256 | 56.7 s |
+| 192,000 | 1,871 | 102.6 s |
+| 256,000 | 1,601 | 159.9 s |
 
 </details>
 
