@@ -397,6 +397,14 @@ def dense_gemm(x: torch.Tensor, w: "DenseWeight | DenseWeightFP8", out_fp32: boo
     small = m <= 16
     warps = 8 if small else 4
     splits = max(1, min(round((1088 if small else 900) / tiles), max(1, (k // 64) // (4 if small else 8))))
+    if not isinstance(w, DenseWeightFP8) and tiles >= 100 and k // 64 >= 8:
+        splits = 1
+        if tiles >= 1000:
+            warps = 8 if small else 2
+        elif m > 32 and tiles >= 200:
+            splits = max(1, min(round(900 / tiles), max(1, (k // 64) // 8)))
+        else:
+            warps = 2 if small or tiles >= 200 else 4
     need = lib().seventy_dense_gemm_workspace(m, w.n_padded, splits)
     ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=x.device) if need else None
     out = torch.empty(m, w.n, dtype=torch.float32 if out_fp32 else torch.float16, device=x.device)

@@ -9,6 +9,11 @@
  *
  * Weights are repacked at load (seventy.ops.kernels.pack_dense): [n_padded / 32, k / 64, 32 lanes, 64 halves]; a
  * lane's 128 bytes are the 64 k values of its column, so a warp reads 4 KB of contiguous weights per step.
+ *
+ * With one split, dense_gemm_wk_kernel runs instead (the structure of nvfp4_gemm_wk_kernel, csrc/nvfp4_gemm.cu):
+ * one block of W warps per 32-column tile, the warps split k into contiguous ranges of 64-steps, each warp stages its
+ * own activations and prefetches the next step's weights and activations into registers, and the warps add their
+ * partial tiles in shared memory at the end: no workspace, no reduce kernel and no block barrier in the main loop.
  */
 
 namespace seventy {
@@ -278,9 +283,124 @@ __global__ void dense_reduce_kernel(void *out, int out_fp32, const float *ws, in
   else static_cast<half *>(out)[idx] = __float2half_rn(s);
 }
 
+template <int MT, int W>
+__global__ void __launch_bounds__(W * 32) dense_gemm_wk_kernel(void *out, int out_fp32, const half *x,
+                                                               const uint4 *wpk, int m, int n, int k,
+                                                               const float *row_scale) {
+  constexpr int kRows = MT * 8;
+  constexpr int kLoads = kRows * 8 / 32;
+  extern __shared__ uint4 dwk_smem[];
+  auto stage = reinterpret_cast<uint4 (*)[kRows * kRowStride]>(dwk_smem);
+  float *red = reinterpret_cast<float *>(dwk_smem);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int ksteps = k / kStepK;
+  const int s0 = warp * ksteps / W;
+  const int s1 = (warp + 1) * ksteps / W;
+  const int steps = s1 - s0;
+  const int quad = (lane >> 2) & 3;
+  const int idx = (lane & 3) + ((lane >> 4) << 2);
+  const uint4 *wp = wpk + (static_cast<int64_t>(tile) * ksteps + s0) * 32 * 8 + lane * 8;
+  const uint4 *xbase = reinterpret_cast<const uint4 *>(x) + s0 * 8 + (lane & 7);
+  int xrow[kLoads];
+#pragma unroll
+  for (int l = 0; l < kLoads; ++l) xrow[l] = min((lane >> 3) + 4 * l, m - 1) * (k / 8);
+  const int dst0 = (lane >> 3) * kRowStride + (lane & 7);
+
+  float acc[MT][8];
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[t][j] = 0.0f;
+
+  uint4 *mine = stage[warp];
+  uint4 ar[kLoads];
+  uint4 wb[8];
+  if (steps > 0) {
+#pragma unroll
+    for (int l = 0; l < kLoads; ++l) mine[dst0 + 4 * kRowStride * l] = __ldg(xbase + xrow[l]);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) wb[i] = __ldg(wp + i);
+  }
+  __syncwarp();
+  for (int s = 0; s < steps; ++s) {
+    const bool more = s + 1 < steps;
+    uint4 cur[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) cur[i] = wb[i];
+    if (more) {
+#pragma unroll
+      for (int l = 0; l < kLoads; ++l) ar[l] = __ldg(xbase + xrow[l] + (s + 1) * 8);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) wb[i] = __ldg(wp + static_cast<int64_t>(s + 1) * 32 * 8 + i);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+#pragma unroll
+      for (int t = 0; t < MT; ++t) {
+        const uint4 a = mine[(t * 8 + idx) * kRowStride + i];
+        mma_8x8x4(acc[t], a.x, a.y, cur[i].x, cur[i].y);
+        mma_8x8x4(acc[t], a.z, a.w, cur[i].z, cur[i].w);
+      }
+    }
+    __syncwarp();
+    if (more) {
+#pragma unroll
+      for (int l = 0; l < kLoads; ++l) mine[dst0 + 4 * kRowStride * l] = ar[l];
+    }
+    __syncwarp();
+  }
+
+  __syncthreads();
+  if (warp > 0) {
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) red[((warp - 1) * kRows * 8 + t * 64 + j * 8) * 4 + lane] = acc[t][j];
+  }
+  __syncthreads();
+  if (warp > 0) return;
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float v = acc[t][j];
+#pragma unroll
+      for (int w = 0; w < W - 1; ++w) v += red[(w * kRows * 8 + t * 64 + j * 8) * 4 + lane];
+      const int row = t * 8 + (idx & 1) + 2 * ((j >> 1) & 1) + 4 * (idx >> 2);
+      const int col = tile * 32 + quad * 8 + (j & 1) + 2 * ((idx >> 1) & 1) + 4 * (j >> 2);
+      if (row >= m || col >= n) continue;
+      if (row_scale != nullptr) v *= row_scale[row];
+      if (out_fp32) static_cast<float *>(out)[static_cast<int64_t>(row) * n + col] = v;
+      else static_cast<half *>(out)[static_cast<int64_t>(row) * n + col] = __float2half_rn(v);
+    }
+}
+
+template <int MT, int W>
+void launch_wk(void *out, int out_fp32, const half *x, const uint4 *wpk, int m, int n, int n_tiles, int k,
+               const float *row_scale, cudaStream_t stream) {
+  constexpr int kBytes = W * MT * 8 * kRowStride * static_cast<int>(sizeof(uint4));
+  static_assert(kBytes >= (W - 1) * MT * 8 * 32 * static_cast<int>(sizeof(float)), "reduction must fit the staging area");
+  if constexpr (kBytes > 48 * 1024) {
+    static bool configured = false;
+    if (!configured) {
+      cudaFuncSetAttribute(dense_gemm_wk_kernel<MT, W>, cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes);
+      configured = true;
+    }
+  }
+  dense_gemm_wk_kernel<MT, W><<<n_tiles, W * 32, kBytes, stream>>>(out, out_fp32, x, wpk, m, n, k, row_scale);
+}
+
 template <int MT>
 int launch(int warps, void *out, int out_fp32, float *ws, const half *x, const uint4 *wpk, int m, int n, int n_tiles,
            int k, int splits, const float *row_scale, cudaStream_t stream) {
+  if (splits == 1 && k / kStepK >= warps) {
+    if (warps >= 8) launch_wk<MT, 8>(out, out_fp32, x, wpk, m, n, n_tiles, k, row_scale, stream);
+    else if (warps >= 4) launch_wk<MT, 4>(out, out_fp32, x, wpk, m, n, n_tiles, k, row_scale, stream);
+    else launch_wk<MT, 2>(out, out_fp32, x, wpk, m, n, n_tiles, k, row_scale, stream);
+    return 1;
+  }
   const int ksteps = k / kStepK;
   const int per = (ksteps + splits - 1) / splits;
   const int used = (ksteps + per - 1) / per;

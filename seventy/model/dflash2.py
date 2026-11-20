@@ -136,12 +136,19 @@ class Drafter:
             self.succ = _to_dtype(ckpt.tensor("candidate_selector.successor_codebook"), dtype).to(device)
         self.kv_all = torch.cat([layer.kv_w for layer in self.layers])
         self.cand_head = None
+        self.fused = (self.device.type == "cuda" and dtype == torch.float16 and cfg.head_dim == 128
+                      and os.environ.get("SEVENTY_DRAFTER_FUSED", "1") != "0")
         if self.device.type == "cuda" and dtype == torch.float16:
             from ..ops.kernels import DenseWeight, DenseWeightFP8
 
             for layer in self.layers:
+                if self.fused:
+                    layer.q_cols = layer.q.shape[0]
+                    layer.qkv = DenseWeight(torch.cat((layer.q, layer.kv_w)))
+                    layer.q = layer.kv_w = None
                 for name in ("q", "kv_w", "o", "gate_up", "down"):
-                    setattr(layer, name, DenseWeight(getattr(layer, name)))
+                    if getattr(layer, name) is not None:
+                        setattr(layer, name, DenseWeight(getattr(layer, name)))
                 layer.conv = {side: (base, DenseWeight(proj)) for side, (base, proj) in layer.conv.items()}
             self.fc, self.kv_all, self.sel_hidden = DenseWeight(self.fc), DenseWeight(self.kv_all), DenseWeight(self.sel_hidden)
             if self.fp8 and target.lm_head_packed is not None:
@@ -154,8 +161,6 @@ class Drafter:
         self.inv_freq = (1.0 / (cfg.rope_theta ** (torch.arange(0, half, dtype=torch.float64) * 2 / cfg.head_dim))
                          ).float().to(device)
         self.groups = cfg.hidden // cfg.group_size
-        self.fused = (self.device.type == "cuda" and dtype == torch.float16 and cfg.head_dim == 128
-                      and os.environ.get("SEVENTY_DRAFTER_FUSED", "1") != "0")
 
     def ring_bytes_per_slot(self) -> int:
         cfg = self.cfg
@@ -257,7 +262,8 @@ class Drafter:
         if self.fused:
             from ..ops import kernels
 
-            q16 = kernels.drafter_qk(self._mm(h, layer.q), self._mm(h, layer.kv_w), layer.q_norm, layer.k_norm,
+            qkv = self._mm(h, layer.qkv)
+            q16 = kernels.drafter_qk(qkv[:, : layer.q_cols], qkv[:, layer.q_cols :], layer.q_norm, layer.k_norm,
                                      positions, slots.repeat_interleave(blk), self.inv_freq, self.k_ring[li],
                                      self.v_ring[li], layer.heads, layer.kv, cfg.eps)
             o = kernels.drafter_attention(q16, self.k_ring[li], self.v_ring[li], slots, ends - blk, blk, cfg.window,
