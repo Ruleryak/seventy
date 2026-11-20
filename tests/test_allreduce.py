@@ -67,7 +67,14 @@ def run_rank(rank, world, port, queue):
         check("ar_norm_2shot", lib().seventy_ar_norm_2shot(ar.ctx, out_b.data_ptr(), res_b.data_ptr(), x.data_ptr(),
                                                            wd.data_ptr(), rows, 5120, 1e-6, it % 2, stream))
         if it % 5 == 0:
-            ar.reduce(x.float())
+            base = torch.randn(rows, 5120, generator=g).to(dev)
+            got = ar.reduce(base * (rank + 1))
+            want = base * 1
+            for p in range(1, world):
+                want = want + base * (p + 1)
+            if not torch.equal(got, want):
+                errors.append(f"repeat {it}: FP32 all-reduce differs from the rank-order sum")
+                break
         if not torch.equal(out_b, out_a):
             errors.append(f"repeat {it}: two-shot out differs from one-shot")
             break

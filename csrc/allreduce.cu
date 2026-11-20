@@ -46,11 +46,14 @@ struct ArContext {
  * slots until no half is 0x7f7f, then writes 0x7f7f back. A payload half equal to 0x7f7f is sent as the NaN 0x7e00.
  * There is no separate flag store and no fence, so a call costs one NVLink write latency per phase. This is the
  * protocol of 1Cat-vLLM's sm70_cross_device_reduce_1stage_push (Apache-2.0), as the lab's fused all-reduce and
- * Gemma RMS norm kernel used it. The push slots have their own region of the buffer (after the flag-protocol data
- * areas), filled with 0x7f7f by seventy_ar_alloc, and every row block has its own epoch bit (push_epochs, local),
- * so the two halves of the region alternate per row from call to call.
+ * Gemma RMS norm kernel used it. FP32 data (ar_sum_push_kernel) uses whole 32-bit words: empty is 0x7f7f7f7f and a
+ * payload word equal to it is sent as 0x7f7f7f7e. The push slots have their own region of the buffer (after the
+ * flag-protocol data areas), filled with 0x7f by seventy_ar_alloc, and every row block has its own epoch bit
+ * (push_epochs, local), so the two halves of the region alternate per row from call to call. Row b of a slot always
+ * takes the bytes [b * dim * 4, (b + 1) * dim * 4), for FP16 and FP32 data alike, so no call can write into another
+ * row's bytes.
  */
-__host__ __device__ inline int64_t push_slot_bytes(int64_t slot_bytes) { return slot_bytes / 2; }
+__host__ __device__ inline int64_t push_slot_bytes(int64_t slot_bytes) { return slot_bytes; }
 
 __host__ __device__ inline int64_t push_p1_offset(int world, int64_t slot_bytes) {
   return kSignalBytes + 2 * static_cast<int64_t>(world) * slot_bytes;
@@ -101,6 +104,26 @@ __device__ __forceinline__ uint4 wait_full(const void *p) {
   do {
     v = ld_vol(p);
   } while (is_empty(v));
+  return v;
+}
+
+__device__ __forceinline__ bool is_empty32(const uint4 &v) {
+  return v.x == kEmpty || v.y == kEmpty || v.z == kEmpty || v.w == kEmpty;
+}
+
+__device__ __forceinline__ uint4 escape32(uint4 v) {
+  v.x = v.x == kEmpty ? kEmpty - 1 : v.x;
+  v.y = v.y == kEmpty ? kEmpty - 1 : v.y;
+  v.z = v.z == kEmpty ? kEmpty - 1 : v.z;
+  v.w = v.w == kEmpty ? kEmpty - 1 : v.w;
+  return v;
+}
+
+__device__ __forceinline__ uint4 wait_full32(const void *p) {
+  uint4 v;
+  do {
+    v = ld_vol(p);
+  } while (is_empty32(v));
   return v;
 }
 
@@ -386,11 +409,12 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_kernel(ArContext ctx, h
   const int home = b / per;
   const bool mine = home == ctx.rank;
   const int64_t row_off = static_cast<int64_t>(b) * vec_per_row;
+  const int64_t slot_off = static_cast<int64_t>(b) * (dim / 4);
   const uint4 empty = make_uint4(kEmpty, kEmpty, kEmpty, kEmpty);
 
   {
     const uint4 *src = reinterpret_cast<const uint4 *>(x) + row_off;
-    uint4 *dst = reinterpret_cast<uint4 *>(ctx.buffers[home] + p1) + ctx.rank * slot_vecs + row_off;
+    uint4 *dst = reinterpret_cast<uint4 *>(ctx.buffers[home] + p1) + ctx.rank * slot_vecs + slot_off;
 #pragma unroll
     for (int j = 0; j < kVecs; ++j) {
       const int i = threadIdx.x + j * kThreads;
@@ -400,7 +424,7 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_kernel(ArContext ctx, h
   uint4 *res = residual != nullptr ? reinterpret_cast<uint4 *>(residual) + row_off : nullptr;
   uint4 *dst = reinterpret_cast<uint4 *>(out) + row_off;
   if (mine) {
-    uint4 *local = reinterpret_cast<uint4 *>(ctx.buffers[ctx.rank] + p1) + row_off;
+    uint4 *local = reinterpret_cast<uint4 *>(ctx.buffers[ctx.rank] + p1) + slot_off;
     float r[kVecs][8];
     uint4 rnew[kVecs];
     float sumsq = 0.0f;
@@ -448,13 +472,13 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_kernel(ArContext ctx, h
       const uint4 o_esc = escape(o16), r_esc = escape(rnew[j]);
       for (int p = 0; p < ctx.world; ++p) {
         if (p == ctx.rank) continue;
-        uint4 *g = reinterpret_cast<uint4 *>(ctx.buffers[p] + p2) + row_off;
+        uint4 *g = reinterpret_cast<uint4 *>(ctx.buffers[p] + p2) + slot_off;
         st_vol(g + i, o_esc);
         if (gather_residual) st_vol(g + slot_vecs + i, r_esc);
       }
     }
   } else {
-    uint4 *g = reinterpret_cast<uint4 *>(ctx.buffers[ctx.rank] + p2) + row_off;
+    uint4 *g = reinterpret_cast<uint4 *>(ctx.buffers[ctx.rank] + p2) + slot_off;
 #pragma unroll
     for (int j = 0; j < kVecs; ++j) {
       const int i = threadIdx.x + j * kThreads;
@@ -466,6 +490,60 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_kernel(ArContext ctx, h
         st_vol(g + slot_vecs + i, empty);
         if (res != nullptr) res[i] = rv;
       }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) ctx.push_epochs[b] += 1;
+}
+
+/*
+ * ar_sum_push_kernel: two-shot FP32 all-reduce of [rows, dim] on the push protocol (FP32 words), one block per row
+ * b, same home ranks as ar_norm_push_kernel. The home rank adds the world partial rows in rank order, as
+ * ar_sum_f32_kernel does, so the result is bitwise the same, and sends the sum to every other rank.
+ */
+__global__ void __launch_bounds__(kThreads) ar_sum_push_kernel(ArContext ctx, float *out, const float *x, int rows,
+                                                               int dim) {
+  const int b = blockIdx.x;
+  const uint32_t parity = ctx.push_epochs[b] & 1u;
+  const int64_t ps = push_slot_bytes(ctx.slot_bytes);
+  const int64_t p1 = push_p1_offset(ctx.world, ctx.slot_bytes) + parity * ctx.world * ps;
+  const int64_t p2 = push_p2_offset(ctx.world, ctx.slot_bytes) + parity * 2 * ps;
+  const int vecs = dim / 4;
+  const int64_t slot_vecs = ps / static_cast<int64_t>(sizeof(uint4));
+  const int per = (rows + ctx.world - 1) / ctx.world;
+  const int home = b / per;
+  const int64_t off = static_cast<int64_t>(b) * vecs;
+  const uint4 empty = make_uint4(kEmpty, kEmpty, kEmpty, kEmpty);
+  const uint4 *src = reinterpret_cast<const uint4 *>(x) + off;
+  uint4 *dst = reinterpret_cast<uint4 *>(out) + off;
+  {
+    uint4 *slot = reinterpret_cast<uint4 *>(ctx.buffers[home] + p1) + ctx.rank * slot_vecs + off;
+    for (int i = threadIdx.x; i < vecs; i += kThreads) st_vol(slot + i, escape32(src[i]));
+  }
+  if (home == ctx.rank) {
+    uint4 *local = reinterpret_cast<uint4 *>(ctx.buffers[ctx.rank] + p1) + off;
+    for (int i = threadIdx.x; i < vecs; i += kThreads) {
+      float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      for (int p = 0; p < ctx.world; ++p) {
+        const uint4 v = wait_full32(local + p * slot_vecs + i);
+        acc.x += __uint_as_float(v.x);
+        acc.y += __uint_as_float(v.y);
+        acc.z += __uint_as_float(v.z);
+        acc.w += __uint_as_float(v.w);
+      }
+      for (int p = 0; p < ctx.world; ++p) st_vol(local + p * slot_vecs + i, empty);
+      const uint4 sum = make_uint4(__float_as_uint(acc.x), __float_as_uint(acc.y), __float_as_uint(acc.z),
+                                   __float_as_uint(acc.w));
+      dst[i] = sum;
+      const uint4 sum_esc = escape32(sum);
+      for (int p = 0; p < ctx.world; ++p)
+        if (p != ctx.rank) st_vol(reinterpret_cast<uint4 *>(ctx.buffers[p] + p2) + off + i, sum_esc);
+    }
+  } else {
+    uint4 *g = reinterpret_cast<uint4 *>(ctx.buffers[ctx.rank] + p2) + off;
+    for (int i = threadIdx.x; i < vecs; i += kThreads) {
+      dst[i] = wait_full32(g + i);
+      st_vol(g + i, empty);
     }
   }
   __syncthreads();
@@ -601,8 +679,14 @@ SEVENTY_API int seventy_ar_sum_f32(void *ctx_ptr, float *out, const float *x, in
   if (static_cast<int64_t>(rows) * dim * static_cast<int64_t>(sizeof(float)) > ctx->slot_bytes)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (!aligned(x, 16) || !aligned(out, 16)) return SEVENTY_ERR_MISALIGNED;
-  const int blocks = rows < kMaxBlocks ? rows : kMaxBlocks;
-  ar_sum_f32_kernel<<<blocks, kThreads, 0, stream>>>(*ctx, out, x, rows, dim);
+  static const bool flags = [] {
+    const char *v = getenv("SEVENTY_AR");
+    return v != nullptr && strcmp(v, "flags") == 0;
+  }();
+  if (!flags && rows <= kMaxBlocks)
+    ar_sum_push_kernel<<<rows, kThreads, 0, stream>>>(*ctx, out, x, rows, dim);
+  else
+    ar_sum_f32_kernel<<<rows < kMaxBlocks ? rows : kMaxBlocks, kThreads, 0, stream>>>(*ctx, out, x, rows, dim);
   return launch_status();
 }
 
@@ -621,7 +705,7 @@ SEVENTY_API int seventy_ar_norm_2shot(void *ctx_ptr, void *out, void *residual, 
     const char *v = getenv("SEVENTY_AR");
     return v != nullptr && strcmp(v, "flags") == 0;
   }();
-  if (flags || static_cast<int64_t>(rows) * dim * static_cast<int64_t>(sizeof(half)) > push_slot_bytes(ctx->slot_bytes))
+  if (flags || static_cast<int64_t>(rows) * dim * static_cast<int64_t>(sizeof(float)) > push_slot_bytes(ctx->slot_bytes))
     ar_norm_2shot_kernel<<<rows, kThreads, 0, stream>>>(*ctx, static_cast<half *>(out),
                                                         static_cast<half *>(residual), static_cast<const half *>(x),
                                                         weight, rows, dim, eps, gather_residual);
