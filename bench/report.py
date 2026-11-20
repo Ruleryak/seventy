@@ -6,7 +6,7 @@
 
 Each file in bench/results/ (or the folder that --results gives) holds the speed of one release:
 
-    {"format": 1, "release": "1.0.0", "name": "1.0.0", "note": "...", "commit": "079485e",
+    {"format": 1, "method": 2, "release": "1.0.0", "name": "1.0.0", "note": "...", "commit": "079485e",
      "date": "2026-11-19T09:15Z", "setup": {...},
      "decode": [{"context": 2000, "streams": 4, "per_stream": [224.2, 154.8], "total": [896.6, 619.3],
                  "ttft_cached": [0.141, 0.134]}, ...],
@@ -15,10 +15,13 @@ Each file in bench/results/ (or the folder that --results gives) holds the speed
 decode: requests of `context` prompt tokens that are already in the prefix cache, `streams` of them at the same time.
 per_stream is the output tokens/s of one request (first to last token), total the output tokens/s of all requests
 together while all of them run; each list has one value per run. prefill: prompt tokens/s of one cold prompt.
+method: how the numbers were measured. 2 is bench/sweep.py. A file without it is method 1 (earlier sweeps, where
+total is the sum of the per-stream rates). A release is compared only with earlier releases of the same method: the
+change, the lighter lines and the best value so far of each figure.
 
---markdown prints the tables of the newest release for the README. --images writes the README charts of the newest release (sorted by date), light and dark, with the release before
-it as lighter lines. --html writes one self-contained page with every release; each release is drawn over the one
-before it.
+--markdown prints the tables of the newest release for the README. --images writes the README charts of the newest
+release (sorted by date), light and dark, with the release before it (same method) as lighter lines. --html writes
+one self-contained page with every release; each release is drawn over the one before it.
 """
 
 from __future__ import annotations
@@ -54,6 +57,26 @@ def load(folder: Path) -> list[dict]:
     """All results files of a folder, oldest release first."""
     runs = [json.loads(p.read_text()) for p in sorted(folder.glob("*.json"))]
     return sorted(runs, key=lambda r: r["date"])
+
+
+def method(run: dict) -> int:
+    return int(run.get("method", 1))
+
+
+def earlier(runs: list[dict], i: int) -> list[dict]:
+    """The releases before runs[i] that were measured with the same method, oldest first."""
+    return [r for r in runs[:i] if method(r) == method(runs[i])]
+
+
+def best_points(runs: list[dict], kind: str) -> dict:
+    """Best mean of each point of a chart over runs: {(series, context): (value, release name)}."""
+    best = {}
+    for r in runs:
+        for s, pts in series(r, kind).items():
+            for c, m, *_ in pts:
+                if (s, c) not in best or m > best[(s, c)][0]:
+                    best[(s, c)] = (m, r["name"])
+    return best
 
 
 def k_label(tokens: int) -> str:
@@ -96,7 +119,8 @@ def text(x, y, s, pal, size=13, fill="ink2", anchor="start", weight=400, halo=Fa
             f'text-anchor="{anchor}"{extra}>{html.escape(s)}</text>')
 
 
-def chart(kind: str, run: dict, prev: dict | None, theme: str, width: int, height: int, titled: bool) -> str:
+def chart(kind: str, run: dict, prev: dict | None, theme: str, width: int, height: int, titled: bool,
+          best: dict | None = None) -> str:
     """One chart as an SVG document: the release's points and lines, the previous release as lighter lines, the
     range of the runs as a vertical bar at each point, and the context lengths that were not measured as a band."""
     pal = THEMES[theme]
@@ -179,6 +203,9 @@ def chart(kind: str, run: dict, prev: dict | None, theme: str, width: int, heigh
                     lines.append(f"{n} runs: {lo:,.0f} to {hi:,.0f}")
                 if c in before and prev:
                     lines.append(f"{prev['name']}: {before[c]:,.0f} ({(m / before[c] - 1) * 100:+.0f}%)")
+                if best and (s, c) in best:
+                    bv, bn = best[(s, c)]
+                    lines.append("Best so far" if bn == run["name"] else f"Best so far: {bv:,.0f} ({bn})")
                 hits.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="13" fill="transparent" tabindex="0" '
                             f'data-tip="{html.escape("|".join(lines))}"/>')
     if len(cur) > 1:
@@ -220,7 +247,8 @@ def chart(kind: str, run: dict, prev: dict | None, theme: str, width: int, heigh
 def write_images(runs: list[dict], folder: Path) -> list[Path]:
     """README charts of the newest release, light and dark: speed-<chart>-<theme>.svg."""
     folder.mkdir(parents=True, exist_ok=True)
-    run, prev = runs[-1], (runs[-2] if len(runs) > 1 else None)
+    same = earlier(runs, len(runs) - 1)
+    run, prev = runs[-1], (same[-1] if same else None)
     paths = []
     for kind in CHARTS:
         for theme in ("light", "dark"):
@@ -271,8 +299,20 @@ def slug(run: dict) -> str:
     return "run-" + "".join(ch if ch.isalnum() else "-" for ch in run["release"].lower())
 
 
-def run_block(run: dict, prev: dict | None, latest: bool) -> str:
-    """The section of the page for one release: finding, figures, charts and tables."""
+def best_label(value: float | None, best: tuple | None, name: str) -> str:
+    """'Best so far' when this release holds the best value, else the best value and its release."""
+    if value is None or best is None:
+        return ""
+    if best[1] == name or value >= best[0] * 0.995:
+        return '<span class="best">★ best so far</span>'
+    return f'<span class="was">{best[0]:,.0f}</span> <small>{html.escape(best[1])}</small>'
+
+
+def run_block(run: dict, prev: dict | None, history: list[dict], latest: bool) -> str:
+    """The section of the page for one release: finding, figures, charts and tables. history: the earlier releases
+    of the same method (prev is the newest of them)."""
+    pool = history + [run]
+    b_total, b_stream, b_prefill = (best_points(pool, k) for k in ("total", "stream", "prefill"))
     dec = run.get("decode", [])
     ctxs = sorted({c["context"] for c in dec})
     totals = [(statistics.mean(c["total"]), c) for c in dec]
@@ -283,59 +323,88 @@ def run_block(run: dict, prev: dict | None, latest: bool) -> str:
     s = run.get("setup", {})
     vs = f"vs {html.escape(prev['name'])}" if prev else ""
 
-    def tile(label, value, before, unit):
+    def tile(label, value, before, unit, top):
         if value is None:
             return ""
         delta = change(value, before)
+        record = ""
+        if top is not None and history:
+            record = ('<div class="tb"><span class="best">★ best so far</span></div>'
+                      if top[1] == run["name"] or value >= top[0] * 0.995 else
+                      f'<div class="tb">best so far {top[0]:,.0f} ({html.escape(top[1])})</div>')
         return (f'<div class="tile"><div class="tl">{label}</div><div class="tv">{value:,.0f}<small> {unit}'
-                f'</small></div><div class="td">{delta} {vs if delta else ""}</div></div>')
+                f'</small></div><div class="td">{delta} {vs if delta else ""}</div>{record}</div>')
 
     tiles = [
-        tile(f"One stream at {lo_ctx:,} tokens", one_short, cell(prev, lo_ctx, 1, "per_stream"), "tok/s"),
-        tile(f"One stream at {hi_ctx:,} tokens", one_long, cell(prev, hi_ctx, 1, "per_stream"), "tok/s"),
+        tile(f"One stream at {lo_ctx:,} tokens", one_short, cell(prev, lo_ctx, 1, "per_stream"), "tok/s",
+             b_stream.get((1, lo_ctx))),
+        tile(f"One stream at {hi_ctx:,} tokens", one_long, cell(prev, hi_ctx, 1, "per_stream"), "tok/s",
+             b_stream.get((1, hi_ctx))),
         tile(f"Most in total: {stream_name(best_cell['streams'])} at {best_cell['context']:,}" if best_cell else "",
              best if best_cell else None,
-             cell(prev, best_cell["context"], best_cell["streams"], "total") if best_cell else None, "tok/s"),
+             cell(prev, best_cell["context"], best_cell["streams"], "total") if best_cell else None, "tok/s",
+             b_total.get((best_cell["streams"], best_cell["context"])) if best_cell else None),
         tile(f"Prefill of one {pf_ctx:,}-token prompt", prefill_at(run, pf_ctx), prefill_at(prev, pf_ctx),
-             "tok/s"),
+             "tok/s", next(iter(v for (_, c), v in b_prefill.items() if c == pf_ctx), None)),
     ]
     rows = []
     for c in dec:
         t, p = statistics.mean(c["total"]), statistics.mean(c["per_stream"])
-        rows.append(f'<tr><td>{c["context"]:,}</td><td>{c["streams"]}</td><td>{p:,.0f}</td><td>{t:,.0f}</td>'
+        key = (c["streams"], c["context"])
+        rows.append(f'<tr><td>{c["context"]:,}</td><td>{c["streams"]}</td><td>{p:,.0f}</td>'
+                    + (f'<td>{best_label(p, b_stream.get(key), run["name"])}</td>' if history else "")
+                    + f'<td>{t:,.0f}</td>'
                     + (f'<td>{change(t, cell(prev, c["context"], c["streams"], "total"))}</td>' if prev else "")
+                    + (f'<td>{best_label(t, b_total.get(key), run["name"])}</td>' if history else "")
                     + f'<td>{statistics.mean(c.get("ttft_cached") or [0]):.2f} s</td></tr>')
-    prow = [f'<tr><td>{c["context"]:,}</td><td>{statistics.mean(c["tokens_per_s"]):,.0f}</td>'
-            + (f'<td>{change(statistics.mean(c["tokens_per_s"]), prefill_at(prev, c["context"]))}</td>'
-               if prev else "") + f'<td>{c["context"] / statistics.mean(c["tokens_per_s"]):.1f} s</td></tr>'
-            for c in run.get("prefill", [])]
+    prow = []
+    for c in run.get("prefill", []):
+        v = statistics.mean(c["tokens_per_s"])
+        top = next(iter(x for (_, cc), x in b_prefill.items() if cc == c["context"]), None)
+        prow.append(f'<tr><td>{c["context"]:,}</td><td>{v:,.0f}</td>'
+                    + (f'<td>{change(v, prefill_at(prev, c["context"]))}</td>' if prev else "")
+                    + (f'<td>{best_label(v, top, run["name"])}</td>' if history else "")
+                    + f'<td>{c["context"] / v:.1f} s</td></tr>')
+
+    bests = {"total": b_total, "stream": b_stream, "prefill": b_prefill}
 
     def fig(kind, wide):
-        return (f'<div class="fig"><div class="w">{chart(kind, run, prev, "css", wide, 380, False)}</div>'
-                f'<div class="n">{chart(kind, run, prev, "css", 380, 330, False)}</div></div>')
+        b = bests[kind] if history else None
+        return (f'<div class="fig"><div class="w">{chart(kind, run, prev, "css", wide, 380, False, b)}</div>'
+                f'<div class="n">{chart(kind, run, prev, "css", 380, 330, False, b)}</div></div>')
 
     title = (f"{html.escape(run['name'])} makes {one_short:,.0f} tokens/s for one stream and up to {best:,.0f} "
              f"in total" if one_short else html.escape(run["name"]))
     note = f" ({html.escape(run['note'])})" if run.get("note") else ""
     chg = "<th>Change</th>" if prev else ""
     pchg = "<th>Change</th>" if prev else ""
+    bst = "<th>Best so far</th>" if history else ""
+    bps = "<th>Best per stream</th>" if history else ""
+    btt = "<th>Best total</th>" if history else ""
+    how = ("measured with bench/sweep.py" if method(run) == 2 else
+           "measured with an earlier lab sweep (method 1: total is the sum of the per-stream rates)")
+    if history:
+        compare = (f"Lighter lines in the charts are {html.escape(prev['name'])}. Changes and best values compare "
+                   f"only with releases measured the same way ({len(history)} earlier).")
+    else:
+        compare = "No earlier release was measured the same way, so there is nothing to compare with yet."
     return f"""<div class="run" data-id="{slug(run)}"{'' if latest else ' hidden'}>
 <section class="band head"><h1>{title}</h1>
-<p class="setup">Release {html.escape(run['release'])}{note}, measured {html.escape(run['date'][:10])} on
+<p class="setup">Release {html.escape(run['release'])}{note}, {how}, on {html.escape(run['date'][:10])} on
 {html.escape(s.get('gpus', ''))} with tensor parallel {s.get('tensor_parallel', '')}:
 {html.escape(s.get('model', ''))}, drafter {html.escape(s.get('drafter', 'none'))}, {html.escape(s.get('kv_cache', ''))}
 KV cache, thinking {'on' if s.get('thinking') else 'off'}, {s.get('output_tokens', '')} output tokens per request.
-{f'Lighter lines in the charts are {html.escape(prev["name"])}.' if prev else ''}</p>
+{compare}</p>
 <div class="tiles">{''.join(tiles)}</div></section>
 <section class="band charts"><h2>Total decode speed</h2><p class="sub">Output tokens per second of all streams together.
 The bar at a point is the range of the runs.</p>{fig('total', 880)}
 <div class="two"><div><h2>Per stream</h2><p class="sub">Output tokens per second that each request receives.</p>
 {fig('stream', 560)}</div><div><h2>Prefill</h2><p class="sub">Prompt tokens per second, one prompt that is not in the
 cache.</p>{fig('prefill', 560)}</div></div></section>
-<section class="band tables"><div class="two wide"><div><h2>Decode</h2><div class="scroll"><table><thead><tr>
-<th>Context</th><th>Streams</th><th>Per stream</th><th>Total</th>{chg}<th>First token (cached)</th></tr></thead>
-<tbody>{''.join(rows)}</tbody></table></div></div><div><h2>Prefill</h2><div class="scroll"><table><thead><tr>
-<th>Context</th><th>Tokens/s</th>{pchg}<th>Time</th></tr></thead><tbody>{''.join(prow)}</tbody></table></div></div>
+<section class="band tables"><div class="two wide{' stack' if history else ''}"><div><h2>Decode</h2><div class="scroll"><table><thead><tr>
+<th>Context</th><th>Streams</th><th>Per stream</th>{bps}<th>Total</th>{chg}{btt}<th>First token (cached)</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table></div></div><div class="pf"><h2>Prefill</h2><div class="scroll"><table><thead><tr>
+<th>Context</th><th>Tokens/s</th>{pchg}{bst}<th>Time</th></tr></thead><tbody>{''.join(prow)}</tbody></table></div></div>
 </div></section></div>"""
 
 
@@ -378,6 +447,10 @@ h2{font-size:20px;line-height:1.2}
 .tv{font-size:clamp(28px,3.4vw,36px);font-weight:600;line-height:1.2;white-space:nowrap}
 .tv small{font-size:14px;font-weight:400;color:var(--ink2)}
 .td{font-size:14px;color:var(--ink2);min-height:1.5em}
+.tb{font-size:13px;color:var(--ink2);margin-top:2px}
+.best{color:var(--up);font-weight:600;white-space:nowrap}.was{font-variant-numeric:tabular-nums}
+td small{color:var(--ink2);font-size:12px;white-space:nowrap}
+.pick .m1{display:block;font-weight:400;font-size:11px;line-height:1.1;opacity:.85}
 .up{color:var(--up);font-weight:600;white-space:nowrap}.down{color:var(--down);font-weight:600;white-space:nowrap}.flat{color:var(--ink2);white-space:nowrap}
 .sub{color:var(--ink2);margin:4px 0 10px;font-size:15px}
 .charts h2{margin-top:8px}
@@ -388,7 +461,7 @@ h2{font-size:20px;line-height:1.2}
 .two{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:24px 40px;margin-top:28px}
 .tables{background:var(--pale)}
 .tables .two{margin-top:0}
-@media(min-width:900px){.two.wide{grid-template-columns:minmax(0,3fr) minmax(0,2fr)}}
+@media(min-width:900px){.two.wide{grid-template-columns:minmax(0,3fr) minmax(0,2fr)}.two.wide.stack{grid-template-columns:minmax(0,1fr)}.stack .pf{max-width:720px}}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;background:var(--bg);border-radius:8px}
 th,td{padding:8px 12px;text-align:right;border-bottom:1px solid var(--rule);white-space:nowrap}
 th{font-weight:600;font-size:14px;color:var(--ink2)}
@@ -411,6 +484,9 @@ generation of tokens. Per stream is the output rate of one request from its firs
 rate of all requests together while all of them run (results made before bench/sweep.py add up the per-stream rates
 instead, which gives more when the streams start far apart). When a cell runs more than one time, the bar at a point shows the range of the
 runs.</p>
+<p>A release is compared only with earlier releases that were measured the same way. Change is against the release
+before it; best so far is the highest value of all those releases, so a gain after a larger loss still shows the
+gap to the best.</p>
 <p>The prefill test sends one prompt that is not in the cache and measures the time to its first token.</p></div>
 <div><h2>Add a release</h2><p>Measure a running server into a results file in <code>bench/results/</code>, then make
 the charts and this page again:</p><pre><code>python bench/sweep.py --release 1.1.0 --out bench/results/1.1.0.json
@@ -440,10 +516,11 @@ def write_html(runs: list[dict], path: Path) -> None:
     """One page with every release, newest first in the picker; each release is drawn over the one before it."""
     blocks, pick = [], []
     for i in range(len(runs) - 1, -1, -1):
-        run, prev = runs[i], (runs[i - 1] if i else None)
-        blocks.append(run_block(run, prev, i == len(runs) - 1))
+        run, history = runs[i], earlier(runs, i)
+        blocks.append(run_block(run, history[-1] if history else None, history, i == len(runs) - 1))
+        tag = "" if method(run) == 2 else '<small class="m1">old method</small>'
         pick.append(f'<button type="button" data-run="{slug(run)}" aria-pressed="false">'
-                    f'{html.escape(run["name"])}</button>')
+                    f'{html.escape(run["name"])}{tag}</button>')
     path.write_text(PAGE.replace("__PICK__", "".join(pick)).replace("__RUNS__", "\n".join(blocks)))
 
 

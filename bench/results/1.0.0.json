@@ -1,5 +1,6 @@
 {
   "format": 1,
+  "method": 2,
   "release": "1.0.0",
   "name": "1.0.0",
   "note": "pre-release build 5f01828",

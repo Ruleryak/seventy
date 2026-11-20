@@ -200,6 +200,7 @@ def main() -> None:
     draft = info.get("draft_name") or ("yes" if info.get("draft") else "none")
     results = {
         "format": 1,
+        "method": 2,
         "release": args.release,
         "name": args.name or args.release,
         "note": args.note,
