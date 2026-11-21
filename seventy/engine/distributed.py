@@ -9,15 +9,31 @@ import torch
 import torch.distributed as dist
 
 
+TIMEOUT = datetime.timedelta(seconds=600)
+
+
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-def init(rank: int, size: int, port: int, backend: str) -> None:
-    dist.init_process_group(backend=backend, init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=size,
-                            timeout=datetime.timedelta(seconds=600))
+def master_store(size: int) -> dist.TCPStore:
+    """The rendezvous store of rank 0, listening from the start on a port that the system chooses (its .port).
+
+    A port from free_port() is free only until the socket closes. Until rank 0 listens on it, another connection
+    can take it as its local port (the panel's health checks, or a worker that retries its connection and
+    connects to itself), and rank 0 then fails with EADDRINUSE. Rank 0 makes this store before it starts the
+    workers, so the port stays taken by the store.
+    """
+    return dist.TCPStore("127.0.0.1", 0, size, is_master=True, timeout=TIMEOUT, wait_for_workers=False)
+
+
+def init(rank: int, size: int, port: int, backend: str, store: dist.TCPStore | None = None) -> None:
+    """Join the process group: with the store of rank 0 (master_store), else with a TCP store at port."""
+    if store is None:
+        store = dist.TCPStore("127.0.0.1", port, size, is_master=rank == 0, timeout=TIMEOUT, wait_for_workers=False)
+    dist.init_process_group(backend=backend, store=store, rank=rank, world_size=size, timeout=TIMEOUT)
 
 
 def shutdown() -> None:

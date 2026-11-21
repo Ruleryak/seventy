@@ -84,7 +84,8 @@ class Engine:
         reserve = int(config.activation_reserve_gib * 2**30)
         kv_dtype = torch.int8 if config.kv_dtype == "int8" else torch.float16
         self.workers, peers = [], []
-        port = distributed.free_port()
+        self._store = distributed.master_store(tp) if tp > 1 else None
+        port = self._store.port if self._store is not None else 0
         if tp > 1:
             _stage("workers", f"starting {tp - 1} tensor-parallel worker processes")
             ctx = mp.get_context("spawn")
@@ -97,7 +98,7 @@ class Engine:
                 child.close()
                 self.workers.append(p)
                 peers.append(parent)
-            distributed.init(0, tp, port, "nccl")
+            distributed.init(0, tp, port, "nccl", self._store)
         from .worker import load_shard
 
         _stage("weights", f"loading {display_name(path)} on {tp} GPU(s)")

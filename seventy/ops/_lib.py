@@ -107,6 +107,11 @@ def lib() -> ctypes.CDLL:
     for path in candidates():
         if path.is_file():
             handle = ctypes.CDLL(str(path))
+            missing = [name for name in SIGNATURES if not hasattr(handle, name)]
+            if missing:
+                _error = KernelError(f"{path} is from another version of seventy (it has no {missing[0]}); "
+                                     "rebuild it or reinstall seventy")
+                raise _error
             for name, (restype, argtypes) in SIGNATURES.items():
                 fn = getattr(handle, name)
                 fn.restype = restype
