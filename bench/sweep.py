@@ -24,6 +24,7 @@ import subprocess
 import sysconfig
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -162,7 +163,10 @@ def main() -> None:
     think = args.think == "on"
 
     model = get(url, "/v1/models", key)["data"][0]["id"]
-    info = get(url, "/info", key)
+    try:
+        info = get(url, "/info", key)
+    except urllib.error.HTTPError:
+        info = {}
     prompts = Prompts(url, key)
     decode, prefill = {}, {}
     started = None
