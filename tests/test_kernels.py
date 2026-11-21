@@ -98,3 +98,23 @@ def test_dense_gemm_fp8_matches_its_dequantized_weights(m):
     assert torch.equal(again.wpk, q.wpk) and torch.equal(again.col_scale, q.col_scale)
     scaled = kernels.dense_gemm(x, q, row_scale=torch.full((m,), 2.0, device="cuda"))
     torch.testing.assert_close(scaled, 2 * got, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("m", [1, 9, 32, 57])
+@pytest.mark.parametrize("warps, splits", [(2, 1), (4, 3), (8, 1), (8, 2), (2, 12)])
+def test_dense_gemm_fp8_wk_splits_agree(m, warps, splits):
+    """Every warp and split count gives the dequantized product; the per-tile counters are zero after each call, and
+    a call gives the same bits each time."""
+    torch.manual_seed(100 + m)
+    n, k = 200, 1536
+    w = (torch.randn(n, k) * 0.02).half().cuda()
+    x = torch.randn(m, k).half().cuda()
+    q = kernels.DenseWeightFP8(w)
+    ref = x.float() @ q.dequantize().T
+    got = kernels.dense_gemm(x, q, fp8_config=(warps, splits))
+    torch.testing.assert_close(got, ref, rtol=1e-3, atol=1e-3 * ref.abs().max().item())
+    assert torch.equal(kernels.dense_gemm(x, q, fp8_config=(warps, splits)), got)
+    half_out = kernels.dense_gemm(x, q, out_fp32=False, fp8_config=(warps, splits))
+    assert torch.equal(half_out, got.half())
+    assert not kernels._tile_counters(x.device, 1).any()

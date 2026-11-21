@@ -25,6 +25,10 @@ with FP16 layers and 32.0% with FP8 (two runs each; runs of one setting differ b
 streams: 2.47 / 2.38 accepted drafts per step and sequence at 2K / 32K with fc, kv_all, sel_hidden and conv in
 FP16, 2.48 / 2.38 with them in FP8, 1.3 to 1.5% faster.
 
+Tensor parallel: the layers split by heads and the MLP by its inner size, with FP32 all-reduces. fc splits by its
+input columns (each rank reads a quarter of the weight at TP4, then an FP32 all-reduce adds the parts;
+SEVENTY_DRAFTER_FC_SPLIT=0 keeps the whole weight on every rank).
+
 Selector: the top-k tokens of each mask position (from the LM head), and edge scores
 score[l, p, c] = logit[l, c] + sum_r pred[token before (l, p)]_r * hidden[l]_r * succ[candidate (l, c)]_r,
 where the token before position 0 is the anchor. A walk from the anchor picks one candidate per position
@@ -133,7 +137,13 @@ class Drafter:
         self.fp8 = (self.device.type == "cuda" and dtype == torch.float16
                     and os.environ.get("SEVENTY_DRAFTER_FP8", "1") != "0")
         with Checkpoint(path) as ckpt:
-            self.fc = _to_dtype(ckpt.tensor("fc.weight"), dtype).to(device)
+            fc = ckpt.tensor("fc.weight")
+            f0, f1 = par.span(fc.shape[1])
+            if par.size == 1 or (f1 - f0) % 64 or os.environ.get("SEVENTY_DRAFTER_FC_SPLIT", "1") == "0":
+                f0, f1 = 0, fc.shape[1]
+            self.fc_cols = (f0, f1)
+            self.fc = _to_dtype(fc[:, f0:f1].contiguous(), dtype).to(device)
+            del fc
             self.hidden_norm = ckpt.tensor("hidden_norm.weight").float().to(device)
             self.norm = ckpt.tensor("norm.weight").float().to(device)
             self.layers = [DraftLayer(cfg, ckpt, i, par, dtype, device) for i in range(cfg.layers)]
@@ -232,7 +242,12 @@ class Drafter:
         if features.shape[0] == 0:
             return
         cfg = self.cfg
-        ctx = self._norm(self._mm(features.to(self.dtype), self.fc), self.hidden_norm)[0]
+        f0, f1 = self.fc_cols
+        if f1 - f0 == features.shape[1]:
+            proj = self._mm(features.to(self.dtype), self.fc)
+        else:
+            proj = self.par.all_reduce(self._mm(features[:, f0:f1].to(self.dtype).contiguous(), self.fc))
+        ctx = self._norm(proj, self.hidden_norm)[0]
         kv = self.layers[0].kv
         d = cfg.head_dim
         if self.fused:

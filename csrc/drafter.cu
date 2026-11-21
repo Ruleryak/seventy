@@ -6,6 +6,8 @@
  * Kernels of the DFlash2 drafter (seventy/model/dflash2.py has the reference of each one):
  *
  *   drafter_norm     RMS norm with an FP32 residual stream: s = x + residual; residual = s; out = norm(s) * w.
+ *                    Rows of up to 8192 values (a multiple of 4) stay in registers: 16-byte loads and stores, one
+ *                    pass over x and the residual.
  *   drafter_conv     the two-tap grouped convolution inside each block of `block` rows:
  *                    out[t, c] = (base[0, c] + d[t, 0, c / gs]) x[t, c] + (base[1, c] + d[t, 1, c / gs]) x[t - 1, c],
  *                    the second term only when t is not the first row of its block.
@@ -14,9 +16,13 @@
  *                    position % ring.
  *   drafter_attention the block attention: each block row (token t of sequence b, at position start + t) sees the
  *                    keys at positions [max(0, start + t - window + 1), start + block) of its ring, so a block of
- *                    queries reads at most window + block - 1 keys. Splits of 128 keys run on the tensor cores
- *                    (WMMA 16 x 16 x 16, FP16 in, FP32 accumulation) with an exact softmax per split; a combine
- *                    kernel merges the splits by their log-sum-exp.
+ *                    queries reads at most window + block - 1 keys. Splits of 64 keys run on the tensor cores
+ *                    (WMMA 16 x 16 x 16, FP16 in, FP32 accumulation), one block of 4 warps each, with an exact
+ *                    softmax per split. A block issues all its loads before the first store to shared memory, and
+ *                    its 43.5 KB of shared memory (the scores take the place of q, P the place of K) let two
+ *                    blocks share an SM. Each split writes its unnormalized output, row maximum and row sum; a
+ *                    combine kernel merges the splits. (A version with several tiles per block and an online
+ *                    softmax needs 74 KB of shared memory, one block of 4 warps per SM, and was no faster.)
  *   silu_mul_scale   p = silu(gate) * up in FP32, rows scaled into the FP16 range (scale = max(1, max|p| / 16384)).
  */
 
@@ -27,9 +33,11 @@ using namespace nvcuda;
 
 constexpr int kD = 128;
 constexpr int kRows = 32;
-constexpr int kKeys = 128;
+constexpr int kKeys = 64;
 constexpr int kLd = kD + 8;
 constexpr int kLdS = kKeys + 4;
+constexpr int kLdP = kKeys + 8;
+constexpr int kAttnThreads = 128;
 
 __global__ void drafter_norm_kernel(half *out, float *res_out, const void *x, int x_fp32, const float *res_in,
                                     const float *weight, int dim, float eps) {
@@ -50,6 +58,51 @@ __global__ void drafter_norm_kernel(half *out, float *res_out, const void *x, in
                                            : __half2float(static_cast<const half *>(x)[row * dim + i]));
     if (res_out == nullptr && res_in != nullptr) v += res_in[row * dim + i];
     out[row * dim + i] = __float2half_rn(v * inv * weight[i]);
+  }
+}
+
+template <int kPer>
+__global__ void __launch_bounds__(256) drafter_norm_vec_kernel(half *out, float *res_out, const void *x, int x_fp32,
+                                                               const float *res_in, const float *weight, int dim,
+                                                               float eps) {
+  __shared__ float scratch[32];
+  const int64_t row = blockIdx.x;
+  const int n4 = dim / 4;
+  float4 v[kPer];
+  float sumsq = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kPer; ++i) {
+    const int c = threadIdx.x + i * 256;
+    v[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (c < n4) {
+      if (x_fp32) {
+        v[i] = reinterpret_cast<const float4 *>(x)[row * n4 + c];
+      } else {
+        const uint2 hv = reinterpret_cast<const uint2 *>(x)[row * n4 + c];
+        const float2 a = __half22float2(*reinterpret_cast<const half2 *>(&hv.x));
+        const float2 b = __half22float2(*reinterpret_cast<const half2 *>(&hv.y));
+        v[i] = make_float4(a.x, a.y, b.x, b.y);
+      }
+      if (res_in != nullptr) {
+        const float4 r = reinterpret_cast<const float4 *>(res_in)[row * n4 + c];
+        v[i] = make_float4(v[i].x + r.x, v[i].y + r.y, v[i].z + r.z, v[i].w + r.w);
+      }
+      if (res_out != nullptr) reinterpret_cast<float4 *>(res_out)[row * n4 + c] = v[i];
+      sumsq += v[i].x * v[i].x + v[i].y * v[i].y + v[i].z * v[i].z + v[i].w * v[i].w;
+    }
+  }
+  const float inv = rsqrtf(block_sum(sumsq, scratch) / dim + eps);
+#pragma unroll
+  for (int i = 0; i < kPer; ++i) {
+    const int c = threadIdx.x + i * 256;
+    if (c >= n4) continue;
+    const float4 w = reinterpret_cast<const float4 *>(weight)[c];
+    const half2 a = __floats2half2_rn(v[i].x * inv * w.x, v[i].y * inv * w.y);
+    const half2 b = __floats2half2_rn(v[i].z * inv * w.z, v[i].w * inv * w.w);
+    uint2 o;
+    o.x = *reinterpret_cast<const uint32_t *>(&a);
+    o.y = *reinterpret_cast<const uint32_t *>(&b);
+    reinterpret_cast<uint2 *>(out)[row * n4 + c] = o;
   }
 }
 
@@ -114,19 +167,17 @@ __global__ void drafter_qk_kernel(half *q_out, half *k_ring, half *v_ring, const
   }
 }
 
-__global__ void __launch_bounds__(128) drafter_attention_kernel(float *ws_o, float *ws_lse, const half *q,
-                                                                const half *k_ring, const half *v_ring,
-                                                                const int64_t *slots, const int64_t *starts,
-                                                                int heads, int kv_heads, int block, int window,
-                                                                int ring, int splits, float scale) {
-  extern __shared__ __align__(16) unsigned char smem[];
-  half *qs = reinterpret_cast<half *>(smem);
-  half *ks = qs + kRows * kLd;
-  half *vs = ks + kKeys * kLd;
-  float *ss = reinterpret_cast<float *>(vs + kKeys * kLd);
-  float *row_l = ss + kRows * kLdS;
+__global__ void __launch_bounds__(kAttnThreads) drafter_attention_kernel(float *ws_o, float *ws_ml, const half *q,
+                                                                         const half *k_ring, const half *v_ring,
+                                                                         const int64_t *slots, const int64_t *starts,
+                                                                         int heads, int kv_heads, int block,
+                                                                         int window, int ring, int splits,
+                                                                         float scale) {
+  __shared__ __align__(32) half qs[kRows * kLd];
+  __shared__ __align__(32) half ks[kKeys * kLd];
+  __shared__ __align__(32) half vs[kKeys * kLd];
+  float *ss = reinterpret_cast<float *>(qs);
   half *ps = ks;
-  float *os = ss;
 
   const int s = blockIdx.x, g = blockIdx.y, b = blockIdx.z;
   const int rep = heads / kv_heads;
@@ -135,75 +186,90 @@ __global__ void __launch_bounds__(128) drafter_attention_kernel(float *ws_o, flo
   const int64_t end = start + block;
   const int64_t k0 = start - (window - 1) > 0 ? start - (window - 1) : 0;
   const int64_t kb = k0 + static_cast<int64_t>(s) * kKeys;
-  const int64_t ke = kb + kKeys < end ? kb + kKeys : end;
+  const int n = end - kb < kKeys ? static_cast<int>(end - kb) : kKeys;
+  const int64_t entries = static_cast<int64_t>(gridDim.z) * gridDim.y * gridDim.x * kRows;
   const int64_t out_base = ((static_cast<int64_t>(b) * kv_heads + g) * splits + s) * kRows;
-  if (kb >= end) {
-    for (int r = threadIdx.x; r < kRows; r += blockDim.x) ws_lse[out_base + r] = -INFINITY;
+  float *ws_m = ws_ml, *ws_l = ws_ml + entries;
+  const int tid = threadIdx.x;
+  if (n <= 0) {
+    if (tid < kRows) {
+      ws_m[out_base + tid] = -INFINITY;
+      ws_l[out_base + tid] = 0.0f;
+    }
     return;
   }
   const int64_t slot = slots[b];
+  const int base_mod = static_cast<int>(kb % ring);
 
-  for (int e = threadIdx.x; e < kRows * (kD / 8); e += blockDim.x) {
-    const int r = e / (kD / 8), c = (e % (kD / 8)) * 8;
-    uint4 v = make_uint4(0, 0, 0, 0);
+  constexpr int kQLoads = kRows * (kD / 8) / kAttnThreads;
+  constexpr int kKLoads = kKeys * (kD / 8) / kAttnThreads;
+  uint4 qv[kQLoads], kv[kKLoads], vv[kKLoads];
+#pragma unroll
+  for (int i = 0; i < kQLoads; ++i) {
+    const int e = tid + i * kAttnThreads;
+    const int r = e >> 4, c = (e & 15) * 8;
+    qv[i] = make_uint4(0, 0, 0, 0);
     if (r < rows) {
       const int t = r / rep, h = g * rep + r % rep;
-      v = *reinterpret_cast<const uint4 *>(q + ((static_cast<int64_t>(b) * block + t) * heads + h) * kD + c);
+      qv[i] = *reinterpret_cast<const uint4 *>(q + ((static_cast<int64_t>(b) * block + t) * heads + h) * kD + c);
     }
-    *reinterpret_cast<uint4 *>(qs + r * kLd + c) = v;
   }
-  for (int e = threadIdx.x; e < kKeys * (kD / 8); e += blockDim.x) {
-    const int j = e / (kD / 8), c = (e % (kD / 8)) * 8;
-    uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = make_uint4(0, 0, 0, 0);
-    const int64_t pos = kb + j;
-    if (pos < ke) {
-      const int64_t off = ((slot * ring + pos % ring) * kv_heads + g) * kD + c;
-      kv4 = *reinterpret_cast<const uint4 *>(k_ring + off);
-      vv4 = *reinterpret_cast<const uint4 *>(v_ring + off);
+#pragma unroll
+  for (int i = 0; i < kKLoads; ++i) {
+    const int e = tid + i * kAttnThreads;
+    const int j = e >> 4, c = (e & 15) * 8;
+    kv[i] = vv[i] = make_uint4(0, 0, 0, 0);
+    if (j < n) {
+      const int idx = base_mod + j < ring ? base_mod + j : base_mod + j - ring;
+      const int64_t off = ((slot * ring + idx) * kv_heads + g) * kD + c;
+      kv[i] = *reinterpret_cast<const uint4 *>(k_ring + off);
+      vv[i] = *reinterpret_cast<const uint4 *>(v_ring + off);
     }
-    *reinterpret_cast<uint4 *>(ks + j * kLd + c) = kv4;
-    *reinterpret_cast<uint4 *>(vs + j * kLd + c) = vv4;
+  }
+#pragma unroll
+  for (int i = 0; i < kQLoads; ++i) {
+    const int e = tid + i * kAttnThreads;
+    *reinterpret_cast<uint4 *>(qs + (e >> 4) * kLd + (e & 15) * 8) = qv[i];
+  }
+#pragma unroll
+  for (int i = 0; i < kKLoads; ++i) {
+    const int e = tid + i * kAttnThreads;
+    *reinterpret_cast<uint4 *>(ks + (e >> 4) * kLd + (e & 15) * 8) = kv[i];
+    *reinterpret_cast<uint4 *>(vs + (e >> 4) * kLd + (e & 15) * 8) = vv[i];
   }
   __syncthreads();
 
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int warp = tid >> 5, lane = tid & 31;
   {
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2];
 #pragma unroll
-    for (int rt = 0; rt < 2; ++rt)
-#pragma unroll
-      for (int ct = 0; ct < 2; ++ct) wmma::fill_fragment(acc[rt][ct], 0.0f);
+    for (int rt = 0; rt < 2; ++rt) wmma::fill_fragment(acc[rt], 0.0f);
 #pragma unroll
     for (int k = 0; k < kD / 16; ++k) {
       wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a[2];
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf[2];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> bf;
 #pragma unroll
       for (int rt = 0; rt < 2; ++rt) wmma::load_matrix_sync(a[rt], qs + rt * 16 * kLd + k * 16, kLd);
+      wmma::load_matrix_sync(bf, ks + warp * 16 * kLd + k * 16, kLd);
 #pragma unroll
-      for (int ct = 0; ct < 2; ++ct) wmma::load_matrix_sync(bf[ct], ks + (warp * 32 + ct * 16) * kLd + k * 16, kLd);
-#pragma unroll
-      for (int rt = 0; rt < 2; ++rt)
-#pragma unroll
-        for (int ct = 0; ct < 2; ++ct) wmma::mma_sync(acc[rt][ct], a[rt], bf[ct], acc[rt][ct]);
+      for (int rt = 0; rt < 2; ++rt) wmma::mma_sync(acc[rt], a[rt], bf, acc[rt]);
     }
+    __syncthreads();
 #pragma unroll
     for (int rt = 0; rt < 2; ++rt)
-#pragma unroll
-      for (int ct = 0; ct < 2; ++ct)
-        wmma::store_matrix_sync(ss + rt * 16 * kLdS + warp * 32 + ct * 16, acc[rt][ct], kLdS, wmma::mem_row_major);
+      wmma::store_matrix_sync(ss + rt * 16 * kLdS + warp * 16, acc[rt], kLdS, wmma::mem_row_major);
   }
   __syncthreads();
 
-  for (int r = warp; r < kRows; r += 4) {
+  for (int r = warp; r < kRows; r += kAttnThreads / 32) {
     const int t = r / rep;
     const int64_t lo = start + t - (window - 1);
-    float v[4];
+    float v[2];
     float m = -INFINITY;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 2; ++i) {
       const int j = lane + 32 * i;
-      const int64_t pos = kb + j;
-      const bool ok = r < rows && pos < ke && pos >= lo;
+      const bool ok = r < rows && j < n && kb + j >= lo;
       v[i] = ok ? ss[r * kLdS + j] * scale : -INFINITY;
       m = fmaxf(m, v[i]);
     }
@@ -211,72 +277,69 @@ __global__ void __launch_bounds__(128) drafter_attention_kernel(float *ws_o, flo
     for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
     float l = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 2; ++i) {
       const float p = m == -INFINITY ? 0.0f : __expf(v[i] - m);
       v[i] = p;
       l += p;
     }
     l = warp_sum(l);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) ps[r * kLd + lane + 32 * i] = __float2half_rn(v[i]);
+    for (int i = 0; i < 2; ++i) ps[r * kLdP + lane + 32 * i] = __float2half_rn(v[i]);
     if (lane == 0) {
-      row_l[r] = l;
-      ws_lse[out_base + r] = l > 0.0f ? m + __logf(l) : -INFINITY;
+      ws_m[out_base + r] = m;
+      ws_l[out_base + r] = l;
     }
   }
   __syncthreads();
 
-  {
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+#pragma unroll
+  for (int rt = 0; rt < 2; ++rt)
+#pragma unroll
+    for (int ct = 0; ct < 2; ++ct) wmma::fill_fragment(acc[rt][ct], 0.0f);
+#pragma unroll
+  for (int k = 0; k < kKeys / 16; ++k) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a[2];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> bf[2];
+#pragma unroll
+    for (int rt = 0; rt < 2; ++rt) wmma::load_matrix_sync(a[rt], ps + rt * 16 * kLdP + k * 16, kLdP);
+#pragma unroll
+    for (int ct = 0; ct < 2; ++ct) wmma::load_matrix_sync(bf[ct], vs + k * 16 * kLd + warp * 32 + ct * 16, kLd);
 #pragma unroll
     for (int rt = 0; rt < 2; ++rt)
 #pragma unroll
-      for (int ct = 0; ct < 2; ++ct) wmma::fill_fragment(acc[rt][ct], 0.0f);
-#pragma unroll
-    for (int k = 0; k < kKeys / 16; ++k) {
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a[2];
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> bf[2];
-#pragma unroll
-      for (int rt = 0; rt < 2; ++rt) wmma::load_matrix_sync(a[rt], ps + rt * 16 * kLd + k * 16, kLd);
-#pragma unroll
-      for (int ct = 0; ct < 2; ++ct) wmma::load_matrix_sync(bf[ct], vs + k * 16 * kLd + warp * 32 + ct * 16, kLd);
-#pragma unroll
-      for (int rt = 0; rt < 2; ++rt)
-#pragma unroll
-        for (int ct = 0; ct < 2; ++ct) wmma::mma_sync(acc[rt][ct], a[rt], bf[ct], acc[rt][ct]);
-    }
-    __syncthreads();
-#pragma unroll
-    for (int rt = 0; rt < 2; ++rt)
-#pragma unroll
-      for (int ct = 0; ct < 2; ++ct)
-        wmma::store_matrix_sync(os + rt * 16 * kLdS + warp * 32 + ct * 16, acc[rt][ct], kLdS, wmma::mem_row_major);
+      for (int ct = 0; ct < 2; ++ct) wmma::mma_sync(acc[rt][ct], a[rt], bf[ct], acc[rt][ct]);
   }
-  __syncthreads();
-  for (int e = threadIdx.x; e < kRows * kD; e += blockDim.x) {
-    const int r = e / kD, c = e % kD;
-    const float l = row_l[r];
-    ws_o[(out_base + r) * kD + c] = l > 0.0f ? os[r * kLdS + c] / l : 0.0f;
-  }
+#pragma unroll
+  for (int rt = 0; rt < 2; ++rt)
+#pragma unroll
+    for (int ct = 0; ct < 2; ++ct)
+      wmma::store_matrix_sync(ws_o + (out_base + rt * 16) * kD + warp * 32 + ct * 16, acc[rt][ct], kD,
+                              wmma::mem_row_major);
 }
 
-__global__ void drafter_combine_kernel(half *out, const float *ws_o, const float *ws_lse, int heads, int kv_heads,
-                                       int block, int splits) {
+__global__ void drafter_combine_kernel(half *out, const float *ws_o, const float *ws_ml, int heads, int kv_heads,
+                                       int block, int splits, int64_t entries) {
   const int g = blockIdx.y, b = blockIdx.z;
   const int rep = heads / kv_heads;
   const int r = blockIdx.x;
   const int c = threadIdx.x;
   const int64_t base = (static_cast<int64_t>(b) * kv_heads + g) * splits;
-  float m = -INFINITY;
-  for (int s = 0; s < splits; ++s) m = fmaxf(m, ws_lse[(base + s) * kRows + r]);
+  const float *ws_m = ws_ml, *ws_l = ws_ml + entries;
+  float mx = -INFINITY;
+#pragma unroll 8
+  for (int s = 0; s < splits; ++s) mx = fmaxf(mx, ws_m[(base + s) * kRows + r]);
   float acc = 0.0f, wsum = 0.0f;
-  if (m != -INFINITY) {
+  if (mx != -INFINITY) {
+#pragma unroll 8
     for (int s = 0; s < splits; ++s) {
-      const float lse = ws_lse[(base + s) * kRows + r];
-      if (lse == -INFINITY) continue;
-      const float w = __expf(lse - m);
-      wsum += w;
-      acc += w * ws_o[((base + s) * kRows + r) * kD + c];
+      const int64_t i = (base + s) * kRows + r;
+      const float m = ws_m[i];
+      if (m != -INFINITY) {
+        const float w = __expf(m - mx);
+        wsum += w * ws_l[i];
+        acc += w * ws_o[i * kD + c];
+      }
     }
   }
   const int t = r / rep, h = g * rep + r % rep;
@@ -312,8 +375,6 @@ __global__ void silu_mul_scale_kernel(half *out, float *scale_out, const float *
   }
 }
 
-constexpr int kAttnSmem = (kRows * kLd + 2 * kKeys * kLd) * 2 + (kRows * kLdS + kRows) * 4;
-
 }  // namespace
 }  // namespace seventy
 
@@ -323,8 +384,26 @@ SEVENTY_API int seventy_drafter_norm(void *out, float *residual_out, const void 
   using namespace seventy;
   if (out == nullptr || x == nullptr || weight == nullptr || rows < 0 || dim <= 0) return SEVENTY_ERR_INVALID_ARGUMENT;
   if (rows == 0) return SEVENTY_OK;
-  drafter_norm_kernel<<<rows, 512, 0, stream>>>(static_cast<half *>(out), residual_out, x, x_fp32, residual_in,
-                                                weight, dim, eps);
+  const int per = (dim / 4 + 255) / 256;
+  const bool vec = dim % 4 == 0 && per <= 8 && aligned(out, 8) && aligned(x, 16) && aligned(weight, 16) &&
+                   (residual_in == nullptr || aligned(residual_in, 16)) &&
+                   (residual_out == nullptr || aligned(residual_out, 16));
+  if (!vec) {
+    drafter_norm_kernel<<<rows, 512, 0, stream>>>(static_cast<half *>(out), residual_out, x, x_fp32, residual_in,
+                                                  weight, dim, eps);
+    return launch_status();
+  }
+  auto *o = static_cast<half *>(out);
+  switch (per) {
+    case 1: drafter_norm_vec_kernel<1><<<rows, 256, 0, stream>>>(o, residual_out, x, x_fp32, residual_in, weight, dim, eps); break;
+    case 2: drafter_norm_vec_kernel<2><<<rows, 256, 0, stream>>>(o, residual_out, x, x_fp32, residual_in, weight, dim, eps); break;
+    case 3: drafter_norm_vec_kernel<3><<<rows, 256, 0, stream>>>(o, residual_out, x, x_fp32, residual_in, weight, dim, eps); break;
+    case 4: drafter_norm_vec_kernel<4><<<rows, 256, 0, stream>>>(o, residual_out, x, x_fp32, residual_in, weight, dim, eps); break;
+    case 5: drafter_norm_vec_kernel<5><<<rows, 256, 0, stream>>>(o, residual_out, x, x_fp32, residual_in, weight, dim, eps); break;
+    case 6: drafter_norm_vec_kernel<6><<<rows, 256, 0, stream>>>(o, residual_out, x, x_fp32, residual_in, weight, dim, eps); break;
+    case 7: drafter_norm_vec_kernel<7><<<rows, 256, 0, stream>>>(o, residual_out, x, x_fp32, residual_in, weight, dim, eps); break;
+    default: drafter_norm_vec_kernel<8><<<rows, 256, 0, stream>>>(o, residual_out, x, x_fp32, residual_in, weight, dim, eps); break;
+  }
   return launch_status();
 }
 
@@ -358,14 +437,14 @@ SEVENTY_API int seventy_drafter_qk(void *q_out, void *k_ring, void *v_ring, cons
   return launch_status();
 }
 
-SEVENTY_API int seventy_drafter_attention_splits(int block, int window) {
+SEVENTY_API int seventy_drafter_attention_splits(int seqs, int kv_heads, int block, int window) {
   using namespace seventy;
   return (window + block - 1 + kKeys - 1) / kKeys;
 }
 
 SEVENTY_API int64_t seventy_drafter_attention_workspace(int seqs, int kv_heads, int splits) {
   using namespace seventy;
-  return static_cast<int64_t>(seqs) * kv_heads * splits * kRows * (kD + 1) * static_cast<int64_t>(sizeof(float));
+  return static_cast<int64_t>(seqs) * kv_heads * splits * kRows * (kD + 2) * static_cast<int64_t>(sizeof(float));
 }
 
 SEVENTY_API int seventy_drafter_attention(void *out, const void *q, const void *k_ring, const void *v_ring,
@@ -378,23 +457,19 @@ SEVENTY_API int seventy_drafter_attention(void *out, const void *q, const void *
       block * (heads / kv_heads) > kRows || window + block > ring)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (seqs == 0) return SEVENTY_OK;
-  const int splits = seventy_drafter_attention_splits(block, window);
+  const int splits = seventy_drafter_attention_splits(seqs, kv_heads, block, window);
   if (workspace == nullptr || workspace_bytes < seventy_drafter_attention_workspace(seqs, kv_heads, splits))
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (!aligned(q, 16) || !aligned(k_ring, 16) || !aligned(v_ring, 16)) return SEVENTY_ERR_MISALIGNED;
-  static bool configured = false;
-  if (!configured) {
-    cudaFuncSetAttribute(drafter_attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kAttnSmem);
-    configured = true;
-  }
   auto *ws_o = static_cast<float *>(workspace);
-  float *ws_lse = ws_o + static_cast<int64_t>(seqs) * kv_heads * splits * kRows * kD;
-  drafter_attention_kernel<<<dim3(splits, kv_heads, seqs), 128, kAttnSmem, stream>>>(
-      ws_o, ws_lse, static_cast<const half *>(q), static_cast<const half *>(k_ring), static_cast<const half *>(v_ring),
+  const int64_t entries = static_cast<int64_t>(seqs) * kv_heads * splits * kRows;
+  float *ws_ml = ws_o + entries * kD;
+  drafter_attention_kernel<<<dim3(splits, kv_heads, seqs), kAttnThreads, 0, stream>>>(
+      ws_o, ws_ml, static_cast<const half *>(q), static_cast<const half *>(k_ring), static_cast<const half *>(v_ring),
       slots, starts, heads, kv_heads, block, window, ring, splits, scale);
   const int rows = block * (heads / kv_heads);
-  drafter_combine_kernel<<<dim3(rows, kv_heads, seqs), kD, 0, stream>>>(static_cast<half *>(out), ws_o, ws_lse,
-                                                                       heads, kv_heads, block, splits);
+  drafter_combine_kernel<<<dim3(rows, kv_heads, seqs), kD, 0, stream>>>(static_cast<half *>(out), ws_o, ws_ml, heads,
+                                                                       kv_heads, block, splits, entries);
   return launch_status();
 }
 

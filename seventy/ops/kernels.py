@@ -623,10 +623,36 @@ class DenseWeightFP8:
         return vals[: self.n]
 
 
+FP8_WK = os.environ.get("SEVENTY_DRAFTER_FP8_WK", "1") != "0"
+_COUNTERS: dict = {}
+
+
+def _tile_counters(device: torch.device, tiles: int) -> torch.Tensor:
+    """The per-tile counters of seventy_dense_gemm_fp8_wk on a device: zero between calls, shared by all calls on
+    the device (they run one after another on one stream)."""
+    if tiles > 1 << 16:
+        raise ValueError(f"dense_gemm_fp8_wk: {tiles} column tiles, at most {1 << 16}")
+    c = _COUNTERS.get(device)
+    if c is None:
+        c = _COUNTERS[device] = torch.zeros(1 << 16, dtype=torch.int32, device=device)
+    return c
+
+
+def fp8_wk_config(m: int, tiles: int, ksteps: int) -> tuple[int, int] | None:
+    """(warps per block, k splits) for seventy_dense_gemm_fp8_wk, or None where the block-staged kernel
+    (seventy_dense_gemm_fp8) is faster: from 32 rows up on wide weights, where the warp-split kernel reads the
+    activations once per 32-column tile. From sweeps of the drafter's shapes on V100 (lab fp8_wk_bench)."""
+    if m > 16 and (ksteps >= 200 or tiles >= 1000 or (m > 32 and tiles >= 200)):
+        return None
+    if tiles <= 64 and m > 16 and ksteps >= 12:
+        return 4, 3
+    return (8 if tiles <= 100 else 4 if tiles <= 200 else 2), 1
+
+
 def dense_gemm(x: torch.Tensor, w: "DenseWeight | DenseWeightFP8", out_fp32: bool = True,
-               row_scale: torch.Tensor | None = None) -> torch.Tensor:
+               row_scale: torch.Tensor | None = None, fp8_config: tuple[int, int] | None = None) -> torch.Tensor:
     """x [m <= 64, k] (FP16) @ w^T, FP32 accumulation, times row_scale[m] (FP32) when given. FP8 weights
-    (DenseWeightFP8) use seventy_dense_gemm_fp8."""
+    (DenseWeightFP8) use seventy_dense_gemm_fp8_wk with (warps, splits) from fp8_wk_config or fp8_config."""
     _expect(x, "x", torch.float16)
     m, k = x.shape
     if k != w.k:
@@ -645,10 +671,21 @@ def dense_gemm(x: torch.Tensor, w: "DenseWeight | DenseWeightFP8", out_fp32: boo
             splits = max(1, min(round(900 / tiles), max(1, (k // 64) // 8)))
         else:
             warps = 2 if small or tiles >= 200 else 4
-    need = lib().seventy_dense_gemm_workspace(m, w.n_padded, splits)
-    ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=x.device) if need else None
     out = torch.empty(m, w.n, dtype=torch.float32 if out_fp32 else torch.float16, device=x.device)
     rs = row_scale.data_ptr() if row_scale is not None else None
+    wk = fp8_config or (fp8_wk_config(m, tiles, k // 64) if isinstance(w, DenseWeightFP8) and FP8_WK else None)
+    if isinstance(w, DenseWeightFP8) and wk is not None:
+        warps, splits = wk
+        need = lib().seventy_dense_gemm_fp8_wk_workspace(m, w.n_padded, splits)
+        ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=x.device) if need else None
+        code = lib().seventy_dense_gemm_fp8_wk(out.data_ptr(), 1 if out_fp32 else 0, x.data_ptr(), w.wpk.data_ptr(),
+                                               w.col_scale.data_ptr(), m, w.n, w.n_padded, k, splits, warps,
+                                               ws.data_ptr() if ws is not None else None, need,
+                                               _tile_counters(x.device, tiles).data_ptr(), rs, _stream(x))
+        check("dense_gemm_fp8_wk", code)
+        return out
+    need = lib().seventy_dense_gemm_workspace(m, w.n_padded, splits)
+    ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=x.device) if need else None
     wsp = ws.data_ptr() if ws is not None else None
     if isinstance(w, DenseWeightFP8):
         code = lib().seventy_dense_gemm_fp8(out.data_ptr(), 1 if out_fp32 else 0, x.data_ptr(), w.wpk.data_ptr(),
@@ -733,7 +770,7 @@ def drafter_attention(q: torch.Tensor, k_ring: torch.Tensor, v_ring: torch.Tenso
     kv_heads, ring = k_ring.shape[2], k_ring.shape[1]
     slots = slots.to(torch.int64).contiguous()
     starts = starts.to(torch.int64).contiguous()
-    splits = lib().seventy_drafter_attention_splits(block, window)
+    splits = lib().seventy_drafter_attention_splits(seqs, kv_heads, block, window)
     need = lib().seventy_drafter_attention_workspace(seqs, kv_heads, splits)
     ws = torch.empty(need // 4 + 1, dtype=torch.float32, device=q.device)
     out = torch.empty(rows, heads * d, dtype=torch.float16, device=q.device)

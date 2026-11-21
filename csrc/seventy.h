@@ -309,6 +309,18 @@ SEVENTY_API int seventy_dense_gemm_fp8(void *out, int out_fp32, const void *x, c
                                        int m, int n, int n_padded, int k, int splits, int warps, void *workspace,
                                        int64_t workspace_bytes, const float *row_scale, cudaStream_t stream);
 
+/*
+ * The FP8 GEMM on dense_gemm_fp8_wk_kernel (csrc/dense_gemm.cu): warps per block (2, 4 or 8) split each block's k
+ * range, and splits blocks per 32-column tile split k. With splits > 1, workspace holds
+ * seventy_dense_gemm_fp8_wk_workspace bytes and counters at least n_padded / 32 int32 that are zero before the first
+ * call; each call leaves them at zero. Calls that share counters must not run at the same time.
+ */
+SEVENTY_API int64_t seventy_dense_gemm_fp8_wk_workspace(int m, int n_padded, int splits);
+SEVENTY_API int seventy_dense_gemm_fp8_wk(void *out, int out_fp32, const void *x, const void *wpk,
+                                          const float *col_scale, int m, int n, int n_padded, int k, int splits,
+                                          int warps, void *workspace, int64_t workspace_bytes, int *counters,
+                                          const float *row_scale, cudaStream_t stream);
+
 /* DFlash2 drafter kernels (see csrc/drafter.cu; head size 128). */
 SEVENTY_API int seventy_drafter_norm(void *out, float *residual_out, const void *x, int x_fp32,
                                      const float *residual_in, const float *weight, int rows, int dim, float eps,
@@ -320,7 +332,7 @@ SEVENTY_API int seventy_drafter_qk(void *q_out, void *k_ring, void *v_ring, cons
                                    const float *kv, int64_t kv_row_stride, const float *q_norm, const float *k_norm,
                                    const int64_t *positions, const int64_t *slots, const float *inv_freq, int rows,
                                    int heads, int kv_heads, int head_dim, int ring, float eps, cudaStream_t stream);
-SEVENTY_API int seventy_drafter_attention_splits(int block, int window);
+SEVENTY_API int seventy_drafter_attention_splits(int seqs, int kv_heads, int block, int window);
 SEVENTY_API int64_t seventy_drafter_attention_workspace(int seqs, int kv_heads, int splits);
 SEVENTY_API int seventy_drafter_attention(void *out, const void *q, const void *k_ring, const void *v_ring,
                                           const int64_t *slots, const int64_t *starts, int seqs, int heads,

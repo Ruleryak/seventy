@@ -99,6 +99,11 @@ def test_drafter_qk_and_attention():
     torch.testing.assert_close(kr[rs, idx].float(), ref.k_ring[0][rs, idx].float(), rtol=0, atol=4e-3)
     torch.testing.assert_close(vr[rs, idx].float(), ref.v_ring[0][rs, idx].float(), rtol=0, atol=0)
     assert torch.equal(kr[0], k_ring[0]) and torch.equal(kr[3], k_ring[3])
+    from seventy.ops._lib import lib
+
+    need = lib().seventy_drafter_attention_workspace(b, kv, lib().seventy_drafter_attention_splits(b, kv, blk, window))
+    poison = torch.full((need // 4 + 1,), float("nan"), device=DEV)
+    del poison
     out = kernels.drafter_attention(q16, kr, vr, slots, starts, blk, window, 1.0 / math.sqrt(d))
     err = (out.float() - want.float()).abs().max().item()
     assert err < 2e-2 * max(1.0, want.float().abs().max().item()), err

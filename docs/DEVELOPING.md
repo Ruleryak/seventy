@@ -122,7 +122,9 @@ engine or for the tests. Without the variable, the default path runs.
 | `SEVENTY_GDN_COMMIT` | `loop` | Gated DeltaNet state commit after speculative verify in one launch per layer |
 | `SEVENTY_DRAFTER_FUSED` | `0` | Drafter without the fused kernels |
 | `SEVENTY_DRAFTER_FP8` | `0` | Drafter layers in FP16 |
+| `SEVENTY_DRAFTER_FP8_WK` | `0` | Drafter FP8 GEMMs on the kernel with a k split over blocks and a reduce kernel |
 | `SEVENTY_DRAFTER_FP8_EXTRA` | `none` | The drafter's fc, kv_all, selector and convolution projections in FP16 (or list the ones to keep in FP8, from `fc,kv_all,sel_hidden,conv`) |
+| `SEVENTY_DRAFTER_FC_SPLIT` | `0` | The drafter's fc weight whole on every GPU (not split over the input columns) |
 | `SEVENTY_DRAFTER_WALK` | `torch` | Drafter selector walk in PyTorch |
 | `SEVENTY_SPEC_ACCEPT` | `torch` | Speculative acceptance in PyTorch |
 

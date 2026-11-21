@@ -14,6 +14,11 @@
  * one block of W warps per 32-column tile, the warps split k into contiguous ranges of 64-steps, each warp stages its
  * own activations and prefetches the next step's weights and activations into registers, and the warps add their
  * partial tiles in shared memory at the end: no workspace, no reduce kernel and no block barrier in the main loop.
+ *
+ * FP8 weights use dense_gemm_fp8_wk_kernel, the same structure with k also split over gridDim.y blocks for narrow
+ * weights: each block writes its partial tile to the workspace, and the last block of a tile (a counter per tile,
+ * which that block sets back to zero) adds the partials in split order. The sum is thus the same whichever block
+ * ends last, and no reduce kernel runs.
  */
 
 namespace seventy {
@@ -131,11 +136,14 @@ __global__ void __launch_bounds__(W * 32) dense_gemm_kernel(void *out, int out_f
  * speculative drafter only). Weights are packed like the FP16 ones but one byte per value, [n_padded / 32, k / 64,
  * 32 lanes, 64 bytes]. E4M3 to FP16 without a table: with the byte in the high byte of a half, (h >> 1) keeps the
  * exponent and mantissa (bits 13..7) and the sign stays in bit 15, which is the E4M3 value times 2^-8 exactly for
- * every finite value (subnormals included); col_scale holds the channel scale times 2^8.
+ * every finite value (subnormals included); col_scale holds the channel scale times 2^8. In three instructions: a
+ * PRMT that puts byte b in the low byte of a half and copies of its sign bit in the high byte (selector 0x9180 for
+ * bytes 0 and 1, 0xB3A2 for bytes 2 and 3), a shift left by 7 and a mask that keeps the sign and bits 13..7.
  */
 __device__ __forceinline__ uint32_t e4m3x2_to_half2(uint32_t word, uint32_t sel) {
-  const uint32_t v = __byte_perm(word, 0u, sel);
-  return ((v >> 1) & 0x3F803F80u) | (v & 0x80008000u);
+  uint32_t v;
+  asm("prmt.b32 %0, %1, 0, %2;" : "=r"(v) : "r"(word), "r"(sel));
+  return (v << 7) & 0xBF80BF80u;
 }
 
 template <int MT, int W>
@@ -205,8 +213,8 @@ __global__ void __launch_bounds__(W * 32) dense_gemm_fp8_kernel(void *out, int o
       for (int i = 0; i < 8; ++i) {
         const uint32_t lo = (i & 1) ? cur[i >> 1].z : cur[i >> 1].x;
         const uint32_t hi = (i & 1) ? cur[i >> 1].w : cur[i >> 1].y;
-        const uint32_t b0 = e4m3x2_to_half2(lo, 0x1404u), b1 = e4m3x2_to_half2(lo, 0x3424u);
-        const uint32_t b2 = e4m3x2_to_half2(hi, 0x1404u), b3 = e4m3x2_to_half2(hi, 0x3424u);
+        const uint32_t b0 = e4m3x2_to_half2(lo, 0x9180u), b1 = e4m3x2_to_half2(lo, 0xB3A2u);
+        const uint32_t b2 = e4m3x2_to_half2(hi, 0x9180u), b3 = e4m3x2_to_half2(hi, 0xB3A2u);
 #pragma unroll
         for (int t = 0; t < MT; ++t) {
           const uint4 a = stage[(t * 8 + idx) * kRowStride + i];
@@ -392,6 +400,163 @@ void launch_wk(void *out, int out_fp32, const half *x, const uint4 *wpk, int m, 
   dense_gemm_wk_kernel<MT, W><<<n_tiles, W * 32, kBytes, stream>>>(out, out_fp32, x, wpk, m, n, k, row_scale);
 }
 
+template <int MT, int W>
+__global__ void __launch_bounds__(W * 32) dense_gemm_fp8_wk_kernel(void *out, int out_fp32, const half *x,
+                                                                   const uint4 *wpk, const float *col_scale, int m,
+                                                                   int n, int k, const float *row_scale, float *ws,
+                                                                   int *counters) {
+  constexpr int kRows = MT * 8;
+  constexpr int kLoads = kRows * 8 / 32;
+  extern __shared__ uint4 fwk_smem[];
+  auto stage = reinterpret_cast<uint4 (*)[kRows * kRowStride]>(fwk_smem);
+  float *red = reinterpret_cast<float *>(fwk_smem);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int ksteps = k / kStepK;
+  const int splits = gridDim.y;
+  const int q0 = blockIdx.y * ksteps / splits;
+  const int q1 = (blockIdx.y + 1) * ksteps / splits;
+  const int s0 = q0 + warp * (q1 - q0) / W;
+  const int s1 = q0 + (warp + 1) * (q1 - q0) / W;
+  const int steps = s1 - s0;
+  const int quad = (lane >> 2) & 3;
+  const int idx = (lane & 3) + ((lane >> 4) << 2);
+  const uint4 *wp = wpk + (static_cast<int64_t>(tile) * ksteps + s0) * 32 * 4 + lane * 4;
+  const uint4 *xbase = reinterpret_cast<const uint4 *>(x) + s0 * 8 + (lane & 7);
+  int xrow[kLoads];
+#pragma unroll
+  for (int l = 0; l < kLoads; ++l) xrow[l] = min((lane >> 3) + 4 * l, m - 1) * (k / 8);
+  const int dst0 = (lane >> 3) * kRowStride + (lane & 7);
+
+  float acc[MT][8];
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[t][j] = 0.0f;
+
+  uint4 *mine = stage[warp];
+  uint4 ar[kLoads];
+  uint4 wb[4];
+  if (steps > 0) {
+#pragma unroll
+    for (int l = 0; l < kLoads; ++l) mine[dst0 + 4 * kRowStride * l] = __ldg(xbase + xrow[l]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) wb[i] = __ldg(wp + i);
+  }
+  __syncwarp();
+  for (int s = 0; s < steps; ++s) {
+    const bool more = s + 1 < steps;
+    uint4 cur[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) cur[i] = wb[i];
+    if (more) {
+#pragma unroll
+      for (int l = 0; l < kLoads; ++l) ar[l] = __ldg(xbase + xrow[l] + (s + 1) * 8);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) wb[i] = __ldg(wp + static_cast<int64_t>(s + 1) * 32 * 4 + i);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t lo = (i & 1) ? cur[i >> 1].z : cur[i >> 1].x;
+      const uint32_t hi = (i & 1) ? cur[i >> 1].w : cur[i >> 1].y;
+      const uint32_t b0 = e4m3x2_to_half2(lo, 0x9180u), b1 = e4m3x2_to_half2(lo, 0xB3A2u);
+      const uint32_t b2 = e4m3x2_to_half2(hi, 0x9180u), b3 = e4m3x2_to_half2(hi, 0xB3A2u);
+#pragma unroll
+      for (int t = 0; t < MT; ++t) {
+        const uint4 a = mine[(t * 8 + idx) * kRowStride + i];
+        mma_8x8x4(acc[t], a.x, a.y, b0, b1);
+        mma_8x8x4(acc[t], a.z, a.w, b2, b3);
+      }
+    }
+    __syncwarp();
+    if (more) {
+#pragma unroll
+      for (int l = 0; l < kLoads; ++l) mine[dst0 + 4 * kRowStride * l] = ar[l];
+    }
+    __syncwarp();
+  }
+
+  __syncthreads();
+  if (warp > 0) {
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) red[(warp - 1) * kRows * 32 + t * 256 + j * 32 + lane] = acc[t][j];
+  }
+  __syncthreads();
+  if (warp > 0) return;
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+      for (int w = 0; w < W - 1; ++w) acc[t][j] += red[w * kRows * 32 + t * 256 + j * 32 + lane];
+  if (splits > 1) {
+    float *part = ws + (static_cast<int64_t>(blockIdx.y) * gridDim.x + tile) * (kRows * 32);
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) part[t * 256 + j * 32 + lane] = acc[t][j];
+    __threadfence();
+    __syncwarp();
+    int last = 0;
+    if (lane == 0) last = atomicAdd(counters + tile, 1) == splits - 1;
+    if (!__shfl_sync(0xffffffffu, last, 0)) return;
+    __threadfence();
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[t][j] = 0.0f;
+    for (int p = 0; p < splits; ++p) {
+      const float *src = ws + (static_cast<int64_t>(p) * gridDim.x + tile) * (kRows * 32);
+#pragma unroll
+      for (int t = 0; t < MT; ++t)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[t][j] += __ldcg(src + t * 256 + j * 32 + lane);
+    }
+    if (lane == 0) counters[tile] = 0;
+  }
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int row = t * 8 + (idx & 1) + 2 * ((j >> 1) & 1) + 4 * (idx >> 2);
+      const int col = tile * 32 + quad * 8 + (j & 1) + 2 * ((idx >> 1) & 1) + 4 * (j >> 2);
+      if (row >= m || col >= n) continue;
+      float v = acc[t][j] * col_scale[col];
+      if (row_scale != nullptr) v *= row_scale[row];
+      if (out_fp32) static_cast<float *>(out)[static_cast<int64_t>(row) * n + col] = v;
+      else static_cast<half *>(out)[static_cast<int64_t>(row) * n + col] = __float2half_rn(v);
+    }
+}
+
+template <int MT, int W>
+void launch_fp8_wk(void *out, int out_fp32, const half *x, const uint4 *wpk, const float *cs, int m, int n,
+                   int n_tiles, int k, int splits, const float *row_scale, float *ws, int *counters,
+                   cudaStream_t stream) {
+  constexpr int kBytes = W * MT * 8 * kRowStride * static_cast<int>(sizeof(uint4));
+  static_assert(kBytes >= (W - 1) * MT * 8 * 32 * static_cast<int>(sizeof(float)), "reduction must fit the staging area");
+  if constexpr (kBytes > 48 * 1024) {
+    static bool configured = false;
+    if (!configured) {
+      cudaFuncSetAttribute(dense_gemm_fp8_wk_kernel<MT, W>, cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes);
+      configured = true;
+    }
+  }
+  dense_gemm_fp8_wk_kernel<MT, W><<<dim3(n_tiles, splits), W * 32, kBytes, stream>>>(out, out_fp32, x, wpk, cs, m, n, k,
+                                                                                     row_scale, ws, counters);
+}
+
+template <int MT>
+void launch_fp8_wk_warps(int warps, void *out, int out_fp32, const half *x, const uint4 *wpk, const float *cs, int m,
+                         int n, int n_tiles, int k, int splits, const float *row_scale, float *ws, int *counters,
+                         cudaStream_t stream) {
+  if (warps >= 8) launch_fp8_wk<MT, 8>(out, out_fp32, x, wpk, cs, m, n, n_tiles, k, splits, row_scale, ws, counters, stream);
+  else if (warps >= 4) launch_fp8_wk<MT, 4>(out, out_fp32, x, wpk, cs, m, n, n_tiles, k, splits, row_scale, ws, counters, stream);
+  else launch_fp8_wk<MT, 2>(out, out_fp32, x, wpk, cs, m, n, n_tiles, k, splits, row_scale, ws, counters, stream);
+}
+
 template <int MT>
 int launch(int warps, void *out, int out_fp32, float *ws, const half *x, const uint4 *wpk, int m, int n, int n_tiles,
            int k, int splits, const float *row_scale, cudaStream_t stream) {
@@ -489,6 +654,41 @@ SEVENTY_API int seventy_dense_gemm_fp8(void *out, int out_fp32, const void *x, c
     const int64_t total = static_cast<int64_t>(m) * n;
     dense_reduce_scaled_kernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0, stream>>>(
         out, out_fp32, ws, col_scale, m, n, n_padded, got, row_scale);
+  }
+  return launch_status();
+}
+
+SEVENTY_API int64_t seventy_dense_gemm_fp8_wk_workspace(int m, int n_padded, int splits) {
+  return splits > 1 ? static_cast<int64_t>(splits) * (n_padded / 32) * ((m + 7) / 8) * 256 *
+                          static_cast<int64_t>(sizeof(float))
+                    : 0;
+}
+
+SEVENTY_API int seventy_dense_gemm_fp8_wk(void *out, int out_fp32, const void *x, const void *wpk,
+                                          const float *col_scale, int m, int n, int n_padded, int k, int splits,
+                                          int warps, void *workspace, int64_t workspace_bytes, int *counters,
+                                          const float *row_scale, cudaStream_t stream) {
+  using namespace seventy;
+  if (out == nullptr || x == nullptr || wpk == nullptr || col_scale == nullptr || m <= 0 || m > 64 || n <= 0 ||
+      n_padded < n || n_padded % 32 || k <= 0 || k % kStepK || splits < 1 || splits > 65535 || warps < 1)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (splits > 1 && (workspace == nullptr || counters == nullptr ||
+                     workspace_bytes < seventy_dense_gemm_fp8_wk_workspace(m, n_padded, splits)))
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (!aligned(x, 16) || !aligned(wpk, 16)) return SEVENTY_ERR_MISALIGNED;
+  const int n_tiles = n_padded / 32;
+  auto *ws = static_cast<float *>(workspace);
+  const auto *xh = static_cast<const half *>(x);
+  const auto *wp = static_cast<const uint4 *>(wpk);
+  switch ((m + 7) / 8) {
+    case 1: launch_fp8_wk_warps<1>(warps, out, out_fp32, xh, wp, col_scale, m, n, n_tiles, k, splits, row_scale, ws, counters, stream); break;
+    case 2: launch_fp8_wk_warps<2>(warps, out, out_fp32, xh, wp, col_scale, m, n, n_tiles, k, splits, row_scale, ws, counters, stream); break;
+    case 3: launch_fp8_wk_warps<3>(warps, out, out_fp32, xh, wp, col_scale, m, n, n_tiles, k, splits, row_scale, ws, counters, stream); break;
+    case 4: launch_fp8_wk_warps<4>(warps, out, out_fp32, xh, wp, col_scale, m, n, n_tiles, k, splits, row_scale, ws, counters, stream); break;
+    case 5: launch_fp8_wk_warps<5>(warps, out, out_fp32, xh, wp, col_scale, m, n, n_tiles, k, splits, row_scale, ws, counters, stream); break;
+    case 6: launch_fp8_wk_warps<6>(warps, out, out_fp32, xh, wp, col_scale, m, n, n_tiles, k, splits, row_scale, ws, counters, stream); break;
+    case 7: launch_fp8_wk_warps<7>(warps, out, out_fp32, xh, wp, col_scale, m, n, n_tiles, k, splits, row_scale, ws, counters, stream); break;
+    default: launch_fp8_wk_warps<8>(warps, out, out_fp32, xh, wp, col_scale, m, n, n_tiles, k, splits, row_scale, ws, counters, stream); break;
   }
   return launch_status();
 }

@@ -21,7 +21,6 @@
 namespace seventy {
 namespace {
 
-constexpr int kMaxTaps = 4;
 constexpr int kConvThreads = 256;
 constexpr int kConvTokens = 32;
 
