@@ -14,12 +14,16 @@ other side's taps; the same around the MLP. Each mask position predicts the toke
 Numerics: the drafter was trained in BF16, and its residual stream grows past the FP16 range. The residual stream,
 the convolutions and every large intermediate stay in FP32; the tensor cores see FP16 inputs that fit (norm
 outputs, attention outputs, and the MLP's down-projection input scaled per row), with FP32 outputs. On GPUs the
-layers' weights and the candidate head (a copy of the target's LM head shard) are FP8 E4M3 with one scale per
-output row: half the weight traffic, and half the drafter's memory, which goes to the KV cache.
-SEVENTY_DRAFTER_FP8=0 keeps them FP16. Acceptance uses this drafter's own draft probabilities, so the target's
-output distribution is unchanged whatever the drafter's precision. Measured with sampling (thinking on,
-temperature 0.6, 2K and 32K prompts, 4 streams): 31.9% of the drafted tokens accepted with FP16 weights and 32.0%
-with FP8 (two runs each; runs of one setting differ by about 3 points).
+layers' weights, the input projection (fc), the context keys and values (kv_all), the selector's hidden
+projection, the convolutions' kernel projections and the candidate head (a copy of the target's LM head shard) are
+FP8 E4M3 with one scale per output row: half the weight traffic, and half the drafter's memory, which goes to the
+KV cache. SEVENTY_DRAFTER_FP8=0 keeps them all FP16; SEVENTY_DRAFTER_FP8_EXTRA lists which of fc, kv_all,
+sel_hidden and conv are FP8 (none: only the layers and the candidate head). Acceptance uses this drafter's own
+draft probabilities, so the target's output distribution is unchanged whatever the drafter's precision. Measured
+with sampling (thinking on, temperature 0.6, 2K and 32K prompts, 4 streams): 31.9% of the drafted tokens accepted
+with FP16 layers and 32.0% with FP8 (two runs each; runs of one setting differ by about 3 points). Greedy, 4
+streams: 2.47 / 2.38 accepted drafts per step and sequence at 2K / 32K with fc, kv_all, sel_hidden and conv in
+FP16, 2.48 / 2.38 with them in FP8, 1.3 to 1.5% faster.
 
 Selector: the top-k tokens of each mask position (from the LM head), and edge scores
 score[l, p, c] = logit[l, c] + sum_r pred[token before (l, p)]_r * hidden[l]_r * succ[candidate (l, c)]_r,
@@ -143,7 +147,7 @@ class Drafter:
         if self.device.type == "cuda" and dtype == torch.float16:
             from ..ops.kernels import DenseWeight, DenseWeightFP8
 
-            fp8_extra = set(os.environ.get("SEVENTY_DRAFTER_FP8_EXTRA", "").split(","))
+            fp8_extra = set(os.environ.get("SEVENTY_DRAFTER_FP8_EXTRA", "fc,kv_all,sel_hidden,conv").split(","))
 
             for layer in self.layers:
                 if self.fused:

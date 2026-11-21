@@ -121,7 +121,7 @@ engine or for the tests. Without the variable, the default path runs.
 | `SEVENTY_GDN_PREPARE` | `torch` | Gated DeltaNet prefill preparation in PyTorch |
 | `SEVENTY_DRAFTER_FUSED` | `0` | Drafter without the fused kernels |
 | `SEVENTY_DRAFTER_FP8` | `0` | Drafter layers in FP16 |
-| `SEVENTY_DRAFTER_FP8_EXTRA` | `fc,kv_all,sel_hidden,conv` | These drafter projections in FP8 too (fewer names select fewer) |
+| `SEVENTY_DRAFTER_FP8_EXTRA` | `none` | The drafter's fc, kv_all, selector and convolution projections in FP16 (or list the ones to keep in FP8, from `fc,kv_all,sel_hidden,conv`) |
 | `SEVENTY_DRAFTER_WALK` | `torch` | Drafter selector walk in PyTorch |
 | `SEVENTY_SPEC_ACCEPT` | `torch` | Speculative acceptance in PyTorch |
 
