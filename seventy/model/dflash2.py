@@ -143,6 +143,8 @@ class Drafter:
         if self.device.type == "cuda" and dtype == torch.float16:
             from ..ops.kernels import DenseWeight, DenseWeightFP8
 
+            fp8_extra = set(os.environ.get("SEVENTY_DRAFTER_FP8_EXTRA", "").split(","))
+
             for layer in self.layers:
                 if self.fused:
                     layer.q_cols = layer.q.shape[0]
@@ -156,8 +158,11 @@ class Drafter:
                     if getattr(layer, name) is not None:
                         setattr(layer, name, (DenseWeightFP8 if lossy else DenseWeight)(getattr(layer, name)))
                 layer.qkv_src_q = layer.qkv_src_kv = None
-                layer.conv = {side: (base, DenseWeight(proj)) for side, (base, proj) in layer.conv.items()}
-            self.fc, self.kv_all, self.sel_hidden = DenseWeight(self.fc), DenseWeight(self.kv_all), DenseWeight(self.sel_hidden)
+                conv_w = DenseWeightFP8 if lossy and "conv" in fp8_extra else DenseWeight
+                layer.conv = {side: (base, conv_w(proj)) for side, (base, proj) in layer.conv.items()}
+            pick = lambda name: DenseWeightFP8 if self.fp8 and name in fp8_extra else DenseWeight
+            self.fc, self.kv_all = pick("fc")(self.fc), pick("kv_all")(self.kv_all)
+            self.sel_hidden = pick("sel_hidden")(self.sel_hidden)
             if self.fp8 and target.lm_head_packed is not None:
                 self.cand_head = DenseWeightFP8.from_dense(target.lm_head_packed)
             torch.cuda.empty_cache()
@@ -346,16 +351,27 @@ class Drafter:
             logits = self.target.head(h)
         else:
             logits = h.float() @ self.target.lm_head.float().T
-        values, ids = torch.topk(logits, k, dim=-1)
-        ids = ids + self.target.vocab_span[0]
+        if not logits.is_cuda or k > 64 or logits.dtype != torch.float32:
+            values, ids = torch.topk(logits, k, dim=-1)
+            ids = ids + self.target.vocab_span[0]
+            if self.par.size > 1:
+                vs = [torch.empty_like(values) for _ in range(self.par.size)]
+                ks = [torch.empty_like(ids) for _ in range(self.par.size)]
+                torch.distributed.all_gather(vs, values)
+                torch.distributed.all_gather(ks, ids)
+                values, sel = torch.topk(torch.cat(vs, -1), k, dim=-1)
+                ids = torch.cat(ks, -1).gather(-1, sel)
+            return values, ids
+        from ..ops import kernels
+
+        values, ids = kernels.topk(logits.contiguous(), k, id_offset=self.target.vocab_span[0])
         if self.par.size > 1:
-            vs = [torch.empty_like(values) for _ in range(self.par.size)]
-            ks = [torch.empty_like(ids) for _ in range(self.par.size)]
-            torch.distributed.all_gather(vs, values)
-            torch.distributed.all_gather(ks, ids)
-            values, sel = torch.topk(torch.cat(vs, -1), k, dim=-1)
-            ids = torch.cat(ks, -1).gather(-1, sel)
-        return values, ids
+            both = torch.cat((values, ids.view(torch.float32)), dim=-1)
+            parts = [torch.empty_like(both) for _ in range(self.par.size)]
+            torch.distributed.all_gather(parts, both)
+            values, ids = kernels.topk(torch.cat([p[:, :k] for p in parts], dim=-1), k,
+                                       ids=torch.cat([p[:, k:].view(torch.int32) for p in parts], dim=-1))
+        return values, ids.long()
 
     def walk(self, anchors, values, ids, h, temps: torch.Tensor, gumbel: torch.Tensor | None) -> Draft:
         """The selector walk for a batch, on the device. gumbel: [B, positions, top_k] noise (or None: greedy)."""

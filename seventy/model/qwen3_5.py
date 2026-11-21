@@ -263,15 +263,25 @@ class Qwen35TextModel:
         """(argmax, top k logits, their token ids) of final hidden states x, from each rank's vocabulary shard: only
         the shards' top k values and ids (one all-gather) cross the ranks, not the full logits."""
         local = self.local_logits(x)
-        v, i = torch.topk(local, min(k, local.shape[-1]), dim=-1)
-        i = (i + self.vocab_span[0]).int()
-        if self.par.size == 1:
-            return merge_top([v], [i], v.shape[-1])
+        kk = min(k, local.shape[-1])
+        if not local.is_cuda or kk > 64:
+            v, i = torch.topk(local, kk, dim=-1)
+            i = (i + self.vocab_span[0]).int()
+            if self.par.size == 1:
+                return merge_top([v], [i], kk)
+        else:
+            v, i = kernels.topk(local, kk, id_offset=self.vocab_span[0])
+            if self.par.size == 1:
+                return i[:, 0].long(), v, i.long()
         both = torch.cat((v, i.view(torch.float32)), dim=-1)
         parts = [torch.empty_like(both) for _ in range(self.par.size)]
         torch.distributed.all_gather(parts, both)
-        kk = v.shape[-1]
-        return merge_top([p[:, :kk] for p in parts], [p[:, kk:].view(torch.int32) for p in parts], kk)
+        if not local.is_cuda or kk > 64:
+            return merge_top([p[:, :kk] for p in parts], [p[:, kk:].view(torch.int32) for p in parts], kk)
+        vals = torch.cat([p[:, :kk] for p in parts], dim=-1)
+        ids = torch.cat([p[:, kk:].view(torch.int32) for p in parts], dim=-1)
+        v, i = kernels.topk(vals, kk, ids=ids)
+        return i[:, 0].long(), v, i.long()
 
     @torch.inference_mode()
     def forward(

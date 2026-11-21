@@ -214,6 +214,18 @@ SEVENTY_API int seventy_prefill_attention(void *out, const void *q, const void *
                                           void *workspace, int64_t workspace_bytes, cudaStream_t stream);
 
 /*
+ * The k <= 64 largest values of every row of x [rows, n] (FP32, row stride ld) and their ids, sorted by value
+ * descending and then id ascending (csrc/topk.cu): values [rows, k], ids_out [rows, k] (int32). The id of element e
+ * is ids[r * ids_ld + e] if ids is given (negative ids are skipped), else id_offset + e. Rows with fewer than k
+ * elements are padded with -inf and id -1. Rows longer than 4096 need seventy_topk_workspace(rows, n, k) bytes of
+ * workspace (else it may be null).
+ */
+SEVENTY_API int64_t seventy_topk_workspace(int rows, int n, int k);
+SEVENTY_API int seventy_topk(float *values, int *ids_out, const float *x, int64_t ld, const int *ids, int64_t ids_ld,
+                             int rows, int n, int k, int id_offset, void *workspace, int64_t workspace_bytes,
+                             cudaStream_t stream);
+
+/*
  * Small-batch tensor-parallel all-reduce over peer GPU memory, fused with the residual add and RMS norm
  * (see csrc/allreduce.cu). seventy_ar_alloc allocates this rank's buffer of seventy_ar_buffer_bytes(world,
  * slot_bytes) bytes (slot_bytes a multiple of 32), prepares it, and returns its 64-byte CUDA IPC handle; seventy_ar_open maps a peer's handle; seventy_ar_context builds the

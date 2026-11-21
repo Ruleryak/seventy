@@ -274,6 +274,26 @@ def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, 
     return out
 
 
+def topk(x: torch.Tensor, k: int, id_offset: int = 0, ids: torch.Tensor | None = None
+         ) -> tuple[torch.Tensor, torch.Tensor]:
+    """(values FP32 [rows, k], ids int32 [rows, k]) of the k <= 64 largest values of each row of FP32 x [rows, n],
+    by value descending and then id ascending (the first is the argmax with the smallest id). The id of element e is
+    ids[row, e] (int32, negative ids skipped) or id_offset + e."""
+    rows, n = x.shape
+    if x.dtype != torch.float32 or x.stride(1) != 1 or (ids is not None and (ids.dtype != torch.int32
+                                                                              or ids.stride(1) != 1)):
+        raise ValueError("topk takes FP32 rows (and int32 ids) with unit column stride")
+    values = torch.empty(rows, k, dtype=torch.float32, device=x.device)
+    out_ids = torch.empty(rows, k, dtype=torch.int32, device=x.device)
+    need = lib().seventy_topk_workspace(rows, n, k)
+    ws = torch.empty(max(1, need // 4), dtype=torch.float32, device=x.device) if need else None
+    code = lib().seventy_topk(values.data_ptr(), out_ids.data_ptr(), x.data_ptr(), x.stride(0),
+                              ids.data_ptr() if ids is not None else None, ids.stride(0) if ids is not None else 0,
+                              rows, n, k, id_offset, ws.data_ptr() if ws is not None else None, need, _stream(x))
+    check("topk", code)
+    return values, out_ids
+
+
 _last_tiles: tuple = (None, None)
 
 
