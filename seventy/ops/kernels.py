@@ -274,10 +274,20 @@ def decode_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, 
     return out
 
 
+_last_tiles: tuple = (None, None)
+
+
 def prefill_tiles(query_start: list[int], device) -> torch.Tensor:
-    """(sequence, first new token) of every 64-token query tile, int32 [tiles, 2]."""
+    """(sequence, first new token) of every 64-token query tile, int32 [tiles, 2]. The last result is kept, so the
+    layers of one step copy it to the device once."""
+    global _last_tiles
+    key = (tuple(query_start), str(device))
+    if _last_tiles[0] == key:
+        return _last_tiles[1]
     tiles = [(b, q0) for b in range(len(query_start) - 1) for q0 in range(0, query_start[b + 1] - query_start[b], 64)]
-    return torch.tensor(tiles, dtype=torch.int32, device=device).view(-1, 2)
+    out = torch.tensor(tiles, dtype=torch.int32, device=device).view(-1, 2)
+    _last_tiles = (key, out)
+    return out
 
 
 GROUPED_ROWS = 48
@@ -331,16 +341,101 @@ def grouped_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor,
     return out
 
 
+PREFILL_MIN_SPLIT_TILES = 8
+PREFILL_GROUPED_MAX_TOKENS = 4
+PREFILL_SPLIT_OVERHEAD = 8.0
+
+
+def prefill_splits(tiles: int, keys: int, device) -> int:
+    """Key splits for seventy_prefill_attention: the count s that minimizes waves(tiles * s blocks) * (overhead +
+    key tiles per split), with at least PREFILL_MIN_SPLIT_TILES key tiles of 32 per split. The overhead (Q staging,
+    the epilogue and the merge, in key tiles) is PREFILL_SPLIT_OVERHEAD."""
+    sms = _sm_count(device)
+    key_tiles = -(-keys // 32)
+    best, best_cost = 1, None
+    for s in range(1, max(1, min(256, key_tiles // PREFILL_MIN_SPLIT_TILES)) + 1):
+        cost = -(-tiles * s // sms) * (PREFILL_SPLIT_OVERHEAD + key_tiles / s)
+        if best_cost is None or cost < best_cost:
+            best, best_cost = s, cost
+    return best
+
+
+_last_prefill_tiles: tuple = (None, None)
+
+
+def prefill_attention_tiles(query_start: list[int], hq: int, hkv: int, device) -> torch.Tensor:
+    """The tiles of seventy_prefill_attention, int32 [tiles, 4] {sequence, first token, first head, heads << 8 |
+    tokens}: 64 tokens of one head, and for the last tokens of a sequence (fewer than 64) the packed tiles of
+    64 // (hq / hkv) tokens times the hq / hkv heads of a KV head, if they need fewer blocks. The last result is
+    kept, so the layers of one step copy it to the device once."""
+    global _last_prefill_tiles
+    key = (tuple(query_start), hq, hkv, str(device))
+    if _last_prefill_tiles[0] == key:
+        return _last_prefill_tiles[1]
+    g = hq // hkv
+    per = 64 // g
+    tiles = []
+    for b in range(len(query_start) - 1):
+        n = query_start[b + 1] - query_start[b]
+        full = n // 64
+        tiles += [(b, 64 * i, h, 1 << 8 | 64) for i in range(full) for h in range(hq)]
+        rest, q0 = n - 64 * full, 64 * full
+        if rest == 0:
+            continue
+        packed = -(-rest // per)
+        if packed * hkv < hq:
+            tiles += [(b, q0 + per * i, kh * g, g << 8 | min(per, rest - per * i)) for i in range(packed)
+                      for kh in range(hkv)]
+        else:
+            tiles += [(b, q0, h, 1 << 8 | rest) for h in range(hq)]
+    out = torch.tensor(tiles, dtype=torch.int32, device=device).view(-1, 4)
+    _last_prefill_tiles = (key, out)
+    return out
+
+
+def prefill_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                      block_tables: torch.Tensor, query_start: list[int], query_start_t: torch.Tensor,
+                      context_lens_t: torch.Tensor, context_lens: list[int], scale: float, k_scale: torch.Tensor,
+                      v_scale: torch.Tensor, splits: int | None = None) -> torch.Tensor:
+    """Gated causal attention output [T, hq * 256] for prefill steps over INT8 caches, on the split-D kernel, with
+    the keys split as prefill_splits chooses."""
+    t, hq, _ = q.shape
+    hkv, block_size = k_cache.shape[2], k_cache.shape[1]
+    tiles = prefill_attention_tiles(query_start, hq, hkv, q.device)
+    n = tiles.shape[0]
+    if splits is None:
+        keys = max(c + query_start[b + 1] - query_start[b] for b, c in enumerate(context_lens))
+        splits = prefill_splits(n, keys, q.device)
+    ws = torch.empty(t * hq * splits * 258 if splits > 1 else 1, dtype=torch.float32, device=q.device)
+    out = torch.empty(t, hq * 256, dtype=torch.float16, device=q.device)
+    code = lib().seventy_prefill_attention(
+        out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), k_scale.data_ptr(), v_scale.data_ptr(),
+        qkv.data_ptr(), qkv.shape[1], tiles.data_ptr(), n, block_tables.data_ptr(), block_tables.shape[1],
+        query_start_t.data_ptr(), context_lens_t.data_ptr(), t, block_size, hq, hkv, 256, splits, scale,
+        ws.data_ptr() if splits > 1 else None, ws.numel() * 4 if splits > 1 else 0, _stream(q),
+    )
+    check("prefill_attention", code)
+    return out
+
+
 def flash_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                     block_tables: torch.Tensor, query_start: list[int], query_start_t: torch.Tensor,
                     context_lens_t: torch.Tensor, scale: float, k_scale: torch.Tensor | None = None,
                     v_scale: torch.Tensor | None = None, context_lens: list[int] | None = None) -> torch.Tensor:
     """Gated causal attention output [T, hq * 256] for prefill steps. With INT8 caches and the host context lengths,
-    it runs on the verify kernel (grouped_attention); SEVENTY_PREFILL_ATTN=tiles keeps the per-head prefill kernel."""
+    it runs on the split-D kernel (prefill_attention), or on the verify kernel (grouped_attention) when no sequence
+    has more than PREFILL_GROUPED_MAX_TOKENS new tokens. SEVENTY_PREFILL_ATTN=grouped always takes the verify kernel,
+    SEVENTY_PREFILL_ATTN=tiles the per-head prefill kernel."""
     t, hq, _ = q.shape
     hkv, block_size = k_cache.shape[2], k_cache.shape[1]
-    if (k_cache.dtype == torch.int8 and context_lens is not None and hq % hkv == 0 and hq // hkv <= GROUPED_ROWS
-            and block_size & (block_size - 1) == 0 and os.environ.get("SEVENTY_PREFILL_ATTN") != "tiles"):
+    mode = os.environ.get("SEVENTY_PREFILL_ATTN")
+    fast = (k_cache.dtype == torch.int8 and context_lens is not None and hq % hkv == 0
+            and block_size & (block_size - 1) == 0 and mode not in ("tiles", "wmma"))
+    tiny = max(b - a for a, b in zip(query_start, query_start[1:])) <= PREFILL_GROUPED_MAX_TOKENS
+    if fast and mode != "grouped" and not (tiny and hq // hkv <= GROUPED_ROWS):
+        return prefill_attention(q, qkv, k_cache, v_cache, block_tables, query_start, query_start_t, context_lens_t,
+                                 context_lens, scale, k_scale, v_scale)
+    if fast and hq // hkv <= GROUPED_ROWS:
         return grouped_attention(q, qkv, k_cache, v_cache, block_tables, query_start, context_lens, scale, k_scale,
                                  v_scale)
     tiles = prefill_tiles(query_start, q.device)

@@ -200,6 +200,20 @@ SEVENTY_API int seventy_grouped_attention(void *out, const void *q, const void *
                                           int64_t workspace_bytes, cudaStream_t stream);
 
 /*
+ * Prefill attention over the INT8 caches (head_dim 256, power-of-two block_size) on the split-D kernel
+ * (csrc/flash_attention.cu). tiles: int32 [num_tiles, 4], each {sequence, first token, first head h0, g << 8 | n}:
+ * n tokens of the g heads h0 .. h0 + g - 1 (one KV head), n * g <= 64; together the tiles cover every new token of
+ * every head once. tokens = query_start[num_seqs]. splits > 1 also divides the keys of every tile among splits
+ * blocks; the workspace then holds tokens * hq * splits * 258 floats (null and 0 for splits = 1).
+ */
+SEVENTY_API int seventy_prefill_attention(void *out, const void *q, const void *k_cache, const void *v_cache,
+                                          const float *k_scale, const float *v_scale, const void *qkv, int ld,
+                                          const int *tiles, int num_tiles, const int *block_tables, int table_width,
+                                          const int *query_start, const int *context_lens, int tokens,
+                                          int block_size, int hq, int hkv, int head_dim, int splits, float scale,
+                                          void *workspace, int64_t workspace_bytes, cudaStream_t stream);
+
+/*
  * Small-batch tensor-parallel all-reduce over peer GPU memory, fused with the residual add and RMS norm
  * (see csrc/allreduce.cu). seventy_ar_alloc allocates this rank's buffer of seventy_ar_buffer_bytes(world,
  * slot_bytes) bytes (slot_bytes a multiple of 32), prepares it, and returns its 64-byte CUDA IPC handle; seventy_ar_open maps a peer's handle; seventy_ar_context builds the

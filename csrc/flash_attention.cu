@@ -1190,6 +1190,410 @@ __global__ void __launch_bounds__(kPT, 1) flash_attention_mma(
       }
 }
 
+/*
+ * flash_attention_splitd: prefill attention for INT8 caches with the structure of 1Cat-vLLM's sm70 D256 split-D
+ * kernel (Apache-2.0): one block of 8 warps per tile of 64 query rows and 32-key tiles. A tile (sequence, first
+ * token q0, first head h0, heads g and tokens n, as int4 {b, q0, h0, g << 8 | n}) holds row r = token q0 + r / g
+ * of head h0 + r % g, n * g <= 64 rows: g = 1 for 64 tokens of one head, g = hq / hkv to pack the heads of one KV
+ * head for a few tokens. The warps form 4 pairs; pair p owns query rows 16 p .. 16 p + 15.
+ *   S = Q K^T: warp (p, n) takes the pair's 16 rows and the 32 keys over head dimensions 128 n .. 128 n + 127, so
+ *   that each K fragment feeds two mma (shared-memory bandwidth bounds this kernel); the Q fragments of the first
+ *   kSdQReg k steps stay in registers. The pair adds its partial sums through shared memory: warp n keeps rows
+ *   16 p + 8 n .. + 7. It runs the online softmax of these 8 rows on the accumulators (base 2, the scale folded into
+ *   the key scales) and writes P and the rows' rescale factors to shared memory. Only the tiles on the diagonal apply
+ *   the causal mask.
+ *   O += P V: warp (p, n) takes the pair's 16 rows and head dimensions 128 n .. 128 n + 127, so O is 64 registers
+ *   per thread; P is loaded once per tile. O is rescaled only when a row maximum of the warp changed.
+ * A whole key tile of K and of V is staged in shared memory as exact FP16 integers; the K scale multiplies each
+ * score column in FP32 and the V scale times 256 each P column (as verify_int8). Two barriers per tile: after the
+ * first, V of the tile is stored and S computed; after the second (P ready), K of the next tile is stored and P V
+ * computed. The INT8 K and V of the next tile load into registers a whole tile ahead (8 words each per thread).
+ * Shared-memory layouts keep operand loads free of bank conflicts with offsets fixed at compile time: Q, K and V
+ * rows have a pitch of 260 halves, P rows 36. Key k is K row (k & 3) | (k >> 3) << 2 | ((k >> 2) & 1) << 4, so that
+ * each half-warp of S reads 16 consecutive rows, and V row (k & 1) | ((k >> 1) & 1) << 3 | ((k >> 2) & 3) << 1 |
+ * (k >> 4) << 4, so that the 4 keys and 4 column chunks of a half-warp of P V fall in distinct banks. A thread stages
+ * 32 consecutive bytes of one key (two 16-byte loads); each half-warp stages 8 keys whose rows differ modulo 8,
+ * two parts of each, so that these stores are free of bank conflicts too.
+ * Split over keys (grid z = splits > 1): split s of a query tile takes its key tiles ntiles * s / splits ..
+ * ntiles * (s + 1) / splits and writes the unnormalized O and the row maxima (natural log) and sums in the layout
+ * of seventy_verify_attention, which verify_combine_kernel merges and gates.
+ */
+constexpr int kSdRows = 64;
+constexpr int kSdKeys = 32;
+constexpr int kSdThreads = 256;
+constexpr int kSdQPitch = kHead + 4;
+constexpr int kSdKPitch = kHead + 4;
+constexpr int kSdPPitch = kSdKeys + 4;
+constexpr int kSdQReg = 4;
+constexpr int kSdSmem =
+    (kSdRows * kSdQPitch + 2 * kSdKeys * kSdKPitch + kSdRows * kSdPPitch) *
+        static_cast<int>(sizeof(half)) +
+    (2 * kSdKeys + 2 * kSdRows + kSdThreads * 8) * static_cast<int>(sizeof(float));
+
+__device__ __forceinline__ float ex2_approx(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__ int sd_krow(int k) { return (k & 3) | ((k >> 3) << 2) | (((k >> 2) & 1) << 4); }
+
+__device__ __forceinline__ int sd_vrow(int k) {
+  return (k & 1) | (((k >> 1) & 1) << 3) | (((k >> 2) & 3) << 1) | ((k >> 4) << 4);
+}
+
+__device__ __forceinline__ int sd_krow_inv(int r) { return (r & 3) | (((r >> 2) & 3) << 3) | (((r >> 4) & 1) << 2); }
+
+__device__ __forceinline__ int sd_vrow_inv(int r) {
+  return (r & 1) | (((r >> 3) & 1) << 1) | (((r >> 1) & 3) << 2) | ((r >> 4) << 4);
+}
+
+__global__ void __launch_bounds__(kSdThreads, 1) flash_attention_splitd(
+    half *out, const half *q, const int8_t *k_cache, const int8_t *v_cache, const float *k_scale,
+    const float *v_scale, const half *qkv, int ld, const int *tiles, int num_tiles, const int *block_tables,
+    int table_width, const int *query_start, const int *context_lens, int block_shift, int hq, int hkv, float scale,
+    float *partial_o, float *partial_ml) {
+  extern __shared__ __align__(16) unsigned char sdm[];
+  half *qs = reinterpret_cast<half *>(sdm);
+  half *kbuf = qs + kSdRows * kSdQPitch;
+  half *vbuf = kbuf + kSdKeys * kSdKPitch;
+  half *ps = vbuf + kSdKeys * kSdKPitch;
+  float *ksc = reinterpret_cast<float *>(ps + kSdRows * kSdPPitch);
+  float *vsc = ksc + kSdKeys;
+  float *alpha = vsc + kSdKeys;
+  float *lsum = alpha + kSdRows;
+  float *xch = lsum + kSdRows;
+
+  const int tix = num_tiles - 1 - blockIdx.x;
+  const int4 tile = reinterpret_cast<const int4 *>(tiles)[tix];
+  const int b = tile.x, q0 = tile.y, head0 = tile.z, grp = tile.w >> 8, ntok = tile.w & 255;
+  const int kh = head0 / (hq / hkv);
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int quad = (lane >> 2) & 3;
+  const int idx = lane_idx();
+  const int pair = warp >> 1, nw = warp & 1;
+  const int t0 = query_start[b];
+  const int ctx = context_lens[b];
+  const int rows = ntok * grp;
+  const int key_end = ctx + q0 + ntok;
+  const int ntiles = (key_end + kSdKeys - 1) / kSdKeys;
+  const int splits = gridDim.z, split = blockIdx.z;
+  const int t_begin = ntiles * split / splits, t_end = ntiles * (split + 1) / splits;
+  const int *table = block_tables + static_cast<int64_t>(b) * table_width;
+  const int bmask = (1 << block_shift) - 1;
+  const int last_block = (key_end - 1) >> block_shift;
+  const float kscale = scale * 1.4426950408889634f;
+
+  for (int e = tid; e < kSdRows * (kHead / 8); e += kSdThreads) {
+    const int r = e / (kHead / 8);
+    const int pr = e % (kHead / 8);
+    uint4 val = make_uint4(0, 0, 0, 0);
+    if (r < rows)
+      val = *reinterpret_cast<const uint4 *>(
+          q + (static_cast<int64_t>(t0 + q0 + r / grp) * hq + head0 + r % grp) * kHead + 8 * pr);
+    *reinterpret_cast<uint2 *>(qs + r * kSdQPitch + 8 * pr) = make_uint2(val.x, val.y);
+    *reinterpret_cast<uint2 *>(qs + r * kSdQPitch + 8 * pr + 4) = make_uint2(val.z, val.w);
+  }
+
+  const int part = 4 * (warp >> 2) + (lane >> 3);
+  const int srow = 8 * (warp & 3) + (lane & 7);
+  const int kkey = sd_krow_inv(srow);
+  const int vkey = sd_vrow_inv(srow);
+  const int scale_key = tid & 31;
+  int blk_k = 0, blk_v = 0, blk_s = 0;
+  auto lookup = [&](int t) {
+    blk_k = __ldg(table + min((t * kSdKeys + kkey) >> block_shift, last_block));
+    blk_v = __ldg(table + min((t * kSdKeys + vkey) >> block_shift, last_block));
+    if (tid < 2 * kSdKeys) blk_s = __ldg(table + min((t * kSdKeys + scale_key) >> block_shift, last_block));
+  };
+  const int8_t *const kbase = k_cache + kh * kHead + 32 * part;
+  const int8_t *const vbase = v_cache + kh * kHead + 32 * part;
+  const float *const sbase = (tid < kSdKeys ? k_scale : v_scale) + kh;
+  const int8_t *kptr = kbase, *vptr = vbase;
+  const float *sptr = sbase;
+  bool k_ok = false, v_ok = false, s_ok = false;
+  auto set_tile = [&](int t) {
+    const int kpos = t * kSdKeys + kkey, vpos = t * kSdKeys + vkey, spos = t * kSdKeys + scale_key;
+    k_ok = kpos < key_end;
+    v_ok = vpos < key_end;
+    s_ok = tid < 2 * kSdKeys && spos < key_end;
+    kptr = kbase + static_cast<int64_t>(((blk_k << block_shift) + (kpos & bmask)) * hkv) * kHead;
+    vptr = vbase + static_cast<int64_t>(((blk_v << block_shift) + (vpos & bmask)) * hkv) * kHead;
+    sptr = sbase + ((blk_s << block_shift) + (spos & bmask)) * hkv;
+  };
+  uint4 rk[2], rv[2];
+  float rs = 0.0f;
+  auto load_k = [&]() {
+    rk[0] = rk[1] = make_uint4(0, 0, 0, 0);
+    if (k_ok) {
+      rk[0] = *reinterpret_cast<const uint4 *>(kptr);
+      rk[1] = *reinterpret_cast<const uint4 *>(kptr + 16);
+    }
+    rs = s_ok ? *sptr : 0.0f;
+  };
+  auto load_v = [&]() {
+    rv[0] = rv[1] = make_uint4(0, 0, 0, 0);
+    if (v_ok) {
+      rv[0] = *reinterpret_cast<const uint4 *>(vptr);
+      rv[1] = *reinterpret_cast<const uint4 *>(vptr + 16);
+    }
+  };
+  auto store8 = [](half *dst, const uint4 (&w)[2]) {
+    const uint32_t *u = reinterpret_cast<const uint32_t *>(w);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) *reinterpret_cast<uint2 *>(dst + 4 * i) = int8x4_to_half_exact(u[i]);
+  };
+  half *const kst = kbuf + srow * kSdKPitch + 32 * part;
+  half *const vst = vbuf + srow * kSdKPitch + 32 * part;
+  auto store_k = [&]() {
+    store8(kst, rk);
+    if (tid < kSdKeys) ksc[tid] = rs * kscale;
+    else if (tid < 2 * kSdKeys) vsc[tid - kSdKeys] = rs * 256.0f;
+  };
+  auto store_v = [&]() { store8(vst, rv); };
+
+  float o[2][2][2][8];
+#pragma unroll
+  for (int a = 0; a < 2; ++a)
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+#pragma unroll
+      for (int g = 0; g < 2; ++g)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) o[a][t][g][j] = 0.0f;
+  const int qk_r0 = 16 * pair + 8 * nw;
+  const int pv_r0 = 16 * pair;
+  float m_row[2] = {-INFINITY, -INFINITY}, l_row[2] = {0.0f, 0.0f};
+  const half *const qa = qs + (pv_r0 + idx) * kSdQPitch + 128 * nw;
+  const half *const kb = kbuf + sd_krow(8 * quad + idx) * kSdKPitch + 128 * nw;
+  float4 *const xsend = reinterpret_cast<float4 *>(xch) + warp * 64 + lane;
+  const float4 *const xrecv = reinterpret_cast<const float4 *>(xch) + (warp ^ 1) * 64 + lane;
+  const half *const pa = ps + (pv_r0 + idx) * kSdPPitch;
+  const int vk = lane & 3;
+  const int vchunk = 2 * quad + (lane >> 4);
+  const half *const vb0 = vbuf + sd_vrow(vk) * kSdKPitch + 128 * nw + 4 * vchunk;
+  const half *const vb1 = vb0 + 32;
+  const int col0 = 8 * quad + 2 * ((idx >> 1) & 1);
+  const int row0 = qk_r0 + frag_row(0), row1 = qk_r0 + frag_row(2);
+  const int tok0 = row0 / grp, tok1 = row1 / grp;
+  half *const pst0 = ps + row0 * kSdPPitch + col0;
+  half *const pst1 = ps + row1 * kSdPPitch + col0;
+
+  if (t_begin < t_end) {
+    lookup(t_begin);
+    set_tile(t_begin);
+    load_k();
+    if (t_begin + 1 < t_end) lookup(t_begin + 1);
+  }
+  __syncthreads();
+  uint2 qreg[kSdQReg][2];
+#pragma unroll
+  for (int c = 0; c < kSdQReg; ++c) {
+    qreg[c][0] = *reinterpret_cast<const uint2 *>(qa + 4 * c);
+    qreg[c][1] = *reinterpret_cast<const uint2 *>(qa + 8 * kSdQPitch + 4 * c);
+  }
+  if (t_begin < t_end) {
+    store_k();
+    load_v();
+    if (t_begin + 1 < t_end) {
+      set_tile(t_begin + 1);
+      load_k();
+      if (t_begin + 2 < t_end) lookup(t_begin + 2);
+    }
+  }
+
+  for (int t = t_begin; t < t_end; ++t) {
+    __syncthreads();
+    store_v();
+    if (t + 1 < t_end) load_v();
+    float sacc[2][8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) sacc[0][j] = sacc[1][j] = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kSdQReg; ++c) {
+      const uint2 bk = *reinterpret_cast<const uint2 *>(kb + 4 * c);
+      mma_8x8x4(sacc[0], qreg[c][0], bk);
+      mma_8x8x4(sacc[1], qreg[c][1], bk);
+    }
+#pragma unroll
+    for (int c = kSdQReg; c < kHead / 8; ++c) {
+      const uint2 a0 = *reinterpret_cast<const uint2 *>(qa + 4 * c);
+      const uint2 a1 = *reinterpret_cast<const uint2 *>(qa + 8 * kSdQPitch + 4 * c);
+      const uint2 bk = *reinterpret_cast<const uint2 *>(kb + 4 * c);
+      mma_8x8x4(sacc[0], a0, bk);
+      mma_8x8x4(sacc[1], a1, bk);
+    }
+    {
+      float send[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        send[j] = nw ? sacc[0][j] : sacc[1][j];
+        sacc[0][j] = nw ? sacc[1][j] : sacc[0][j];
+      }
+      xsend[0] = make_float4(send[0], send[1], send[2], send[3]);
+      xsend[32] = make_float4(send[4], send[5], send[6], send[7]);
+      asm volatile("bar.sync %0, 64;" ::"r"(1 + pair) : "memory");
+      const float4 r0 = xrecv[0], r1 = xrecv[32];
+      sacc[0][0] += r0.x;
+      sacc[0][1] += r0.y;
+      sacc[0][2] += r0.z;
+      sacc[0][3] += r0.w;
+      sacc[0][4] += r1.x;
+      sacc[0][5] += r1.y;
+      sacc[0][6] += r1.z;
+      sacc[0][7] += r1.w;
+    }
+
+    {
+      const float2 ks01 = *reinterpret_cast<const float2 *>(ksc + col0);
+      const float2 ks45 = *reinterpret_cast<const float2 *>(ksc + col0 + 4);
+      const float2 vs01 = *reinterpret_cast<const float2 *>(vsc + col0);
+      const float2 vs45 = *reinterpret_cast<const float2 *>(vsc + col0 + 4);
+      const float ks[4] = {ks01.x, ks01.y, ks45.x, ks45.y};
+      const float vs[4] = {vs01.x, vs01.y, vs45.x, vs45.y};
+      float *sc = sacc[0];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) sc[j] *= ks[(j & 1) | ((j >> 1) & 2)];
+      if ((t + 1) * kSdKeys - 1 > ctx + q0) {
+        const int lim0 = ctx + q0 + tok0 - t * kSdKeys - col0;
+        const int lim1 = ctx + q0 + tok1 - t * kSdKeys - col0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int dc = (j & 1) + 4 * (j >> 2);
+          if (dc > (((j >> 1) & 1) ? lim1 : lim0)) sc[j] = -INFINITY;
+        }
+      }
+      float mx[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+      for (int j = 0; j < 8; ++j) mx[(j >> 1) & 1] = fmaxf(mx[(j >> 1) & 1], sc[j]);
+      float corr[2], sum[2] = {0.0f, 0.0f}, m_use[2];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const float m_new = fmaxf(m_row[h], row_reduce_max(mx[h]));
+        m_use[h] = m_new == -INFINITY ? 0.0f : m_new;
+        corr[h] = ex2_approx(m_row[h] - m_use[h]);
+        m_row[h] = m_new;
+      }
+#pragma unroll
+      for (int j = 0; j < 8; j += 2) {
+        const int h = (j >> 1) & 1;
+        const float p0 = ex2_approx(sc[j] - m_use[h]);
+        const float p1 = ex2_approx(sc[j + 1] - m_use[h]);
+        sum[h] += p0 + p1;
+        const half2 pp = __floats2half2_rn(p0 * vs[(j >> 1) & 2], p1 * vs[((j >> 1) & 2) | 1]);
+        *reinterpret_cast<half2 *>((h ? pst1 : pst0) + 4 * (j >> 2)) = pp;
+      }
+#pragma unroll
+      for (int h = 0; h < 2; ++h) l_row[h] = l_row[h] * corr[h] + sum[h];
+      if ((lane & 0xe) == 0) {
+        alpha[row0] = corr[0];
+        alpha[row1] = corr[1];
+      }
+    }
+    __syncthreads();
+    if (t + 1 < t_end) {
+      store_k();
+      if (t + 2 < t_end) {
+        set_tile(t + 2);
+        load_k();
+        if (t + 3 < t_end) lookup(t + 3);
+      }
+    }
+    {
+      float f[2][2];
+#pragma unroll
+      for (int tt = 0; tt < 2; ++tt)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) f[tt][h] = alpha[pv_r0 + 8 * tt + frag_row(2 * h)];
+      const bool same = f[0][0] == 1.0f && f[0][1] == 1.0f && f[1][0] == 1.0f && f[1][1] == 1.0f;
+      if (!__all_sync(0xffffffffu, same)) {
+#pragma unroll
+        for (int a = 0; a < 2; ++a)
+#pragma unroll
+          for (int tt = 0; tt < 2; ++tt)
+#pragma unroll
+            for (int g = 0; g < 2; ++g)
+#pragma unroll
+              for (int j = 0; j < 8; ++j) o[a][tt][g][j] *= f[tt][(j >> 1) & 1];
+      }
+    }
+    uint2 pf[kSdKeys / 4][2];
+#pragma unroll
+    for (int kk = 0; kk < kSdKeys / 4; ++kk)
+#pragma unroll
+      for (int tt = 0; tt < 2; ++tt)
+        pf[kk][tt] = *reinterpret_cast<const uint2 *>(pa + 8 * tt * kSdPPitch + 4 * kk);
+#pragma unroll
+    for (int dl = 0; dl < 2; ++dl)
+#pragma unroll
+      for (int kk = 0; kk < kSdKeys / 4; ++kk) {
+        const uint2 b0 = *reinterpret_cast<const uint2 *>(vb0 + 64 * dl + sd_vrow(4 * kk) * kSdKPitch);
+        const uint2 b1 = *reinterpret_cast<const uint2 *>(vb1 + 64 * dl + sd_vrow(4 * kk) * kSdKPitch);
+#pragma unroll
+        for (int tt = 0; tt < 2; ++tt) {
+          mma_8x8x4_rr(o[dl][tt][0], pf[kk][tt], b0);
+          mma_8x8x4_rr(o[dl][tt][1], pf[kk][tt], b1);
+        }
+      }
+  }
+
+#pragma unroll
+  for (int h = 0; h < 2; ++h) l_row[h] = row_reduce_sum(l_row[h]);
+  constexpr float kInv256 = 1.0f / 256.0f;
+  if (splits > 1) {
+    if ((lane & 0xe) == 0) {
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int row = h ? row1 : row0;
+        if (row >= rows) continue;
+        const int64_t pidx = (static_cast<int64_t>(t0 + q0 + row / grp) * hq + head0 + row % grp) * splits + split;
+        partial_ml[pidx * 2] = l_row[h] > 0.0f ? m_row[h] * 0.6931471805599453f : -FLT_MAX;
+        partial_ml[pidx * 2 + 1] = l_row[h];
+      }
+    }
+#pragma unroll
+    for (int dl = 0; dl < 2; ++dl)
+#pragma unroll
+      for (int tt = 0; tt < 2; ++tt)
+#pragma unroll
+        for (int g = 0; g < 2; ++g)
+#pragma unroll
+          for (int j = 0; j < 8; j += 2) {
+            const int row = pv_r0 + 8 * tt + frag_row(j);
+            if (row >= rows) continue;
+            const int col = 128 * nw + 64 * dl + 32 * g + frag_col(j);
+            const int64_t pidx =
+                (static_cast<int64_t>(t0 + q0 + row / grp) * hq + head0 + row % grp) * splits + split;
+            *reinterpret_cast<float2 *>(partial_o + pidx * kHead + col) =
+                make_float2(o[dl][tt][g][j] * kInv256, o[dl][tt][g][j + 1] * kInv256);
+          }
+    return;
+  }
+  if ((lane & 0xe) == 0) {
+    lsum[row0] = l_row[0];
+    lsum[row1] = l_row[1];
+  }
+  __syncthreads();
+#pragma unroll
+  for (int dl = 0; dl < 2; ++dl)
+#pragma unroll
+    for (int tt = 0; tt < 2; ++tt)
+#pragma unroll
+      for (int g = 0; g < 2; ++g)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int row = pv_r0 + 8 * tt + frag_row(j);
+          if (row >= rows) continue;
+          const int col = 128 * nw + 64 * dl + 32 * g + frag_col(j);
+          const int64_t tok = t0 + q0 + row / grp;
+          const int head = head0 + row % grp;
+          const float l = lsum[row];
+          const float a = __half2float(__float2half_rn(l > 0.0f ? o[dl][tt][g][j] * kInv256 / l : 0.0f));
+          const float gt = __half2float(qkv[tok * ld + head * 2 * kHead + kHead + col]);
+          out[(tok * hq + head) * kHead + col] = __float2half_rn(a / (1.0f + expf(-gt)));
+        }
+}
+
 template <typename T>
 int launch(half *out, const half *q, const T *k, const T *v, const float *ks, const float *vs, const half *qkv,
            int ld, const int *tiles, int num_tiles, const int *block_tables, int table_width, const int *query_start,
@@ -1370,5 +1774,40 @@ SEVENTY_API int seventy_grouped_attention(void *out, const void *q, const void *
   if (code != 0) return code;
   verify_combine_kernel<<<dim3(tokens, hq), kHead, 0, stream>>>(static_cast<half *>(out), po, pml,
                                                                 static_cast<const half *>(qkv), ld, hq, splits);
+  return launch_status();
+}
+
+SEVENTY_API int seventy_prefill_attention(void *out, const void *q, const void *k_cache, const void *v_cache,
+                                          const float *k_scale, const float *v_scale, const void *qkv, int ld,
+                                          const int *tiles, int num_tiles, const int *block_tables, int table_width,
+                                          const int *query_start, const int *context_lens, int tokens,
+                                          int block_size, int hq, int hkv, int head_dim, int splits, float scale,
+                                          void *workspace, int64_t workspace_bytes, cudaStream_t stream) {
+  using namespace seventy;
+  if (out == nullptr || q == nullptr || k_cache == nullptr || v_cache == nullptr || k_scale == nullptr ||
+      v_scale == nullptr || qkv == nullptr || tiles == nullptr || block_tables == nullptr || query_start == nullptr ||
+      context_lens == nullptr)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (head_dim != kHead || hkv < 1 || hq % hkv || num_tiles < 0 || splits < 1 || splits > 65535 || block_size < 1 ||
+      (block_size & (block_size - 1)))
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  const int64_t need =
+      splits > 1 ? static_cast<int64_t>(tokens) * hq * splits * (kHead + 2) * static_cast<int64_t>(sizeof(float)) : 0;
+  if (splits > 1 && (workspace == nullptr || workspace_bytes < need)) return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (num_tiles == 0 || tokens == 0) return SEVENTY_OK;
+  int shift = 0;
+  while ((1 << shift) < block_size) ++shift;
+  const cudaError_t e =
+      cudaFuncSetAttribute(flash_attention_splitd, cudaFuncAttributeMaxDynamicSharedMemorySize, kSdSmem);
+  if (e != cudaSuccess) return static_cast<int>(e);
+  auto *po = static_cast<float *>(workspace);
+  float *pml = splits > 1 ? po + static_cast<int64_t>(tokens) * hq * splits * kHead : nullptr;
+  flash_attention_splitd<<<dim3(num_tiles, 1, splits), kSdThreads, kSdSmem, stream>>>(
+      static_cast<half *>(out), static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
+      static_cast<const int8_t *>(v_cache), k_scale, v_scale, static_cast<const half *>(qkv), ld, tiles, num_tiles,
+      block_tables, table_width, query_start, context_lens, shift, hq, hkv, scale, po, pml);
+  if (splits > 1)
+    verify_combine_kernel<<<dim3(tokens, hq), kHead, 0, stream>>>(static_cast<half *>(out), po, pml,
+                                                                  static_cast<const half *>(qkv), ld, hq, splits);
   return launch_status();
 }

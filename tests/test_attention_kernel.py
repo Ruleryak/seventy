@@ -89,7 +89,7 @@ def test_prep_and_attention_match_reference(lengths, ctx, hkv, kv):
     assert err < 3e-3, err
 
 
-@pytest.mark.parametrize("kv", ["fp16", "int8", "int8-grouped"])
+@pytest.mark.parametrize("kv", ["fp16", "int8", "int8-grouped", "int8-splitd"])
 @pytest.mark.parametrize("lengths, ctx, hkv", [([64], [0], 2), ([100, 37], [0, 130], 2), ([200], [70], 2),
                                               ([700, 9, 300], [5000, 0, 63], 1), ([1000], [20000], 1)])
 def test_flash_attention_matches_reference(lengths, ctx, hkv, kv):
@@ -105,9 +105,35 @@ def test_flash_attention_matches_reference(lengths, ctx, hkv, kv):
     ref = R.sigmoid_gate(ref.reshape(t, hq * d), qkv[:, : 2 * d * hq].view(t, hq, 2, d)[:, :, 1].reshape(t, hq * d))
     dev = "cuda"
     i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=dev)
-    out = kernels.flash_attention(q.to(dev), qkv.to(dev), k_cache.to(dev), v_cache.to(dev), bt.to(dev), starts,
-                                  i32(starts), i32(ctx), 1 / math.sqrt(d), None if ks is None else ks.to(dev),
-                                  None if vs is None else vs.to(dev), ctx if kv == "int8-grouped" else None)
+    if kv == "int8-grouped":
+        out = kernels.grouped_attention(q.to(dev), qkv.to(dev), k_cache.to(dev), v_cache.to(dev), bt.to(dev), starts,
+                                        ctx, 1 / math.sqrt(d), ks.to(dev), vs.to(dev))
+    else:
+        out = kernels.flash_attention(q.to(dev), qkv.to(dev), k_cache.to(dev), v_cache.to(dev), bt.to(dev), starts,
+                                      i32(starts), i32(ctx), 1 / math.sqrt(d), None if ks is None else ks.to(dev),
+                                      None if vs is None else vs.to(dev), ctx if kv == "int8-splitd" else None)
+    err = (out.cpu().float() - ref.float()).abs().max().item()
+    assert err < 4e-3, err
+
+
+@pytest.mark.parametrize("splits", [1, 2, 5, 64])
+@pytest.mark.parametrize("lengths, ctx, hkv", [([64], [0], 2), ([100, 37], [0, 130], 2), ([130, 1], [3000, 900], 1),
+                                              ([700, 9, 300], [5000, 0, 63], 1), ([1], [100], 2),
+                                              ([8, 3, 1, 5], [1, 63, 64, 120], 1), ([9, 4, 59], [600, 17, 0], 2),
+                                              ([75, 10], [40, 2000], 1)])
+def test_prefill_attention_splits_match_reference(lengths, ctx, hkv, splits):
+    hq, d, bs = 6, 256, 16
+    qkv, starts, bt, k_cache, v_cache, positions = setup(lengths, ctx, hq, hkv, bs, seed=5)
+    t = qkv.shape[0]
+    k_cache, ks = R.quantize_int8(k_cache)
+    v_cache, vs = R.quantize_int8(v_cache)
+    q = (torch.randn(t, hq, d) * 0.7).half()
+    ref = R.paged_attention(q, k_cache, v_cache, starts, ctx, bt.long(), 1 / math.sqrt(d), ks, vs)
+    ref = R.sigmoid_gate(ref.reshape(t, hq * d), qkv[:, : 2 * d * hq].view(t, hq, 2, d)[:, :, 1].reshape(t, hq * d))
+    dev = "cuda"
+    i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=dev)
+    out = kernels.prefill_attention(q.to(dev), qkv.to(dev), k_cache.to(dev), v_cache.to(dev), bt.to(dev), starts,
+                                    i32(starts), i32(ctx), ctx, 1 / math.sqrt(d), ks.to(dev), vs.to(dev), splits)
     err = (out.cpu().float() - ref.float()).abs().max().item()
     assert err < 4e-3, err
 
