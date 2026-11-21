@@ -1192,7 +1192,9 @@ __global__ void __launch_bounds__(kPT, 1) flash_attention_mma(
 
 /*
  * flash_attention_splitd: prefill attention for INT8 caches with the structure of 1Cat-vLLM's sm70 D256 split-D
- * kernel (Apache-2.0): one block of 8 warps per tile of 64 query rows and 32-key tiles. A tile (sequence, first
+ * kernel (Apache-2.0): one block of 8 warps per tile of 64 query rows and 32-key tiles (kPairs = 4; kPairs = 3 is
+ * the same with 6 warps for tiles of up to 48 rows, the speculative verify steps: the 256 staging chunks of a key
+ * tile then take two passes for warps 0 and 1). A tile (sequence, first
  * token q0, first head h0, heads g and tokens n, as int4 {b, q0, h0, g << 8 | n}) holds row r = token q0 + r / g
  * of head h0 + r % g, n * g <= 64 rows: g = 1 for 64 tokens of one head, g = hq / hkv to pack the heads of one KV
  * head for a few tokens. The warps form 4 pairs; pair p owns query rows 16 p .. 16 p + 15.
@@ -1214,21 +1216,21 @@ __global__ void __launch_bounds__(kPT, 1) flash_attention_mma(
  * (k >> 4) << 4, so that the 4 keys and 4 column chunks of a half-warp of P V fall in distinct banks. A thread stages
  * 32 consecutive bytes of one key (two 16-byte loads); each half-warp stages 8 keys whose rows differ modulo 8,
  * two parts of each, so that these stores are free of bank conflicts too.
- * Split over keys (grid z = splits > 1): split s of a query tile takes its key tiles ntiles * s / splits ..
- * ntiles * (s + 1) / splits and writes the unnormalized O and the row maxima (natural log) and sums in the layout
- * of seventy_verify_attention, which verify_combine_kernel merges and gates.
+ * Split over keys (grid z = splits > 1): a query tile with ntiles key tiles uses u = min(splits, ceil(ntiles /
+ * min_split_tiles)) splits (short_split_tiles instead of min_split_tiles up to 128 key tiles, if it is not 0); split s < u takes the key tiles ntiles * s / u .. ntiles * (s + 1) / u, and writes the
+ * unnormalized O and the row maxima (natural log) and sums in the layout of seventy_verify_attention, which
+ * verify_combine_kernel merges and gates; a split s >= u writes an empty part. A fixed grid thus fits every context
+ * length (CUDA graphs: seventy_verify_attention_splitd).
  */
-constexpr int kSdRows = 64;
 constexpr int kSdKeys = 32;
-constexpr int kSdThreads = 256;
 constexpr int kSdQPitch = kHead + 4;
 constexpr int kSdKPitch = kHead + 4;
 constexpr int kSdPPitch = kSdKeys + 4;
 constexpr int kSdQReg = 4;
-constexpr int kSdSmem =
-    (kSdRows * kSdQPitch + 2 * kSdKeys * kSdKPitch + kSdRows * kSdPPitch) *
-        static_cast<int>(sizeof(half)) +
-    (2 * kSdKeys + 2 * kSdRows + kSdThreads * 8) * static_cast<int>(sizeof(float));
+constexpr int sd_smem(int pairs) {
+  return (16 * pairs * kSdQPitch + 2 * kSdKeys * kSdKPitch + 16 * pairs * kSdPPitch) * static_cast<int>(sizeof(half)) +
+         (2 * kSdKeys + 2 * 16 * pairs + 64 * pairs * 8) * static_cast<int>(sizeof(float));
+}
 
 __device__ __forceinline__ float ex2_approx(float x) {
   float y;
@@ -1248,21 +1250,25 @@ __device__ __forceinline__ int sd_vrow_inv(int r) {
   return (r & 1) | (((r >> 3) & 1) << 1) | (((r >> 1) & 3) << 2) | ((r >> 4) << 4);
 }
 
-__global__ void __launch_bounds__(kSdThreads, 1) flash_attention_splitd(
+template <int kPairs>
+__global__ void __launch_bounds__(kPairs * 64, 1) flash_attention_splitd(
     half *out, const half *q, const int8_t *k_cache, const int8_t *v_cache, const float *k_scale,
     const float *v_scale, const half *qkv, int ld, const int *tiles, int num_tiles, const int *block_tables,
     int table_width, const int *query_start, const int *context_lens, int block_shift, int hq, int hkv, float scale,
-    float *partial_o, float *partial_ml) {
+    int min_split_tiles, int short_split_tiles, int min_context, float *partial_o, float *partial_ml) {
+  constexpr int kRowsT = 16 * kPairs;
+  constexpr int kThr = 64 * kPairs;
+  constexpr int kChunks = (8 * kSdKeys + kThr - 1) / kThr;
   extern __shared__ __align__(16) unsigned char sdm[];
   half *qs = reinterpret_cast<half *>(sdm);
-  half *kbuf = qs + kSdRows * kSdQPitch;
+  half *kbuf = qs + kRowsT * kSdQPitch;
   half *vbuf = kbuf + kSdKeys * kSdKPitch;
   half *ps = vbuf + kSdKeys * kSdKPitch;
-  float *ksc = reinterpret_cast<float *>(ps + kSdRows * kSdPPitch);
+  float *ksc = reinterpret_cast<float *>(ps + kRowsT * kSdPPitch);
   float *vsc = ksc + kSdKeys;
   float *alpha = vsc + kSdKeys;
-  float *lsum = alpha + kSdRows;
-  float *xch = lsum + kSdRows;
+  float *lsum = alpha + kRowsT;
+  float *xch = lsum + kRowsT;
 
   const int tix = num_tiles - 1 - blockIdx.x;
   const int4 tile = reinterpret_cast<const int4 *>(tiles)[tix];
@@ -1274,17 +1280,28 @@ __global__ void __launch_bounds__(kSdThreads, 1) flash_attention_splitd(
   const int pair = warp >> 1, nw = warp & 1;
   const int t0 = query_start[b];
   const int ctx = context_lens[b];
+  if (ctx < min_context) return;
   const int rows = ntok * grp;
   const int key_end = ctx + q0 + ntok;
   const int ntiles = (key_end + kSdKeys - 1) / kSdKeys;
   const int splits = gridDim.z, split = blockIdx.z;
-  const int t_begin = ntiles * split / splits, t_end = ntiles * (split + 1) / splits;
+  const int mst = ntiles <= 128 && short_split_tiles > 0 ? short_split_tiles : min_split_tiles;
+  const int used = min(splits, max(1, (ntiles + mst - 1) / mst));
+  if (split >= used) {
+    for (int r = tid; r < rows; r += kThr) {
+      const int64_t pidx = (static_cast<int64_t>(t0 + q0 + r / grp) * hq + head0 + r % grp) * splits + split;
+      partial_ml[pidx * 2] = -FLT_MAX;
+      partial_ml[pidx * 2 + 1] = 0.0f;
+    }
+    return;
+  }
+  const int t_begin = ntiles * split / used, t_end = ntiles * (split + 1) / used;
   const int *table = block_tables + static_cast<int64_t>(b) * table_width;
   const int bmask = (1 << block_shift) - 1;
   const int last_block = (key_end - 1) >> block_shift;
   const float kscale = scale * 1.4426950408889634f;
 
-  for (int e = tid; e < kSdRows * (kHead / 8); e += kSdThreads) {
+  for (int e = tid; e < kRowsT * (kHead / 8); e += kThr) {
     const int r = e / (kHead / 8);
     const int pr = e % (kHead / 8);
     uint4 val = make_uint4(0, 0, 0, 0);
@@ -1295,47 +1312,71 @@ __global__ void __launch_bounds__(kSdThreads, 1) flash_attention_splitd(
     *reinterpret_cast<uint2 *>(qs + r * kSdQPitch + 8 * pr + 4) = make_uint2(val.z, val.w);
   }
 
-  const int part = 4 * (warp >> 2) + (lane >> 3);
-  const int srow = 8 * (warp & 3) + (lane & 7);
-  const int kkey = sd_krow_inv(srow);
-  const int vkey = sd_vrow_inv(srow);
+  int kkey[kChunks], vkey[kChunks];
+  half *kst[kChunks], *vst[kChunks];
+  const int8_t *kbase[kChunks], *vbase[kChunks];
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    const int chunk = min(tid + c * kThr, 8 * kSdKeys - 1);
+    const int vwarp = chunk >> 5, vlane = chunk & 31;
+    const int part = 4 * (vwarp >> 2) + (vlane >> 3);
+    const int srow = 8 * (vwarp & 3) + (vlane & 7);
+    kkey[c] = sd_krow_inv(srow);
+    vkey[c] = sd_vrow_inv(srow);
+    kst[c] = kbuf + srow * kSdKPitch + 32 * part;
+    vst[c] = vbuf + srow * kSdKPitch + 32 * part;
+    kbase[c] = k_cache + kh * kHead + 32 * part;
+    vbase[c] = v_cache + kh * kHead + 32 * part;
+  }
+  const bool chunk_on[2] = {true, kChunks > 1 && tid + kThr < 8 * kSdKeys};
   const int scale_key = tid & 31;
-  int blk_k = 0, blk_v = 0, blk_s = 0;
+  int blk_k[kChunks], blk_v[kChunks], blk_s = 0;
   auto lookup = [&](int t) {
-    blk_k = __ldg(table + min((t * kSdKeys + kkey) >> block_shift, last_block));
-    blk_v = __ldg(table + min((t * kSdKeys + vkey) >> block_shift, last_block));
+#pragma unroll
+    for (int c = 0; c < kChunks; ++c) {
+      blk_k[c] = __ldg(table + min((t * kSdKeys + kkey[c]) >> block_shift, last_block));
+      blk_v[c] = __ldg(table + min((t * kSdKeys + vkey[c]) >> block_shift, last_block));
+    }
     if (tid < 2 * kSdKeys) blk_s = __ldg(table + min((t * kSdKeys + scale_key) >> block_shift, last_block));
   };
-  const int8_t *const kbase = k_cache + kh * kHead + 32 * part;
-  const int8_t *const vbase = v_cache + kh * kHead + 32 * part;
   const float *const sbase = (tid < kSdKeys ? k_scale : v_scale) + kh;
-  const int8_t *kptr = kbase, *vptr = vbase;
+  const int8_t *kptr[kChunks], *vptr[kChunks];
   const float *sptr = sbase;
-  bool k_ok = false, v_ok = false, s_ok = false;
+  bool k_ok[kChunks], v_ok[kChunks], s_ok = false;
   auto set_tile = [&](int t) {
-    const int kpos = t * kSdKeys + kkey, vpos = t * kSdKeys + vkey, spos = t * kSdKeys + scale_key;
-    k_ok = kpos < key_end;
-    v_ok = vpos < key_end;
+#pragma unroll
+    for (int c = 0; c < kChunks; ++c) {
+      const int kpos = t * kSdKeys + kkey[c], vpos = t * kSdKeys + vkey[c];
+      k_ok[c] = chunk_on[c] && kpos < key_end;
+      v_ok[c] = chunk_on[c] && vpos < key_end;
+      kptr[c] = kbase[c] + static_cast<int64_t>(((blk_k[c] << block_shift) + (kpos & bmask)) * hkv) * kHead;
+      vptr[c] = vbase[c] + static_cast<int64_t>(((blk_v[c] << block_shift) + (vpos & bmask)) * hkv) * kHead;
+    }
+    const int spos = t * kSdKeys + scale_key;
     s_ok = tid < 2 * kSdKeys && spos < key_end;
-    kptr = kbase + static_cast<int64_t>(((blk_k << block_shift) + (kpos & bmask)) * hkv) * kHead;
-    vptr = vbase + static_cast<int64_t>(((blk_v << block_shift) + (vpos & bmask)) * hkv) * kHead;
     sptr = sbase + ((blk_s << block_shift) + (spos & bmask)) * hkv;
   };
-  uint4 rk[2], rv[2];
+  uint4 rk[kChunks][2], rv[kChunks][2];
   float rs = 0.0f;
   auto load_k = [&]() {
-    rk[0] = rk[1] = make_uint4(0, 0, 0, 0);
-    if (k_ok) {
-      rk[0] = *reinterpret_cast<const uint4 *>(kptr);
-      rk[1] = *reinterpret_cast<const uint4 *>(kptr + 16);
+#pragma unroll
+    for (int c = 0; c < kChunks; ++c) {
+      rk[c][0] = rk[c][1] = make_uint4(0, 0, 0, 0);
+      if (k_ok[c]) {
+        rk[c][0] = *reinterpret_cast<const uint4 *>(kptr[c]);
+        rk[c][1] = *reinterpret_cast<const uint4 *>(kptr[c] + 16);
+      }
     }
     rs = s_ok ? *sptr : 0.0f;
   };
   auto load_v = [&]() {
-    rv[0] = rv[1] = make_uint4(0, 0, 0, 0);
-    if (v_ok) {
-      rv[0] = *reinterpret_cast<const uint4 *>(vptr);
-      rv[1] = *reinterpret_cast<const uint4 *>(vptr + 16);
+#pragma unroll
+    for (int c = 0; c < kChunks; ++c) {
+      rv[c][0] = rv[c][1] = make_uint4(0, 0, 0, 0);
+      if (v_ok[c]) {
+        rv[c][0] = *reinterpret_cast<const uint4 *>(vptr[c]);
+        rv[c][1] = *reinterpret_cast<const uint4 *>(vptr[c] + 16);
+      }
     }
   };
   auto store8 = [](half *dst, const uint4 (&w)[2]) {
@@ -1343,14 +1384,18 @@ __global__ void __launch_bounds__(kSdThreads, 1) flash_attention_splitd(
 #pragma unroll
     for (int i = 0; i < 8; ++i) *reinterpret_cast<uint2 *>(dst + 4 * i) = int8x4_to_half_exact(u[i]);
   };
-  half *const kst = kbuf + srow * kSdKPitch + 32 * part;
-  half *const vst = vbuf + srow * kSdKPitch + 32 * part;
   auto store_k = [&]() {
-    store8(kst, rk);
+#pragma unroll
+    for (int c = 0; c < kChunks; ++c)
+      if (chunk_on[c]) store8(kst[c], rk[c]);
     if (tid < kSdKeys) ksc[tid] = rs * kscale;
     else if (tid < 2 * kSdKeys) vsc[tid - kSdKeys] = rs * 256.0f;
   };
-  auto store_v = [&]() { store8(vst, rv); };
+  auto store_v = [&]() {
+#pragma unroll
+    for (int c = 0; c < kChunks; ++c)
+      if (chunk_on[c]) store8(vst[c], rv[c]);
+  };
 
   float o[2][2][2][8];
 #pragma unroll
@@ -1658,14 +1703,17 @@ __global__ void verify_combine_kernel(half *out, const float *partial_o, const f
   const int d = threadIdx.x;
   const int64_t base = (static_cast<int64_t>(t) * hq + head) * splits;
   float m = -FLT_MAX;
+#pragma unroll 8
   for (int s = 0; s < splits; ++s) m = fmaxf(m, partial_ml[(base + s) * 2]);
   float l = 0.0f, o = 0.0f;
+#pragma unroll 8
   for (int s = 0; s < splits; ++s) {
-    const float ms = partial_ml[(base + s) * 2];
-    if (ms == -FLT_MAX) continue;
-    const float w = expf(ms - m);
-    l += partial_ml[(base + s) * 2 + 1] * w;
-    o += partial_o[(base + s) * kHead + d] * w;
+    const float2 ml = *reinterpret_cast<const float2 *>(partial_ml + (base + s) * 2);
+    if (ml.x != -FLT_MAX) {
+      const float w = expf(ml.x - m);
+      l += ml.y * w;
+      o += partial_o[(base + s) * kHead + d] * w;
+    }
   }
   const float a = __half2float(__float2half_rn(o / l));
   const float g = __half2float(qkv[static_cast<int64_t>(t) * ld + head * 2 * kHead + kHead + d]);
@@ -1781,7 +1829,8 @@ SEVENTY_API int seventy_prefill_attention(void *out, const void *q, const void *
                                           const float *k_scale, const float *v_scale, const void *qkv, int ld,
                                           const int *tiles, int num_tiles, const int *block_tables, int table_width,
                                           const int *query_start, const int *context_lens, int tokens,
-                                          int block_size, int hq, int hkv, int head_dim, int splits, float scale,
+                                          int block_size, int hq, int hkv, int head_dim, int splits,
+                                          int min_split_tiles, int short_split_tiles, int tile_rows, float scale,
                                           void *workspace, int64_t workspace_bytes, cudaStream_t stream) {
   using namespace seventy;
   if (out == nullptr || q == nullptr || k_cache == nullptr || v_cache == nullptr || k_scale == nullptr ||
@@ -1789,7 +1838,8 @@ SEVENTY_API int seventy_prefill_attention(void *out, const void *q, const void *
       context_lens == nullptr)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (head_dim != kHead || hkv < 1 || hq % hkv || num_tiles < 0 || splits < 1 || splits > 65535 || block_size < 1 ||
-      (block_size & (block_size - 1)))
+      (block_size & (block_size - 1)) || min_split_tiles < 1 || short_split_tiles < 0 ||
+      (tile_rows != 64 && tile_rows != 48))
     return SEVENTY_ERR_INVALID_ARGUMENT;
   const int64_t need =
       splits > 1 ? static_cast<int64_t>(tokens) * hq * splits * (kHead + 2) * static_cast<int64_t>(sizeof(float)) : 0;
@@ -1797,17 +1847,61 @@ SEVENTY_API int seventy_prefill_attention(void *out, const void *q, const void *
   if (num_tiles == 0 || tokens == 0) return SEVENTY_OK;
   int shift = 0;
   while ((1 << shift) < block_size) ++shift;
-  const cudaError_t e =
-      cudaFuncSetAttribute(flash_attention_splitd, cudaFuncAttributeMaxDynamicSharedMemorySize, kSdSmem);
-  if (e != cudaSuccess) return static_cast<int>(e);
   auto *po = static_cast<float *>(workspace);
   float *pml = splits > 1 ? po + static_cast<int64_t>(tokens) * hq * splits * kHead : nullptr;
-  flash_attention_splitd<<<dim3(num_tiles, 1, splits), kSdThreads, kSdSmem, stream>>>(
+  const auto kernel = tile_rows == 48 ? flash_attention_splitd<3> : flash_attention_splitd<4>;
+  const int smem = tile_rows == 48 ? sd_smem(3) : sd_smem(4);
+  const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  if (e != cudaSuccess) return static_cast<int>(e);
+  kernel<<<dim3(num_tiles, 1, splits), 4 * tile_rows, smem, stream>>>(
       static_cast<half *>(out), static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
       static_cast<const int8_t *>(v_cache), k_scale, v_scale, static_cast<const half *>(qkv), ld, tiles, num_tiles,
-      block_tables, table_width, query_start, context_lens, shift, hq, hkv, scale, po, pml);
+      block_tables, table_width, query_start, context_lens, shift, hq, hkv, scale, min_split_tiles,
+      short_split_tiles, 0, po, pml);
   if (splits > 1)
     verify_combine_kernel<<<dim3(tokens, hq), kHead, 0, stream>>>(static_cast<half *>(out), po, pml,
                                                                   static_cast<const half *>(qkv), ld, hq, splits);
+  return launch_status();
+}
+
+SEVENTY_API int seventy_verify_attention_hybrid(void *out, const void *q, const void *k_cache, const void *v_cache,
+                                                const float *k_scale, const float *v_scale, const void *qkv, int ld,
+                                                const int *tiles, int num_tiles, const int *block_tables,
+                                                int table_width, const int *query_start, const int *context_lens,
+                                                int num_seqs, int tokens, int max_query_len, int block_size, int hq,
+                                                int hkv, int splits, int min_split_tiles, int short_split_tiles,
+                                                int min_split_keys, int split_context, float scale, void *workspace,
+                                                int64_t workspace_bytes, cudaStream_t stream) {
+  using namespace seventy;
+  if (out == nullptr || q == nullptr || k_cache == nullptr || v_cache == nullptr || k_scale == nullptr ||
+      v_scale == nullptr || qkv == nullptr || tiles == nullptr || block_tables == nullptr || query_start == nullptr ||
+      context_lens == nullptr || workspace == nullptr)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (hkv < 1 || hq % hkv || (hq / hkv) * max_query_len > 48 || splits < 2 || splits > 65535 || block_size < 1 ||
+      (block_size & (block_size - 1)) || min_split_tiles < 1 || short_split_tiles < 0 || split_context < 0 ||
+      !verify_int8_supported(hq, hkv, max_query_len, block_size))
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  const int64_t need = static_cast<int64_t>(tokens) * hq * splits * (kHead + 2) * static_cast<int64_t>(sizeof(float));
+  if (workspace_bytes < need) return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (num_seqs == 0 || tokens == 0 || num_tiles == 0) return SEVENTY_OK;
+  int shift = 0;
+  while ((1 << shift) < block_size) ++shift;
+  auto *po = static_cast<float *>(workspace);
+  float *pml = po + static_cast<int64_t>(tokens) * hq * splits * kHead;
+  const cudaError_t e =
+      cudaFuncSetAttribute(flash_attention_splitd<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, sd_smem(3));
+  if (e != cudaSuccess) return static_cast<int>(e);
+  flash_attention_splitd<3><<<dim3(num_tiles, 1, splits), 192, sd_smem(3), stream>>>(
+      static_cast<half *>(out), static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
+      static_cast<const int8_t *>(v_cache), k_scale, v_scale, static_cast<const half *>(qkv), ld, tiles, num_tiles,
+      block_tables, table_width, query_start, context_lens, shift, hq, hkv, scale, min_split_tiles,
+      short_split_tiles, split_context, po, pml);
+  const int code = launch_verify_int8(po, pml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
+                                      static_cast<const int8_t *>(v_cache), k_scale, v_scale, block_tables,
+                                      table_width, nullptr, query_start, context_lens, num_seqs, block_size, hq, hkv,
+                                      splits, min_split_keys, scale, stream, split_context - 1);
+  if (code != 0) return code;
+  verify_combine_kernel<<<dim3(tokens, hq), kHead, 0, stream>>>(static_cast<half *>(out), po, pml,
+                                                                static_cast<const half *>(qkv), ld, hq, splits);
   return launch_status();
 }

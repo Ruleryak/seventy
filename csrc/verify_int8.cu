@@ -119,7 +119,7 @@ __global__ void __launch_bounds__(kThreads, 1)
                        const float *__restrict__ k_scale, const float *__restrict__ v_scale,
                        const int *__restrict__ block_tables, int table_width, const int *__restrict__ table_rows,
                        const int *__restrict__ query_start, const int *__restrict__ context_lens, int block_shift,
-                       int hq, int hkv, int splits, int min_split_keys, float qk_scale) {
+                       int hq, int hkv, int splits, int min_split_keys, float qk_scale, int max_context) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   Smem &s = *reinterpret_cast<Smem *>(smem_raw);
   const int split = blockIdx.x, b = gridDim.y - 1 - blockIdx.y, kh = blockIdx.z;
@@ -130,6 +130,7 @@ __global__ void __launch_bounds__(kThreads, 1)
   const int rows = group * tokens;
   if (tokens <= 0 || rows > kRows) return;
   const int ctx = context_lens[b];
+  if (ctx > max_context) return;
   const int total = ctx + tokens;
   const int total_tiles = (total + kBN - 1) / kBN;
   const int used = max(1, min(min(splits, total_tiles), (total + min_split_keys - 1) / min_split_keys));
@@ -414,7 +415,7 @@ int launch_verify_int8(float *partial_o, float *partial_ml, const half *q, const
                        const int8_t *v_cache, const float *k_scale, const float *v_scale, const int *block_tables,
                        int table_width, const int *table_rows, const int *query_start, const int *context_lens,
                        int num_seqs, int block_size, int hq, int hkv, int splits, int min_split_keys, float scale,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, int max_context) {
   cudaError_t e = cudaFuncSetAttribute(verify_int8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem));
   if (e == cudaSuccess) e = cudaFuncSetAttribute(verify_int8_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   if (e != cudaSuccess) return static_cast<int>(e);
@@ -422,7 +423,7 @@ int launch_verify_int8(float *partial_o, float *partial_ml, const half *q, const
   while ((1 << shift) < block_size) ++shift;
   verify_int8_kernel<<<dim3(splits, num_seqs, hkv), kThreads, sizeof(Smem), stream>>>(
       partial_o, partial_ml, q, k_cache, v_cache, k_scale, v_scale, block_tables, table_width, table_rows,
-      query_start, context_lens, shift, hq, hkv, splits, max(1, min_split_keys), scale);
+      query_start, context_lens, shift, hq, hkv, splits, max(1, min_split_keys), scale, max_context);
   return launch_status();
 }
 

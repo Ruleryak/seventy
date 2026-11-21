@@ -112,6 +112,8 @@ engine or for the tests. Without the variable, the default path runs.
 |---|---|---|
 | `SEVENTY_PREFILL_ATTN` | `grouped` | Prefill attention on the verify kernel |
 | `SEVENTY_PREFILL_ATTN` | `tiles` | Prefill attention on the per-head prefill kernel |
+| `SEVENTY_VERIFY_ATTN` | `int8` | Verify attention on the verify kernel at every context length (not the split-D kernel from 32K cached keys) |
+| `SEVENTY_VERIFY_SPLITD_CONTEXT` | a number of tokens | Verify attention on the split-D kernel from this many cached keys (default 32768) |
 | `SEVENTY_VERIFY_ATTN` | `wmma` | Verify attention on the WMMA kernel |
 | `SEVENTY_AR` | `home` | All-reduce and norm where the home rank of a row also takes the norm |
 | `SEVENTY_AR` | `flags` | All-reduce on the flag protocol |

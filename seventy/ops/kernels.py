@@ -517,10 +517,48 @@ def prefill_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor,
     code = lib().seventy_prefill_attention(
         out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), k_scale.data_ptr(), v_scale.data_ptr(),
         qkv.data_ptr(), qkv.shape[1], tiles.data_ptr(), n, block_tables.data_ptr(), block_tables.shape[1],
-        query_start_t.data_ptr(), context_lens_t.data_ptr(), t, block_size, hq, hkv, 256, splits, scale,
+        query_start_t.data_ptr(), context_lens_t.data_ptr(), t, block_size, hq, hkv, 256, splits, 1, 0, 64, scale,
         ws.data_ptr() if splits > 1 else None, ws.numel() * 4 if splits > 1 else 0, _stream(q),
     )
     check("prefill_attention", code)
+    return out
+
+
+VERIFY_SPLITD = os.environ.get("SEVENTY_VERIFY_ATTN", "splitd") == "splitd"
+VERIFY_MIN_SPLIT_TILES = 4
+VERIFY_SPLITD_CONTEXT = int(os.environ.get("SEVENTY_VERIFY_SPLITD_CONTEXT", "32768"))
+_verify_tiles: dict = {}
+
+
+def verify_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                     block_tables: torch.Tensor, query_start_t: torch.Tensor, context_lens_t: torch.Tensor,
+                     tokens: int, scale: float, k_scale: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
+    """Gated causal attention [T, hq * 256] over INT8 caches for steps with the same number of new tokens per
+    sequence, at most 48 rows per KV head (speculative verify): seventy_verify_attention_hybrid, which runs the
+    sequences with at least VERIFY_SPLITD_CONTEXT cached keys on the split-D kernel and the others on the verify
+    kernel, with a fixed number of key splits (about one block per SM), so the launch suits CUDA graphs. The tiles
+    of a shape are made once and kept (graphs hold their addresses). In the engine (TP4, 4 streams) the split-D
+    kernel is 13% slower at 8K, even at 32K and 4 to 7% faster from 78K to 200K."""
+    t, hq, _ = q.shape
+    hkv, block_size = k_cache.shape[2], k_cache.shape[1]
+    seqs = context_lens_t.numel()
+    key = (seqs, tokens, hq, hkv, str(q.device))
+    tiles = _verify_tiles.get(key)
+    if tiles is None:
+        tiles = _verify_tiles[key] = prefill_attention_tiles([i * tokens for i in range(seqs + 1)], hq, hkv,
+                                                             q.device).clone()
+    n = tiles.shape[0]
+    splits = max(2, min(128, round(_sm_count(q.device) / max(1, n))))
+    ws = torch.empty(t * hq * splits * 258, dtype=torch.float32, device=q.device)
+    out = torch.empty(t, hq * 256, dtype=torch.float16, device=q.device)
+    code = lib().seventy_verify_attention_hybrid(
+        out.data_ptr(), q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), k_scale.data_ptr(), v_scale.data_ptr(),
+        qkv.data_ptr(), qkv.shape[1], tiles.data_ptr(), n, block_tables.data_ptr(), block_tables.shape[1],
+        query_start_t.data_ptr(), context_lens_t.data_ptr(), seqs, t, tokens, block_size, hq, hkv, splits,
+        VERIFY_MIN_SPLIT_TILES, 2 if splits >= 40 else 0, VERIFY_MIN_SPLIT_KEYS, VERIFY_SPLITD_CONTEXT, scale,
+        ws.data_ptr(), ws.numel() * 4, _stream(q),
+    )
+    check("verify_attention", code)
     return out
 
 

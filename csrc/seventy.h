@@ -198,6 +198,23 @@ SEVENTY_API int seventy_verify_attention(void *out, const void *q, const void *k
                                          cudaStream_t stream);
 
 /*
+ * Speculative verify attention over INT8 caches (csrc/flash_attention.cu): the sequences with at least split_context
+ * cached keys run on the split-D kernel (3 warp pairs, tiles as for seventy_prefill_attention: one per sequence and
+ * KV head, at most 48 rows; min_split_tiles and short_split_tiles as there), the others on the verify kernel
+ * (min_split_keys as for seventy_verify_attention); both write parts for the same splits (at least 2), and one
+ * combine merges them. All choices are taken on the GPU, so a fixed launch suits CUDA graphs. The workspace holds
+ * tokens * hq * splits * 258 floats.
+ */
+SEVENTY_API int seventy_verify_attention_hybrid(void *out, const void *q, const void *k_cache, const void *v_cache,
+                                                const float *k_scale, const float *v_scale, const void *qkv, int ld,
+                                                const int *tiles, int num_tiles, const int *block_tables,
+                                                int table_width, const int *query_start, const int *context_lens,
+                                                int num_seqs, int tokens, int max_query_len, int block_size, int hq,
+                                                int hkv, int splits, int min_split_tiles, int short_split_tiles,
+                                                int min_split_keys, int split_context, float scale, void *workspace,
+                                                int64_t workspace_bytes, cudaStream_t stream);
+
+/*
  * Prefill attention over the INT8 caches on the verify kernel (csrc/verify_int8.cu): the new tokens of each
  * sequence are cut into groups of at most max_group_tokens (with (hq / hkv) * max_group_tokens <= 48), and every
  * group runs as a verify sequence of its own. Group g owns token rows [group_start[g], group_start[g + 1]), sees
@@ -216,14 +233,19 @@ SEVENTY_API int seventy_grouped_attention(void *out, const void *q, const void *
  * Prefill attention over the INT8 caches (head_dim 256, power-of-two block_size) on the split-D kernel
  * (csrc/flash_attention.cu). tiles: int32 [num_tiles, 4], each {sequence, first token, first head h0, g << 8 | n}:
  * n tokens of the g heads h0 .. h0 + g - 1 (one KV head), n * g <= 64; together the tiles cover every new token of
- * every head once. tokens = query_start[num_seqs]. splits > 1 also divides the keys of every tile among splits
- * blocks; the workspace then holds tokens * hq * splits * 258 floats (null and 0 for splits = 1).
+ * every head once. tokens = query_start[num_seqs]. splits > 1 also divides the keys of every tile among up to
+ * splits blocks, each with at least min_split_tiles tiles of 32 keys (short_split_tiles for tiles with at most 128
+ * key tiles, if it is not 0; the count per tile is taken on the GPU from its context length, so a fixed grid suits
+ * CUDA graphs); the workspace then holds tokens * hq * splits * 258 floats (null and 0 for splits = 1).
+ * tile_rows: 64, or 48 when no tile has more than 48 rows (3 warp pairs instead of 4: the speculative verify steps,
+ * 8 tokens x 6 heads per KV head).
  */
 SEVENTY_API int seventy_prefill_attention(void *out, const void *q, const void *k_cache, const void *v_cache,
                                           const float *k_scale, const float *v_scale, const void *qkv, int ld,
                                           const int *tiles, int num_tiles, const int *block_tables, int table_width,
                                           const int *query_start, const int *context_lens, int tokens,
-                                          int block_size, int hq, int hkv, int head_dim, int splits, float scale,
+                                          int block_size, int hq, int hkv, int head_dim, int splits,
+                                          int min_split_tiles, int short_split_tiles, int tile_rows, float scale,
                                           void *workspace, int64_t workspace_bytes, cudaStream_t stream);
 
 /*

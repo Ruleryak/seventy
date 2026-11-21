@@ -164,3 +164,35 @@ def test_prep_multimodal_positions_match_reference():
     torch.testing.assert_close(qd.cpu().float(), q.float(), rtol=0, atol=2e-3)
     blocks, offs = slots // bs, slots % bs
     torch.testing.assert_close(kk.cpu()[blocks, offs].float(), k.float(), rtol=0, atol=2e-3)
+
+
+@pytest.mark.parametrize("split_context", [0, 4096, 1 << 30])
+@pytest.mark.parametrize("seqs, tokens", [(1, 8), (4, 8), (3, 5), (8, 2)])
+def test_verify_attention_splitd_matches_verify_kernel(seqs, tokens, split_context, monkeypatch):
+    """The hybrid verify path (split-D kernel from split_context cached keys, the verify kernel below; fixed grid,
+    splits chosen per tile on the GPU) gives the verify kernel's output for short and long contexts in one batch,
+    also with NaN in the reused workspace memory."""
+    import math
+
+    monkeypatch.setattr(kernels, "VERIFY_SPLITD_CONTEXT", split_context)
+
+    torch.manual_seed(seqs * 10 + tokens)
+    hq, hkv, d, bs = 6, 1, 256, 16
+    ctxs = [5, 700, 4093, 30011, 1, 64, 2047, 9000][:seqs]
+    per = -(-(max(ctxs) + tokens) // bs)
+    blocks = per * seqs + 1
+    k = torch.randint(-127, 127, (blocks, bs, hkv, d), dtype=torch.int8, device="cuda")
+    v = torch.randint(-127, 127, (blocks, bs, hkv, d), dtype=torch.int8, device="cuda")
+    ks = torch.rand(blocks, bs, hkv, device="cuda") * 0.02
+    vs = torch.rand(blocks, bs, hkv, device="cuda") * 0.02
+    q = torch.randn(tokens * seqs, hq, d, device="cuda").half()
+    qkv = torch.randn(tokens * seqs, 2 * hq * d + 2 * hkv * d, device="cuda").half()
+    bt = torch.randperm(blocks - 1, device="cuda")[: per * seqs].int().view(seqs, per)
+    qs = torch.arange(seqs + 1, dtype=torch.int32, device="cuda") * tokens
+    cl = torch.tensor(ctxs, dtype=torch.int32, device="cuda")
+    scale = 1 / math.sqrt(d)
+    ref = kernels.decode_attention(q, qkv, k, v, bt, qs, cl, tokens, 0, scale, ks, vs)
+    poison = torch.full((tokens * seqs * hq * 128 * 258,), float("nan"), device="cuda")
+    del poison
+    got = kernels.verify_attention(q, qkv, k, v, bt, qs, cl, tokens, scale, ks, vs)
+    torch.testing.assert_close(got.float(), ref.float(), rtol=2e-3, atol=2e-3)

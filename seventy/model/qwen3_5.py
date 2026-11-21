@@ -65,7 +65,12 @@ class AttentionLayer:
             q = kernels.attn_prep(qkv, self.q_norm, self.k_norm, step.positions, self.inv_freq, self.section,
                                   step.kv_slots_t, cache.k[layer], cache.v[layer], self.heads, self.kv_heads, self.eps,
                                   ks, vs)
-            if (self.heads // self.kv_heads) * step.max_query_len <= 64:
+            n = step.max_query_len
+            if (kernels.VERIFY_SPLITD and n > 1 and ks is not None and step.num_seqs > 0
+                    and step.query_start[-1] == n * step.num_seqs and (self.heads // self.kv_heads) * n <= 48):
+                o = kernels.verify_attention(q, qkv, cache.k[layer], cache.v[layer], step.block_tables,
+                                             step.query_start_t, step.context_lens_t, n, self.scale, ks, vs)
+            elif (self.heads // self.kv_heads) * n <= 64:
                 o = kernels.decode_attention(q, qkv, cache.k[layer], cache.v[layer], step.block_tables,
                                              step.query_start_t, step.context_lens_t, step.max_query_len,
                                              step.max_blocks, self.scale, ks, vs)
