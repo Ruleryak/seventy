@@ -2,8 +2,8 @@
 
 ## What you need
 
-- Linux on x86-64 with one or more NVIDIA V100 GPUs and driver 525 or later (driver branch 580 is the last one for
-  Volta).
+- Linux on x86-64 (glibc 2.28 or later) with one or more NVIDIA V100 GPUs and a driver of branch 580 (the last
+  branch for Volta; the tests ran with 580.178.04).
 - The CUDA 12.9 toolkit, for `nvcc`. CUDA 13 cannot compile for sm70.
 - [uv](https://docs.astral.sh/uv/), or Python 3.12 with pip.
 
@@ -91,8 +91,18 @@ You can run each command again; the panel keeps its settings and history in its 
 CUDACXX=/usr/local/cuda-12.9/bin/nvcc uv build --wheel
 ```
 
-The wheel is `dist/seventy-<version>-py3-none-linux_x86_64.whl`. It contains `seventy/_lib/libseventy_kernels.so`
-compiled for sm70.
+The wheel is `dist/seventy-<version>-py3-none-manylinux_2_28_x86_64.whl`. It contains
+`seventy/_lib/libseventy_kernels.so` compiled for sm70.
+
+- The tag `manylinux_2_28` comes from `pyproject.toml`. `tests/test_kernel_library.py` makes sure that the
+  library needs glibc 2.28 at most and links the shared CUDA runtime. Run it on each new build:
+
+  ```
+  SEVENTY_KERNELS_LIB=/path/to/libseventy_kernels.so pytest tests/test_kernel_library.py
+  ```
+
+- The dependencies in `pyproject.toml` are exact pins. Before a release, update them to the versions that the
+  release tests ran with.
 
 ## The kernel library
 

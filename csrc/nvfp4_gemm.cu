@@ -1,6 +1,7 @@
 #include "common.cuh"
 
 #include <cstdlib>
+#include <cstring>
 
 /*
  * NVFP4 weight GEMM for small batches: out[m, n] = alpha[n] * sum_k x[m, k] * q[n, k], with q = e2m1 * e4m3 the
@@ -507,7 +508,7 @@ SEVENTY_API int seventy_nvfp4_gemm(void *out, const void *x, const void *wpk, co
   const auto *xh = static_cast<const half *>(x);
   const auto *wp = static_cast<const uint4 *>(wpk);
   const auto *sp = static_cast<const uint32_t *>(wsc);
-  static const bool wk_off = getenv("SEVENTY_GEMM_WK") != nullptr && atoi(getenv("SEVENTY_GEMM_WK")) == 0;
+  static const bool wk_off = getenv("SEVENTY_GEMM_WK") != nullptr && strcmp(getenv("SEVENTY_GEMM_WK"), "0") == 0;
   const bool use_wk = m <= 40 || ksteps <= 72 || n_tiles < 200;
   if (!wk_off && use_wk && ksteps >= 8) {
     if (m > 56)

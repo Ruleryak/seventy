@@ -25,8 +25,11 @@ added as new model modules. The engine core does not assume one architecture.
   a property of the hardware, not a choice that can float.
 - Our kernels are CUDA C++ in `csrc/`. They build into one shared library, `libseventy_kernels.so`, with a C ABI.
   Python loads it with `ctypes` and passes device pointers and the current stream. The library does not link
-  against PyTorch or Python, so one wheel (`py3-none-linux_x86_64`) works with any Python 3.12 build of the
-  pinned PyTorch.
+  against PyTorch or Python, so one wheel (`py3-none-manylinux_2_28_x86_64`) works with any Python 3.12 build of
+  the pinned PyTorch. It links the shared CUDA runtime (`libcudart.so.12`) that PyTorch installs, and needs
+  glibc 2.28 or later, the same as PyTorch.
+- The wheel pins PyTorch (`torch==2.10.0+cu129`) and each other dependency to the version that the release was
+  tested with.
 - No Triton, no TileLang, no `torch.compile`. Decode and verify steps run as CUDA graphs. This removes compile
   caches and the minutes they add to a cold start.
 - PyTorch provides tensors, the caching allocator, cuBLAS (dense FP16 GEMMs), NCCL (`torch.distributed`), and

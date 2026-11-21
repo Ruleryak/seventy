@@ -169,3 +169,46 @@ def test_panel_api(tmp_path, monkeypatch):
         assert c.post("/api/downloads", json={"repo": "not a repo"}).status_code == 400
         assert c.post("/api/api_key").json()["api_key"].startswith("sk-")
         assert isinstance(c.get("/api/history?seconds=300").json(), list)
+
+
+TREE_STUB = r'''
+import http.server, signal, subprocess, sys, time
+port = int(sys.argv[sys.argv.index("--port") + 1])
+worker = subprocess.Popen([sys.executable, "-c",
+                           "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(600)"])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+    def log_message(self, *a):
+        pass
+try:
+    http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+except KeyboardInterrupt:
+    time.sleep(1.0)
+    worker.terminate()
+    worker.wait()
+    print(f"stub: stopped cleanly, worker {worker.pid}", flush=True)
+'''
+
+
+def test_panel_shutdown_stops_the_engine_and_waits_for_its_processes(tmp_path, monkeypatch):
+    """The panel's shutdown (Ctrl+C, systemctl stop) stops the engine and its workers before the panel exits."""
+    from fastapi.testclient import TestClient
+
+    from seventy.panel import app as panel
+
+    script = tmp_path / "tree.py"
+    script.write_text(TREE_STUB)
+    monkeypatch.setattr(Settings, "command", lambda self: [sys.executable, str(script), "--port", str(self.port)])
+    monkeypatch.setattr(hardware, "sample", lambda: [])
+    app = panel.create_app("127.0.0.1", tmp_path / "home")
+    with TestClient(app):
+        sup = app.state.supervisor
+        sup.start(Settings(model="/m", gpus=[0], port=free_port()))
+        assert wait_for(sup, ("ready",)) == "ready"
+        pid, run = sup.status.pid, sup.status.run
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pid, 0)
+    log = (tmp_path / "home" / "runs" / run / "engine.log").read_text()
+    assert "stub: stopped cleanly" in log
+    assert sup.status.state == "cold" and sup.status.exit_code == 0

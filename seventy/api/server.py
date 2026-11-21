@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -104,7 +105,8 @@ def create_app(config: ServerConfig) -> FastAPI:
     app.state.client = client
 
     def check_key(request: Request) -> None:
-        if config.api_key and request.headers.get("authorization", "") != f"Bearer {config.api_key}":
+        if config.api_key and not secrets.compare_digest(request.headers.get("authorization", "").encode(),
+                                                         f"Bearer {config.api_key}".encode()):
             raise HTTPException(status_code=401, detail="invalid API key")
 
     def error(status: int, message: str, kind: str = "invalid_request_error") -> JSONResponse:

@@ -4,6 +4,10 @@ The panel home (default $XDG_STATE_HOME/seventy, else ~/.local/state/seventy) ho
 error reports, measured profiles and the dashboard history. When the panel listens on an address other than
 loopback, every /api/ request needs the UI token (header X-Seventy-Token or ?token=), which the panel prints at
 start and keeps in ui_token in the home.
+
+On SIGINT or SIGTERM (Ctrl+C, systemctl stop) the panel answers the open requests for at most 10 seconds, then
+stops the engine and waits for all its processes (seventy.panel.supervisor), then exits. Thus a service manager
+that signals only the panel process (systemd KillMode=mixed) gets a clean stop of the engine.
 """
 
 from __future__ import annotations
@@ -291,7 +295,7 @@ def run(host: str, port: int, home: Path | None = None) -> None:
     print(f"seventy panel {__version__}: {url}", flush=True)
     if app.state.need_token:
         print("seventy panel: open to the network; the UI token is in the URL above", flush=True)
-    uvicorn.run(app, host=host, port=port, log_level="warning", timeout_graceful_shutdown=90)
+    uvicorn.run(app, host=host, port=port, log_level="warning", timeout_graceful_shutdown=10)
 
 
 def _lan_address() -> str:

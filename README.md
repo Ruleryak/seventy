@@ -8,14 +8,6 @@ It serves an OpenAI-compatible API and has a control panel in the browser.
 - The design and the plan for version 1 are in [docs/DESIGN.md](docs/DESIGN.md).
 - To build and test the code, see [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
-## What you need
-
-- Linux on x86-64.
-- 1, 2, 4 or 8 NVIDIA V100 GPUs (16 GB or 32 GB). With more than one GPU, NVLink between the GPUs is recommended.
-- NVIDIA driver 525 or later. Driver branch 580 is the last branch for Volta.
-- Python 3.12 and [uv](https://docs.astral.sh/uv/) (or pip).
-- Disk space for the model: approximately 20 GB for the NVFP4 27B model and 4 GB for its DFlash2 drafter.
-
 ## Models
 
 seventy serves checkpoints with the `Qwen3_5ForConditionalGeneration` architecture, with NVFP4 weights
@@ -96,149 +88,336 @@ uses the NVFP4 27B model, the DFlash2 drafter and the INT8 KV cache. Thinking is
 
 </details>
 
-## Install
+## Quickstart
 
-1. Make a virtual environment and install the wheel from the release. Use one of the two options.
+Start with the control panel to download a model, choose your GPUs, and run the engine.
 
-   With uv:
+You need Linux x86_64 (glibc 2.28 or later) and NVIDIA V100 GPUs with a working NVIDIA driver; see [Requirements](#requirements). The wheel includes the compiled kernels; no CUDA toolkit or compiler is required. Python 3.12 is installed automatically by uv if needed.
 
-   ```
-   uv venv --python 3.12 ~/seventy-env
-   ```
+### 1. Install uv
 
-   ```
-   uv pip install -p ~/seventy-env "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.0/seventy-1.1.0-py3-none-linux_x86_64.whl" --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match
-   ```
+Skip this step if you already have a recent version of [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
-   With pip (a virtual environment from `uv venv` has no pip, thus use `venv` from Python):
-
-   ```
-   python3.12 -m venv ~/seventy-env
-   ```
-
-   ```
-   ~/seventy-env/bin/pip install "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.0/seventy-1.1.0-py3-none-linux_x86_64.whl" --extra-index-url https://download.pytorch.org/whl/cu129
-   ```
-
-   You can run the install command again. It does not change an installation that is up to date.
-
-2. Check the GPUs, the driver and the kernel library:
-
-   ```
-   ~/seventy-env/bin/seventy info
-   ```
-
-The wheel contains the compiled kernels. You do not need the CUDA toolkit.
-
-## Download a model
-
-Download the model and the drafter into the Hugging Face cache:
-
-```
-~/seventy-env/bin/hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
+### 2. Install seventy
+
+Run as your normal user:
+
+```bash
+uv venv --python 3.12 ~/seventy-env &&
+uv pip install --python ~/seventy-env --torch-backend=cu129 \
+  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.0/seventy-1.1.0-py3-none-manylinux_2_28_x86_64.whl" &&
+~/seventy-env/bin/seventy info
 ```
-~/seventy-env/bin/hf download incoai/Qwen3.8-27B-DFlash2
-```
 
-To use a Hugging Face mirror, set `HF_ENDPOINT` before the command:
+Check the reported GPUs, driver, and kernel library before continuing.
 
-```
-HF_ENDPOINT=https://your-mirror.example ~/seventy-env/bin/hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4
-```
+### 3. Start the control panel
 
-The control panel can also download models (Models tab).
+If your browser is on the GPU machine:
 
-## Start with the control panel
-
-The control panel shows the GPUs, calculates the memory plan, starts and stops the engine, and shows the speed,
-the cache use and the GPUs while the engine runs. If the engine stops because of an error, the panel writes an
-error report and starts the engine again with the last good settings.
-
-To use the panel from this computer only:
-
-```
+```bash
 ~/seventy-env/bin/seventy panel
 ```
 
-Then open http://127.0.0.1:8270/ in a browser.
+Open [http://127.0.0.1:8270/](http://127.0.0.1:8270/).
 
-To use the panel from other computers in your network:
+If your browser is on another computer, use this command instead:
 
-```
+```bash
 ~/seventy-env/bin/seventy panel --host 0.0.0.0
 ```
 
-The panel then prints a URL with a token. Only a browser with this token can use the panel.
+Open the URL printed in the terminal, including its access token.
 
-The panel keeps its settings, logs and history in `~/.local/state/seventy` (or in the folder that you give with
-`--home`).
+In the panel:
 
-## Start the engine without the panel
+1. Use **Models** to download `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4`.
+2. Select the model and the GPUs you want to use, review the memory plan, and start the engine.
 
-On 4 GPUs, with the drafter:
+The drafter is optional. To use it, also download `incoai/Qwen3.8-27B-DFlash2` and select it before starting the engine. It requires additional GPU memory.
 
+Keep the panel running. To run it in the background and start it at boot, see [Run the panel as a service](#run-the-panel-as-a-service).
+
+### 4. Send a request
+
+Once the engine is ready, open another terminal on the GPU machine:
+
+```bash
+curl --fail-with-body -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.8-27B-QUASAR-NVFP4",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
 ```
-~/seventy-env/bin/seventy engine --model /path/to/model --draft-model /path/to/drafter --gpus 0,1,2,3
+
+## Full installation and startup
+
+If you completed the quickstart, seventy is already installed. The sections below cover alternative installation, command-line startup, downloads, and background operation.
+
+### Requirements
+
+- Linux x86_64 with glibc 2.28 or later, for example Ubuntu 20.04 or later, Debian 11 or later, or RHEL 8 or later. Tested on Ubuntu 24.04 LTS.
+- 1, 2 or 4 NVIDIA V100 GPUs (16 GB or 32 GB). With more than one GPU, NVLink between the GPUs is recommended.
+- A working NVIDIA driver. `nvidia-smi` must be able to list the GPUs. Tested with driver 580.178.04 (branch 580, the last branch for Volta). The CUDA 12.9 libraries need driver 525.60.13 or later; drivers before branch 580 are not tested.
+- Enough GPU memory for your model and settings. The panel calculates a memory plan before startup.
+- Internet access for installation and model downloads, and enough disk space for the downloaded files: approximately 20 GB for the NVFP4 27B model and 4 GB for its DFlash2 drafter.
+- Bash and curl for the commands below. systemd is needed only for the service instructions.
+
+The uv installation method obtains Python 3.12 if necessary. The pip alternative requires an existing Python 3.12 installation with `venv` support.
+
+No local CUDA toolkit or compiler is required. The NVIDIA driver is still required.
+
+### Install with uv
+
+If uv is not installed:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-On 1 GPU, without the drafter:
+Create the environment and install the release:
 
-```
-~/seventy-env/bin/seventy engine --model /path/to/model --gpus 0
-```
-
-On 2 specified GPUs, open to the network, with an API key:
-
-```
-SEVENTY_API_KEY=your-key ~/seventy-env/bin/seventy engine --model /path/to/model --draft-model /path/to/drafter --gpus 2,3 --host 0.0.0.0
+```bash
+uv venv --python 3.12 ~/seventy-env &&
+uv pip install --python ~/seventy-env --torch-backend=cu129 \
+  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.0/seventy-1.1.0-py3-none-manylinux_2_28_x86_64.whl"
 ```
 
-The API listens on port 8000 (`--port` changes it). Use `seventy engine --help` to see all options.
+All examples use the executables inside `~/seventy-env`, so you do not need to activate the environment or change your system Python.
 
-## Run the panel as a service
+### Alternative: install with pip
 
-1. Make the file `~/.config/systemd/user/seventy.service` with this text:
+Use this instead of the uv installation method:
 
-   ```
-   [Unit]
-   Description=seventy control panel
+```bash
+python3.12 -m venv ~/seventy-env &&
+~/seventy-env/bin/python -m pip install \
+  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.0/seventy-1.1.0-py3-none-manylinux_2_28_x86_64.whl" \
+  --extra-index-url https://download.pytorch.org/whl/cu129
+```
 
-   [Service]
-   ExecStart=%h/seventy-env/bin/seventy panel --host 0.0.0.0
-   KillMode=mixed
-   TimeoutStopSec=90
-   Restart=on-failure
+### Check the installation
 
-   [Install]
-   WantedBy=default.target
-   ```
+```bash
+~/seventy-env/bin/seventy info
+```
 
-2. Start the service now and at each boot:
+This reports the GPUs, NVIDIA driver, and kernel library. Resolve any reported compatibility or loading errors before starting the engine.
 
-   ```
-   systemctl --user enable --now seventy
-   ```
+The commands above install version **1.1.0**, with the versions of PyTorch and the other libraries that were tested with it. Running the install command again does not select a newer seventy release; use the wheel URL from the release you want to install.
 
-3. To start the service at boot also when you are not logged in:
+### Start with the control panel
 
-   ```
-   sudo loginctl enable-linger $USER
-   ```
+For a browser on the GPU machine:
 
-The panel starts the engine with the last good settings when it starts.
+```bash
+~/seventy-env/bin/seventy panel
+```
+
+Open [http://127.0.0.1:8270/](http://127.0.0.1:8270/).
+
+To listen on all network interfaces for access from another computer:
+
+```bash
+~/seventy-env/bin/seventy panel --host 0.0.0.0
+```
+
+Open the printed URL with its access token. Treat that URL as a password: anyone with the token and network access can use the panel. The panel token and the engine's API key are separate credentials.
+
+The panel downloads models, calculates the memory plan, starts and stops the engine, and displays generation speed, cache use, and GPU activity. If the engine fails, the panel saves an error report and attempts to restart it using the last good settings.
+
+After you have successfully run an engine through the panel, subsequent panel starts use the last good settings to start the engine again.
+
+Settings, logs, and history are stored in `~/.local/state/seventy`. Use `--home` to choose another directory.
+
+### Start without the panel
+
+Use either a Hugging Face model ID or a local model directory for `--model` and `--draft-model`. Model IDs use the Hugging Face cache and download missing files on first use.
+
+Start on one GPU without a drafter:
+
+```bash
+~/seventy-env/bin/seventy engine \
+  --model QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
+  --gpus 0
+```
+
+Start on four GPUs with a drafter:
+
+```bash
+~/seventy-env/bin/seventy engine \
+  --model QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
+  --draft-model incoai/Qwen3.8-27B-DFlash2 \
+  --gpus 0,1,2,3
+```
+
+The API listens on port **8000**. Use `--port` to change it. The engine runs in the foreground; press **Ctrl+C** to stop it.
+
+See all engine options:
+
+```bash
+~/seventy-env/bin/seventy engine --help
+```
+
+### Download models in advance
+
+You can prefetch the same models used by the panel and the command-line engine:
+
+```bash
+~/seventy-env/bin/hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4
+```
+
+For the optional drafter:
+
+```bash
+~/seventy-env/bin/hf download incoai/Qwen3.8-27B-DFlash2
+```
+
+These commands use the Hugging Face cache. The final output line of each command is `path=` followed by the downloaded directory; that directory can also be passed directly to the engine.
+
+To keep a model in a named directory:
+
+```bash
+~/seventy-env/bin/hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
+  --local-dir "$HOME/models/seventy/qwen-27b" &&
+~/seventy-env/bin/seventy engine \
+  --model "$HOME/models/seventy/qwen-27b" \
+  --gpus 0
+```
+
+### Use a Hugging Face mirror
+
+Set `HF_ENDPOINT` before starting a download, the panel, or the engine. Enter your mirror's full URL when prompted:
+
+```bash
+read -r -p 'Hugging Face mirror URL: ' HF_ENDPOINT
+export HF_ENDPOINT
+```
+
+Then run the relevant command in that terminal. This setting applies to programs started from that shell. For the systemd service, configure `HF_ENDPOINT` with an `Environment=` entry in the service's `[Service]` section.
+
+### Allow API access from another computer
+
+Set an API key and bind the engine to all network interfaces. This example uses GPUs 2 and 3:
+
+```bash
+read -r -s -p 'API key: ' SEVENTY_API_KEY
+printf '\n'
+if [ -z "$SEVENTY_API_KEY" ]; then
+  printf 'Error: the API key cannot be empty. Engine not started.\n' >&2
+else
+  export SEVENTY_API_KEY
+  ~/seventy-env/bin/seventy engine \
+    --model QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
+    --draft-model incoai/Qwen3.8-27B-DFlash2 \
+    --gpus 2,3 \
+    --host 0.0.0.0
+fi
+```
+
+Use a nonempty key. Configure your client with the GPU machine's address, port **8000**, the `/v1` base path, and the same API key. Authenticated requests use the `Authorization: Bearer` header.
+
+Opening the panel to the network does not automatically open the engine API to the network.
+
+### Run the panel as a service
+
+First configure and successfully start the engine through the panel so it has settings to restore. Stop the foreground panel with **Ctrl+C** before starting the service.
+
+Create the user service:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/seventy.service <<'EOF'
+[Unit]
+Description=seventy control panel
+
+[Service]
+Type=exec
+ExecStart=%h/seventy-env/bin/seventy panel
+Environment=PYTHONUNBUFFERED=1
+KillMode=mixed
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+```
+
+This unit uses local browser access. For access from another computer, change its `ExecStart` line to:
+
+```ini
+ExecStart=%h/seventy-env/bin/seventy panel --host 0.0.0.0
+```
+
+Start it now and enable startup without an interactive login:
+
+```bash
+systemctl --user daemon-reload &&
+systemctl --user enable --now seventy.service &&
+sudo loginctl enable-linger "$USER"
+```
+
+The panel restores the last good engine settings when it starts. In network mode, retrieve its token URL from the service log:
+
+```bash
+journalctl --user -u seventy.service -b -n 50 --no-pager
+```
+
+Useful service commands:
+
+| Action | Command |
+| --- | --- |
+| Show status | `systemctl --user status seventy.service` |
+| Follow logs | `journalctl --user -u seventy.service -f` |
+| Stop the panel and its engine | `systemctl --user stop seventy.service` |
+| Restart the panel and its engine | `systemctl --user restart seventy.service` |
+| Stop and disable automatic startup | `systemctl --user disable --now seventy.service` |
+
+After editing the service file, apply the changes:
+
+```bash
+systemctl --user daemon-reload &&
+systemctl --user restart seventy.service
+```
 
 ## Use the API
 
-The API is OpenAI-compatible: `/v1/chat/completions` (with streaming, tools, images and videos),
-`/v1/completions`, `/v1/models`, `/tokenize`, `/detokenize`, `/health` and `/metrics` (Prometheus).
+For a client on the GPU machine, the API base URL is `http://127.0.0.1:8000/v1`. For a remote client, use the GPU machine's address after enabling network access.
 
-```
-curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{"model": "Qwen3.8-27B-QUASAR-NVFP4", "messages": [{"role": "user", "content": "Hello"}]}'
+The example model name is `Qwen3.8-27B-QUASAR-NVFP4`. Query `/v1/models` to see the model name advertised by your running engine.
+
+Send a chat request to the local engine started by the quickstart:
+
+```bash
+curl --fail-with-body -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.8-27B-QUASAR-NVFP4",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
 ```
 
-To turn off thinking for one request, add `"chat_template_kwargs": {"enable_thinking": false}` to the request.
+To disable thinking for one request, include `"chat_template_kwargs": {"enable_thinking": false}` in the JSON body, as shown in the quickstart. For streaming, include `"stream": true` and use curl's `--no-buffer` option.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `/v1/chat/completions` | OpenAI-compatible chat, including streaming, tools, images, and videos |
+| `/v1/completions` | OpenAI-compatible text completions |
+| `/v1/models` | Available model information |
+| `/tokenize` | Tokenization |
+| `/detokenize` | Detokenization |
+| `/health` | Engine health |
+| `/metrics` | Prometheus metrics |
 
 ## Credits
 

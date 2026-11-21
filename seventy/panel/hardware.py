@@ -112,6 +112,11 @@ def gpus() -> list[Gpu]:
     return out
 
 
+def driver_version() -> str:
+    """The version of the NVIDIA driver, for example 580.178.04 (raises an exception when NVML is missing)."""
+    return _text(_nvml().nvmlSystemGetDriverVersion())
+
+
 def inventory(disk_path: str | None = None) -> Inventory:
     mem = _meminfo()
     path = disk_path or os.environ.get("HF_HUB_CACHE") or str(Path.home() / ".cache" / "huggingface")
@@ -120,8 +125,7 @@ def inventory(disk_path: str | None = None) -> Inventory:
         probe = probe.parent
     disk = shutil.disk_usage(probe).free if probe.exists() else 0
     try:
-        nv = _nvml()
-        driver, found, error = _text(nv.nvmlSystemGetDriverVersion()), gpus(), None
+        driver, found, error = driver_version(), gpus(), None
     except Exception as e:
         driver, found, error = "", [], f"NVML is not available: {e}"
     return Inventory(driver, found, _cpu_name(), os.cpu_count() or 0, mem.get("MemTotal", 0),

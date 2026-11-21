@@ -16,6 +16,12 @@ def cmd_info(args: argparse.Namespace) -> int:
 
     print(f"seventy {__version__}")
     print(f"python {platform.python_version()}, torch {torch.__version__}, CUDA {torch.version.cuda}")
+    try:
+        from .panel.hardware import driver_version
+
+        print(f"NVIDIA driver {driver_version()}")
+    except Exception as e:
+        print(f"NVIDIA driver: not found ({type(e).__name__}: {e})")
     if not torch.cuda.is_available():
         print("GPUs: none visible")
     else:
@@ -59,22 +65,29 @@ def cmd_engine(args: argparse.Namespace) -> int:
     from .api.server import ServerConfig, run
     from .config import UnsupportedModel, load_config
     from .engine.engine import EngineConfig
+    from .hub import ModelNotFound, resolve, served_name
 
     try:
-        cfg = load_config(args.model)
+        model = resolve(args.model)
+        draft_model = resolve(args.draft_model, "drafter") if args.draft_model else None
+    except ModelNotFound as e:
+        print(f"seventy: {e}", file=sys.stderr)
+        return 1
+    try:
+        cfg = load_config(model)
     except UnsupportedModel as e:
         print("seventy cannot serve this model:\n" + "\n".join(f"  - {r}" for r in e.reasons))
         return 1
     tp = args.tensor_parallel or (len(args.gpus.split(",")) if args.gpus else 1)
     engine = EngineConfig(
-        model=args.model, max_num_seqs=args.max_num_seqs,
+        model=model, max_num_seqs=args.max_num_seqs,
         max_model_len=min(args.max_model_len or cfg.text.max_position_embeddings, cfg.text.max_position_embeddings),
         gpu_memory_utilization=args.gpu_memory_utilization, prefill_budget=args.prefill_budget,
         kv_dtype=args.kv_cache_dtype, tensor_parallel=tp, cuda_graphs=not args.no_cuda_graphs,
-        draft_model=args.draft_model, prefix_cache=not args.no_prefix_cache,
+        draft_model=draft_model, prefix_cache=not args.no_prefix_cache,
     )
     server = ServerConfig(
-        engine=engine, served_model_name=args.served_model_name or os.path.basename(os.path.normpath(args.model)),
+        engine=engine, served_model_name=args.served_model_name or served_name(args.model, model),
         api_key=args.api_key or os.environ.get("SEVENTY_API_KEY") or None,
         default_chat_template_kwargs=json.loads(args.default_chat_template_kwargs or "{}"),
         max_tokens_default=args.max_tokens_default, max_image_pixels=args.max_image_pixels,
@@ -102,8 +115,11 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("path")
     check.set_defaults(fn=cmd_check_model)
     eng = sub.add_parser("engine", help="serve a model with an OpenAI-compatible API")
-    eng.add_argument("--model", required=True, help="checkpoint folder")
-    eng.add_argument("--served-model-name")
+    eng.add_argument("--model", required=True,
+                     help="checkpoint folder, or a Hugging Face model ID (downloaded into the Hugging Face cache)")
+    eng.add_argument("--draft-model", help="DFlash2 drafter for speculative decoding: a folder or a model ID")
+    eng.add_argument("--served-model-name", help="the model name in the API (default: the name part of the model ID, "
+                     "or the folder name)")
     eng.add_argument("--host", default="127.0.0.1")
     eng.add_argument("--port", type=int, default=8000)
     eng.add_argument("--api-key", help="require this key (also SEVENTY_API_KEY)")
@@ -115,7 +131,6 @@ def main(argv: list[str] | None = None) -> int:
     eng.add_argument("--prefill-budget", type=int, default=8192, help="prompt tokens per engine step")
     eng.add_argument("--kv-cache-dtype", choices=("int8", "fp16"), default="int8")
     eng.add_argument("--no-cuda-graphs", action="store_true")
-    eng.add_argument("--draft-model", help="DFlash2 drafter checkpoint folder for speculative decoding")
     eng.add_argument("--no-prefix-cache", action="store_true")
     eng.add_argument("--default-chat-template-kwargs", help='JSON, for example {"enable_thinking": false}')
     eng.add_argument("--max-tokens-default", type=int)
