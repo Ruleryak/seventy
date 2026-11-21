@@ -45,13 +45,13 @@ struct ArContext {
  * half, a sender writes its 16-byte packs straight into the receiver's slot, and the receiver spins on its own
  * slots until no half is 0x7f7f, then writes 0x7f7f back. A payload half equal to 0x7f7f is sent as the NaN 0x7e00.
  * There is no separate flag store and no fence, so a call costs one NVLink write latency per phase. This is the
- * protocol of 1Cat-vLLM's sm70_cross_device_reduce_1stage_push (Apache-2.0), as the lab's fused all-reduce and
- * Gemma RMS norm kernel used it. FP32 data (ar_sum_push_kernel) uses whole 32-bit words: empty is 0x7f7f7f7f and a
- * payload word equal to it is sent as 0x7f7f7f7e. The push slots have their own region of the buffer (after the
- * flag-protocol data areas), filled with 0x7f by seventy_ar_alloc, and every row block has its own epoch bit
- * (push_epochs, local), so the two halves of the region alternate per row from call to call. Row b of a slot always
- * takes the bytes [b * dim * 4, (b + 1) * dim * 4), for FP16 and FP32 data alike, so no call can write into another
- * row's bytes.
+ * protocol of 1Cat-vLLM's sm70_cross_device_reduce_1stage_push (Apache-2.0), as the lab kernel for the fused
+ * all-reduce and Gemma RMS norm used it. FP32 data (ar_sum_push_kernel) uses whole 32-bit words: empty is
+ * 0x7f7f7f7f and a payload word equal to it is sent as 0x7f7f7f7e. The push slots have their own region of the
+ * buffer (after the flag-protocol data areas), filled with 0x7f by seventy_ar_alloc, and every row block has its own
+ * epoch bit (push_epochs, local), so the two halves of the region alternate per row from call to call. Row b of a
+ * slot always takes the bytes [b * dim * 4, (b + 1) * dim * 4), for FP16 and FP32 data alike, so no call can write
+ * into another row's bytes.
  */
 __host__ __device__ inline int64_t push_slot_bytes(int64_t slot_bytes) { return slot_bytes; }
 
@@ -497,12 +497,12 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_kernel(ArContext ctx, h
 }
 
 /*
- * ar_norm_push_all_kernel: the two-shot all-reduce and norm with the structure of the lab's fused kernel (the
- * critical path holds only the sum): the home rank of row b waits for its world slots, adds them in FP32 in rank
- * order, rounds once to FP16 and writes the sum into every other rank's phase-2 area at once; then every rank adds
- * the sum to its residual row, takes the RMS norm and writes both. Same rounding as ar_norm_push_kernel (bitwise the
- * same output), with the residual complete on every rank. Without weight, out is the sum (plus the residual, which
- * is then not written). Packs i and i + blockDim.x of the row per thread.
+ * ar_norm_push_all_kernel: the two-shot all-reduce and norm with the structure of the lab kernel for the fused
+ * all-reduce and norm (the critical path holds only the sum): the home rank of row b waits for its world slots,
+ * adds them in FP32 in rank order, rounds once to FP16 and writes the sum into every other rank's phase-2 area at
+ * once; then every rank adds the sum to its residual row, takes the RMS norm and writes both. Same rounding as
+ * ar_norm_push_kernel (bitwise the same output), with the residual complete on every rank. Without weight, out is
+ * the sum (plus the residual, which is then not written). Packs i and i + blockDim.x of the row per thread.
  */
 __global__ void __launch_bounds__(kThreads) ar_norm_push_all_kernel(ArContext ctx, half *out, half *residual,
                                                                     const half *x, const float *weight, int rows,
