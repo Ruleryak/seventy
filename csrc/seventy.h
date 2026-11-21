@@ -85,6 +85,19 @@ SEVENTY_API int seventy_gdn_recurrent(void *out, void *conv_state, float *state,
                                       int hk, int hv, int dk, int dv, int taps, float eps, cudaStream_t stream);
 
 /*
+ * The commit pass of seventy_gdn_recurrent for `layers` layers in one launch. The arrays of layer l start at a fixed
+ * stride (in elements) from those of layer 0: y at l * y_ls, conv_state at l * conv_ls, state at l * state_ls;
+ * conv_w at l * conv_dim * taps, a_log and dt_bias at l * hv, norm_w at l * dv. The sequence arrays and commit_lens
+ * are the same for all layers.
+ */
+SEVENTY_API int seventy_gdn_commit_layers(void *conv_state, float *state, const void *y, int ld, int64_t y_ls,
+                                          int64_t conv_ls, int64_t state_ls, const float *conv_w, const float *a_log,
+                                          const float *dt_bias, const float *norm_w, const int *query_start,
+                                          const int *context_lens, const int *state_slots, const int *commit_lens,
+                                          int num_seqs, int layers, int hk, int hv, int dk, int dv, int taps,
+                                          float eps, cudaStream_t stream);
+
+/*
  * Attention prep for full-attention layers (head size 256), one launch per layer step: RMS norm of each query and
  * key head (weights with the 1 + w offset in them), multimodal rotary on the first rotary_dim values, queries to
  * q_out [T, hq, 256], keys and raw values to the paged caches [blocks, block_size, hkv, 256] at slots[t].

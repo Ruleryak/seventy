@@ -119,6 +119,7 @@ engine or for the tests. Without the variable, the default path runs.
 | `SEVENTY_GEMM_WK` | `0` | NVFP4 GEMM without the warp split over k |
 | `SEVENTY_GDN_SCAN` | `single` | Gated DeltaNet prefill state scan in one kernel |
 | `SEVENTY_GDN_PREPARE` | `torch` | Gated DeltaNet prefill preparation in PyTorch |
+| `SEVENTY_GDN_COMMIT` | `loop` | Gated DeltaNet state commit after speculative verify in one launch per layer |
 | `SEVENTY_DRAFTER_FUSED` | `0` | Drafter without the fused kernels |
 | `SEVENTY_DRAFTER_FP8` | `0` | Drafter layers in FP16 |
 | `SEVENTY_DRAFTER_FP8_EXTRA` | `none` | The drafter's fc, kv_all, selector and convolution projections in FP16 (or list the ones to keep in FP8, from `fc,kv_all,sel_hidden,conv`) |

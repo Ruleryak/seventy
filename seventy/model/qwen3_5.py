@@ -11,6 +11,7 @@ Weights are loaded as this rank's tensor-parallel shard:
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -24,6 +25,7 @@ from ..ops import gdn_prefill, kernels
 from ..parallel import SINGLE, Parallel
 
 RECURRENT_MAX_TOKENS = 32
+GDN_COMMIT_LAYERS = os.environ.get("SEVENTY_GDN_COMMIT", "layers") != "loop"
 from .layers import Linear, Source, _to_dtype
 
 
@@ -121,7 +123,8 @@ class GatedDeltaNetLayer:
     def __call__(self, x, step: StepInput, cache: ModelCache, layer: int, rope, slots, stash=None):
         t = x.shape[0]
         key, val = self.hk * self.dk, self.hv * self.dv
-        y = self.in_proj(x)
+        y_all = stash.get("y_all") if stash is not None else None
+        y = self.in_proj(x, out=y_all[self.gdn_index] if y_all is not None else None)
         if y.is_cuda and step.max_query_len <= RECURRENT_MAX_TOKENS:
             o = kernels.gdn_recurrent(y, self.conv_weight, cache.conv[layer], cache.state[layer], self.a_log,
                                       self.dt_bias, self.norm, step.query_start_t, step.context_lens_t,
@@ -210,6 +213,18 @@ class Qwen35TextModel:
         for layer in self.layers:
             if layer.kind == "full_attention":
                 layer.mixer.inv_freq = inv_freq.float().to(device)
+        self.gdn = [layer.mixer for layer in self.layers if layer.kind != "full_attention"]
+        self.gdn_params = None
+        for j, m in enumerate(self.gdn):
+            m.gdn_index = j
+        if self.gdn and self.device.type == "cuda":
+            stacked = []
+            for name in ("conv_weight", "a_log", "dt_bias", "norm"):
+                both = torch.stack([getattr(m, name) for m in self.gdn])
+                for j, m in enumerate(self.gdn):
+                    setattr(m, name, both[j])
+                stacked.append(both)
+            self.gdn_params = tuple(stacked)
         self.final_norm = _norm_weight(ckpt, f"{p}norm.weight", device, 1.0)
         head = "lm_head.weight" if not t.tie_word_embeddings else f"{p}embed_tokens.weight"
         self.lm_head = _to_dtype(ckpt.rows(head, v0, v1), dtype).to(device)
@@ -305,6 +320,9 @@ class Qwen35TextModel:
         residual = h
         x = ops.rms_norm(h, self.layers[0].input_norm, t.rms_norm_eps)[0]
         captured = {}
+        if stash is not None and self.gdn_params is not None and GDN_COMMIT_LAYERS:
+            stash["y_all"] = torch.empty(len(self.gdn), h.shape[0], self.gdn[0].in_proj.out_features,
+                                         dtype=torch.float16, device=h.device)
         for i, layer in enumerate(self.layers):
             if stash is not None and layer.kind != "full_attention":
                 x = layer.mixer(x, step, cache, i, rope, slots, stash)
@@ -323,7 +341,14 @@ class Qwen35TextModel:
     @torch.inference_mode()
     def commit(self, step: StepInput, cache: ModelCache, stash: dict, commit_lens: torch.Tensor) -> None:
         """After a speculative verify step: write each Gated DeltaNet layer's state as if only the first
-        commit_lens[b] new tokens of every sequence had run."""
+        commit_lens[b] new tokens of every sequence had run. With the in_proj outputs of all layers in one buffer
+        (stash["y_all"]), one launch commits every layer."""
+        y_all = stash.get("y_all")
+        if y_all is not None and len(stash) == len(self.gdn) + 1:
+            m = self.gdn[0]
+            kernels.gdn_commit_layers(y_all, cache.conv_all, cache.state_all, *self.gdn_params, step.query_start_t,
+                                      step.context_lens_t, step.state_slots_t, commit_lens, m.hk, m.hv, m.eps)
+            return
         for i, layer in enumerate(self.layers):
             if layer.kind == "full_attention":
                 continue

@@ -63,7 +63,8 @@ class Linear:
         elif self.parts[0].packed.is_cuda and dtype == torch.float16 and self.parts[0].shape[1] % 64 == 0:
             self.gemm = nvfp4.pack_for_gemm(self.parts)
             self.parts = []
-        self.out_features = self.dense.shape[0] if self.dense is not None else sum(p.shape[0] for p in self.parts)
+        self.out_features = (self.dense.shape[0] if self.dense is not None else self.gemm.n if self.gemm is not None
+                             else sum(p.shape[0] for p in self.parts))
 
     def _dequantize(self) -> torch.Tensor:
         if self.parts[0].packed.is_cuda and self.dtype == torch.float16:
@@ -77,10 +78,12 @@ class Linear:
             return kernels.nvfp4_gemm_dequantize(self.gemm)
         return self._dequantize()
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        """x W^T, written to out when given (a contiguous [rows, out_features] tensor)."""
         if self.gemm is not None and 0 < x.shape[0] <= SMALL_BATCH and x.is_contiguous():
-            return kernels.nvfp4_gemm(x, self.gemm)
-        return F.linear(x, self.weight())
+            return kernels.nvfp4_gemm(x, self.gemm, out=out)
+        y = F.linear(x, self.weight())
+        return y if out is None else out.copy_(y)
 
 
 def _to_dtype(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

@@ -3,7 +3,7 @@
 seventy is an inference engine for Qwen3.5-family models (Qwen3.5, Qwen3.6, Qwen3.8) on NVIDIA V100 GPUs.
 It serves an OpenAI-compatible API and has a control panel in the browser.
 
-**Status:** version 1.0.0, the first release. The tests ran on 4 Tesla V100-SXM2-32GB GPUs with NVLink.
+**Status:** version 1.0.1. The tests ran on 4 Tesla V100-SXM2-32GB GPUs with NVLink.
 
 - The design and the plan for version 1 are in [docs/DESIGN.md](docs/DESIGN.md).
 - To build and test the code, see [docs/DEVELOPING.md](docs/DEVELOPING.md).
@@ -107,7 +107,7 @@ uses the NVFP4 27B model, the DFlash2 drafter and the INT8 KV cache. Thinking is
    ```
 
    ```
-   uv pip install -p ~/seventy-env "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.0.0/seventy-1.0.0-py3-none-linux_x86_64.whl" --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match
+   uv pip install -p ~/seventy-env "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.0.1/seventy-1.0.1-py3-none-linux_x86_64.whl" --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match
    ```
 
    With pip (a virtual environment from `uv venv` has no pip, thus use `venv` from Python):
@@ -117,7 +117,7 @@ uses the NVFP4 27B model, the DFlash2 drafter and the INT8 KV cache. Thinking is
    ```
 
    ```
-   ~/seventy-env/bin/pip install "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.0.0/seventy-1.0.0-py3-none-linux_x86_64.whl" --extra-index-url https://download.pytorch.org/whl/cu129
+   ~/seventy-env/bin/pip install "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.0.1/seventy-1.0.1-py3-none-linux_x86_64.whl" --extra-index-url https://download.pytorch.org/whl/cu129
    ```
 
    You can run the install command again. It does not change an installation that is up to date.

@@ -92,3 +92,66 @@ def test_verify_then_commit_equals_running_accepted_rows():
     assert torch.equal(st.cpu(), st2.cpu()) and torch.equal(cs.cpu(), cs2.cpu())
     for s, a, n in zip(starts, acc_starts, accepted):
         assert torch.equal(full[s : s + n].cpu(), ref[a : a + n].cpu())
+
+
+@pytest.mark.parametrize("taps", [4, 2])
+def test_commit_layers_equals_commit_per_layer(taps):
+    """One gdn_commit_layers launch writes the same state and convolution history, bit for bit, as one commit pass
+    per layer."""
+    torch.manual_seed(31 + taps)
+    layers, hk, hv, d, eps = 3, 2, 6, 128, 1e-6
+    conv_dim = 2 * hk * d + hv * d
+    width = conv_dim + hv * d + 2 * hv
+    starts, ctx, accepted, slots = [0, 8, 16], [10, 0], [3, 8], [1, 0]
+    dev = "cuda"
+    i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=dev)
+    y_all = (torch.randn(layers, 16, width, device=dev) * 0.5).half()
+    conv_w = torch.randn(layers, conv_dim, taps, device=dev) * 0.3
+    a_log, dt_bias = torch.randn(layers, hv, device=dev) * 0.5, torch.randn(layers, hv, device=dev) * 0.5
+    norm_w = 1.0 + torch.randn(layers, d, device=dev) * 0.1
+    conv0 = (torch.randn(layers, 3, conv_dim, taps - 1, device=dev) * 0.5).half()
+    state0 = torch.randn(layers, 3, hv, d, d, device=dev) * 0.05
+    cs, st = conv0.clone(), state0.clone()
+    for i in range(layers):
+        kernels.gdn_recurrent(y_all[i], conv_w[i], cs[i], st[i], a_log[i], dt_bias[i], norm_w[i], i32(starts),
+                              i32(ctx), i32(slots), hk, hv, eps, commit_lens=i32(accepted))
+    cs2, st2 = conv0.clone(), state0.clone()
+    kernels.gdn_commit_layers(y_all, cs2, st2, conv_w, a_log, dt_bias, norm_w, i32(starts), i32(ctx), i32(slots),
+                              i32(accepted), hk, hv, eps)
+    assert not torch.equal(st, state0)
+    assert torch.equal(st2, st) and torch.equal(cs2, cs)
+
+
+def test_commit_with_more_blocks_than_the_gpu_holds():
+    """24 sequences x 6 value heads: more blocks than one wave. Value heads that share a key head read its q and k
+    convolution history; the history the commit writes must still be the one from the old history and the
+    committed rows, whatever the order the blocks run in."""
+    torch.manual_seed(77)
+    hk, hv, d, taps, eps = 2, 6, 128, 4, 1e-6
+    conv_dim = 2 * hk * d + hv * d
+    width = conv_dim + hv * d + 2 * hv
+    n = 24
+    lengths = [8] * n
+    ctx = [5 + i for i in range(n)]
+    starts = [8 * i for i in range(n + 1)]
+    accepted = [1 + (i * 5) % 8 for i in range(n)]
+    slots = list(range(n))
+    y = (torch.randn(8 * n, width) * 0.5).half()
+    conv_w = torch.randn(conv_dim, taps) * 0.3
+    a_log, dt_bias = torch.randn(hv) * 0.5, torch.randn(hv) * 0.5
+    norm_w = 1.0 + torch.randn(d) * 0.1
+    conv_state = (torch.randn(n, conv_dim, taps - 1) * 0.5).half()
+    state = torch.randn(n, hv, d, d) * 0.05
+    rows = torch.cat([y[s : s + a] for s, a in zip(starts, accepted)])
+    acc_starts = [0]
+    for a in accepted:
+        acc_starts.append(acc_starts[-1] + a)
+    ref_conv, ref_state = conv_state.clone(), state.clone()
+    reference_layer(rows, conv_w, ref_conv, ref_state, a_log, dt_bias, norm_w, acc_starts, ctx, slots, hk, hv, eps)
+    dev = "cuda"
+    i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=dev)
+    cs, st = conv_state.to(dev), state.to(dev)
+    kernels.gdn_recurrent(y.to(dev), conv_w.to(dev), cs, st, a_log.to(dev), dt_bias.to(dev), norm_w.to(dev),
+                          i32(starts), i32(ctx), i32(slots), hk, hv, eps, commit_lens=i32(accepted))
+    assert torch.equal(cs.cpu(), ref_conv)
+    torch.testing.assert_close(st.cpu(), ref_state, rtol=2e-3, atol=2e-4)

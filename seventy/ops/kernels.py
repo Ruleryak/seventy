@@ -206,6 +206,50 @@ def gdn_recurrent(
     return out
 
 
+def gdn_commit_layers(
+    y_all: torch.Tensor,
+    conv_all: torch.Tensor,
+    state_all: torch.Tensor,
+    conv_weight_all: torch.Tensor,
+    a_log_all: torch.Tensor,
+    dt_bias_all: torch.Tensor,
+    norm_all: torch.Tensor,
+    query_start: torch.Tensor,
+    context_lens: torch.Tensor,
+    state_slots: torch.Tensor,
+    commit_lens: torch.Tensor,
+    hk: int,
+    hv: int,
+    eps: float,
+) -> None:
+    """The commit pass of gdn_recurrent for the first y_all.shape[0] Gated DeltaNet layers in one launch; see
+    seventy_gdn_commit_layers in csrc/seventy.h. y_all: [layers, T, ld]; conv_all, state_all: the caches of all
+    layers; the parameters stacked per layer: conv weights [layers, conv_dim, taps], a_log and dt_bias
+    [layers, hv], norm [layers, dv]."""
+    _expect(y_all, "y_all", torch.float16)
+    _expect(conv_all, "conv_all", torch.float16)
+    _expect(state_all, "state_all", torch.float32)
+    for name, x in (("conv_weight_all", conv_weight_all), ("a_log_all", a_log_all), ("dt_bias_all", dt_bias_all),
+                    ("norm_all", norm_all)):
+        _expect(x, name, torch.float32)
+    for name, x in (("query_start", query_start), ("context_lens", context_lens), ("state_slots", state_slots),
+                    ("commit_lens", commit_lens)):
+        _expect(x, name, torch.int32)
+    layers, tokens, ld = y_all.shape
+    dk, dv = state_all.shape[3], state_all.shape[4]
+    if (conv_all.shape[0] < layers or state_all.shape[0] < layers or conv_weight_all.shape[0] < layers
+            or a_log_all.shape != (layers, hv) or dt_bias_all.shape != (layers, hv) or norm_all.shape != (layers, dv)):
+        raise ValueError("gdn_commit_layers: per-layer arrays do not match the layer count")
+    code = lib().seventy_gdn_commit_layers(
+        conv_all.data_ptr(), state_all.data_ptr(), y_all.data_ptr(), ld, tokens * ld, conv_all.stride(0),
+        state_all.stride(0), conv_weight_all.data_ptr(), a_log_all.data_ptr(), dt_bias_all.data_ptr(),
+        norm_all.data_ptr(), query_start.data_ptr(), context_lens.data_ptr(), state_slots.data_ptr(),
+        commit_lens.data_ptr(), context_lens.numel(), layers, hk, hv, dk, dv, conv_weight_all.shape[2], eps,
+        _stream(y_all),
+    )
+    check("gdn_commit_layers", code)
+
+
 def _kv_args(k_cache, v_cache, k_scale, v_scale):
     if k_cache.dtype == torch.int8:
         if k_scale is None or v_scale is None:

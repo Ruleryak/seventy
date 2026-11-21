@@ -23,13 +23,20 @@
  * unrolled over the registers: the code that runs once per chunk stays compact (instruction cache).
  *
  * Inputs come straight from the in_proj output y [T, ld]: q, k, v (the convolution channels: key heads, key
- * heads, value heads), then z [Hv * Dv], b [Hv], a [Hv]. Value head h reads key head h / (Hv / Hk). The q and k
- * convolution history is written back by the first value head of each key head only. The number of
- * convolution taps (2 to 4; 4 in Qwen3.5) is a template parameter, so that the taps stay in registers.
+ * heads, value heads), then z [Hv * Dv], b [Hv], a [Hv]. Value head h reads key head h / (Hv / Hk). A block writes
+ * back the convolution history of its value channels only. The q and k history of a key head is read by all the
+ * value heads of that key head, and a block can start after another one has ended, so gdn_qk_history_kernel writes
+ * it after the main kernel (each of its threads reads the old history of one channel, then writes the new one).
+ * The number of convolution taps (2 to 4; 4 in Qwen3.5) is a template parameter, so that the taps stay in
+ * registers.
  *
  * Speculative decoding runs the kernel twice. The verify pass (commit = 0) computes the outputs of all drafted
  * tokens and leaves the state and convolution history untouched. After acceptance, the commit pass (commit = 1,
  * out may be null) replays only the first commit_lens[b] rows of each sequence and writes the state back.
+ *
+ * The commit pass runs for all layers in one launch (seventy_gdn_commit_layers): blockIdx.y is the layer, and y,
+ * the caches and the layer parameters of layer l are at fixed strides from those of layer 0. One layer alone has
+ * only num_seqs * hv blocks, too few to keep the GPU busy; the layers together have that many times the layers.
  */
 
 namespace seventy {
@@ -40,7 +47,6 @@ constexpr int kThreads = 512;
 constexpr int kLanes = 4;
 constexpr int kRows = kD / kLanes;
 constexpr int kChunk = 16;
-constexpr int kWarps = kThreads / 32;
 constexpr int kCols = 32 / kLanes;
 
 __device__ __forceinline__ float round_half(float x) { return __half2float(__float2half_rn(x)); }
@@ -51,7 +57,8 @@ template <int kTaps>
 __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
     half *out, half *conv_state, float *state, const half *y, int ld, const float *conv_w, const float *a_log,
     const float *dt_bias, const float *norm_w, const int *query_start, const int *context_lens,
-    const int *state_slots, const int *commit_lens, int commit, int hk, int hv, float eps) {
+    const int *state_slots, const int *commit_lens, int commit, int hk, int hv, float eps, int64_t y_ls,
+    int64_t conv_ls, int64_t state_ls, int params_ls) {
   __shared__ __align__(16) half raw[kChunk][4 * kD];
   __shared__ __align__(16) float qs[kChunk][kD];
   __shared__ __align__(16) float ks[kChunk][kD];
@@ -73,12 +80,24 @@ __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
   const int lane = tid & 31;
   const int warp = tid >> 5;
   const int quarter = lane & (kLanes - 1);
+  if (blockIdx.y > 0) {
+    const int layer = blockIdx.y;
+    y += layer * y_ls;
+    conv_state += layer * conv_ls;
+    state += layer * state_ls;
+    if (params_ls) {
+      conv_w += static_cast<int64_t>(layer) * conv_dim * kTaps;
+      a_log += layer * hv;
+      dt_bias += layer * hv;
+      norm_w += layer * kD;
+    }
+  }
   const int v = warp * kCols + lane / kLanes;
   const bool outputs = out != nullptr;
 
   const int ch = quarter == 0 ? kh * kD + v : quarter == 1 ? key_size + kh * kD + v
                  : quarter == 2 ? 2 * key_size + h * kD + v : -1;
-  const bool writes_conv = ch >= 0 && (quarter == 2 || h % rep == 0);
+  const bool writes_conv = quarter == 2;
   float w[kTaps], hist[kTaps - 1];
   half *conv_slot = conv_state + (static_cast<int64_t>(slot) * conv_dim + (ch < 0 ? 0 : ch)) * (kTaps - 1);
 #pragma unroll
@@ -222,6 +241,48 @@ __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
     for (int j = 0; j < kTaps - 1; ++j) conv_slot[j] = __float2half_rn(hist[j]);
 }
 
+template <int kTaps>
+__global__ void __launch_bounds__(256) gdn_qk_history_kernel(half *conv_state, const half *y, int ld,
+                                                             const int *query_start, const int *context_lens,
+                                                             const int *state_slots, const int *commit_lens, int hk,
+                                                             int hv, int64_t y_ls, int64_t conv_ls) {
+  const int b = blockIdx.x;
+  const int t0 = query_start[b];
+  const int n = commit_lens != nullptr ? commit_lens[b] : query_start[b + 1] - t0;
+  if (n <= 0) return;
+  y += blockIdx.y * y_ls;
+  conv_state += blockIdx.y * conv_ls;
+  const bool fresh = context_lens[b] == 0;
+  const int key_size = hk * kD;
+  const int conv_dim = 2 * key_size + hv * kD;
+  for (int c = threadIdx.x; c < 2 * key_size; c += blockDim.x) {
+    half *hs = conv_state + (static_cast<int64_t>(state_slots[b]) * conv_dim + c) * (kTaps - 1);
+    half next[kTaps - 1];
+#pragma unroll
+    for (int j = 0; j < kTaps - 1; ++j) {
+      const int p = n - (kTaps - 1) + j;
+      next[j] = p >= 0 ? y[static_cast<int64_t>(t0 + p) * ld + c] : (fresh ? __float2half(0.0f) : hs[kTaps - 1 + p]);
+    }
+#pragma unroll
+    for (int j = 0; j < kTaps - 1; ++j) hs[j] = next[j];
+  }
+}
+
+template <int kTaps>
+void launch_recurrent(dim3 grid, half *out, half *conv_state, float *state, const half *y, int ld, const float *conv_w,
+                      const float *a_log, const float *dt_bias, const float *norm_w, const int *query_start,
+                      const int *context_lens, const int *state_slots, const int *commit_lens, int commit, int hk,
+                      int hv, float eps, int64_t y_ls, int64_t conv_ls, int64_t state_ls, int params_ls,
+                      cudaStream_t stream) {
+  gdn_recurrent_kernel<kTaps><<<grid, kThreads, 0, stream>>>(out, conv_state, state, y, ld, conv_w, a_log, dt_bias,
+                                                             norm_w, query_start, context_lens, state_slots,
+                                                             commit_lens, commit, hk, hv, eps, y_ls, conv_ls,
+                                                             state_ls, params_ls);
+  if (commit)
+    gdn_qk_history_kernel<kTaps><<<dim3(grid.x / hv, grid.y), 256, 0, stream>>>(
+        conv_state, y, ld, query_start, context_lens, state_slots, commit_lens, hk, hv, y_ls, conv_ls);
+}
+
 }  // namespace
 }  // namespace seventy
 
@@ -238,9 +299,31 @@ SEVENTY_API int seventy_gdn_recurrent(void *out, void *conv_state, float *state,
   if (dk != kD || dv != kD || hk <= 0 || hv <= 0 || hv % hk || taps < 2 || taps > 4 || num_seqs < 0)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (num_seqs == 0) return SEVENTY_OK;
-  const auto kernel = taps == 2 ? gdn_recurrent_kernel<2> : taps == 3 ? gdn_recurrent_kernel<3> : gdn_recurrent_kernel<4>;
-  kernel<<<static_cast<unsigned>(num_seqs * hv), kThreads, 0, stream>>>(
-      static_cast<half *>(out), static_cast<half *>(conv_state), state, static_cast<const half *>(y), ld, conv_w,
-      a_log, dt_bias, norm_w, query_start, context_lens, state_slots, commit_lens, commit, hk, hv, eps);
+  const auto launch = taps == 2 ? launch_recurrent<2> : taps == 3 ? launch_recurrent<3> : launch_recurrent<4>;
+  launch(dim3(static_cast<unsigned>(num_seqs * hv)), static_cast<half *>(out), static_cast<half *>(conv_state), state,
+         static_cast<const half *>(y), ld, conv_w, a_log, dt_bias, norm_w, query_start, context_lens, state_slots,
+         commit_lens, commit, hk, hv, eps, 0, 0, 0, 0, stream);
+  return launch_status();
+}
+
+SEVENTY_API int seventy_gdn_commit_layers(void *conv_state, float *state, const void *y, int ld, int64_t y_ls,
+                                          int64_t conv_ls, int64_t state_ls, const float *conv_w, const float *a_log,
+                                          const float *dt_bias, const float *norm_w, const int *query_start,
+                                          const int *context_lens, const int *state_slots, const int *commit_lens,
+                                          int num_seqs, int layers, int hk, int hv, int dk, int dv, int taps,
+                                          float eps, cudaStream_t stream) {
+  using namespace seventy;
+  if (conv_state == nullptr || state == nullptr || y == nullptr || conv_w == nullptr || a_log == nullptr ||
+      dt_bias == nullptr || norm_w == nullptr || query_start == nullptr || context_lens == nullptr ||
+      state_slots == nullptr || commit_lens == nullptr || layers < 1 || layers > 65535 || y_ls < 0 || conv_ls < 0 ||
+      state_ls < 0)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (dk != kD || dv != kD || hk <= 0 || hv <= 0 || hv % hk || taps < 2 || taps > 4 || num_seqs < 0)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (num_seqs == 0) return SEVENTY_OK;
+  const auto launch = taps == 2 ? launch_recurrent<2> : taps == 3 ? launch_recurrent<3> : launch_recurrent<4>;
+  launch(dim3(static_cast<unsigned>(num_seqs * hv), static_cast<unsigned>(layers)), nullptr,
+         static_cast<half *>(conv_state), state, static_cast<const half *>(y), ld, conv_w, a_log, dt_bias, norm_w,
+         query_start, context_lens, state_slots, commit_lens, 1, hk, hv, eps, y_ls, conv_ls, state_ls, 1, stream);
   return launch_status();
 }
