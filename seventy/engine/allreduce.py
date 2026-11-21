@@ -12,7 +12,6 @@ import torch.distributed as dist
 from ..ops._lib import check, lib
 
 
-TWO_SHOT_MIN = int(os.environ.get("SEVENTY_AR_TWO_SHOT_MIN", "16"))
 
 
 class CustomAllReduce:
@@ -45,13 +44,13 @@ class CustomAllReduce:
 
     def norm(self, x: torch.Tensor, residual: torch.Tensor | None, weight: torch.Tensor, eps: float,
              full_residual: bool = True):
-        """(rms_norm(residual + all_reduce(x)) * weight, the new residual). With a residual, from TWO_SHOT_MIN rows
-        and for a single row the two-shot kernel runs (faster there on V100; 2 to 15 rows the one-shot kernel is):
-        the residual is then updated only for this rank's shard of rows, unless full_residual is set; the caller
-        keeps the residual stream sharded between calls."""
+        """(rms_norm(residual + all_reduce(x)) * weight, the new residual). FP16 rows with a residual take the
+        two-shot kernel (faster than the one-shot kernel at every row count on V100), which updates the full
+        residual on every rank; with SEVENTY_AR=home it updates only this rank's shard of rows unless full_residual
+        is set, so callers keep treating the residual stream as sharded between calls."""
         x = x.contiguous()
         out = torch.empty_like(x)
-        if residual is not None and x.dtype == torch.float16 and (x.shape[0] >= TWO_SHOT_MIN or x.shape[0] == 1):
+        if residual is not None and x.dtype == torch.float16:
             code = lib().seventy_ar_norm_2shot(self.ctx, out.data_ptr(), residual.data_ptr(), x.data_ptr(),
                                                weight.data_ptr(), x.shape[0], x.shape[1], eps, 1 if full_residual else 0,
                                                torch.cuda.current_stream(x.device).cuda_stream)
@@ -72,7 +71,12 @@ class CustomAllReduce:
                                                          torch.cuda.current_stream(x.device).cuda_stream))
             return out
         out = torch.empty_like(x)
-        code = lib().seventy_ar_norm(self.ctx, out.data_ptr(), None, x.data_ptr(), None, x.shape[0], x.shape[1], 0.0,
-                                     torch.cuda.current_stream(x.device).cuda_stream)
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        if os.environ.get("SEVENTY_AR") not in ("home", "flags"):
+            code = lib().seventy_ar_norm_2shot(self.ctx, out.data_ptr(), None, x.data_ptr(), None, x.shape[0],
+                                               x.shape[1], 0.0, 0, stream)
+        else:
+            code = lib().seventy_ar_norm(self.ctx, out.data_ptr(), None, x.data_ptr(), None, x.shape[0], x.shape[1],
+                                         0.0, stream)
         check("ar_reduce", code)
         return out

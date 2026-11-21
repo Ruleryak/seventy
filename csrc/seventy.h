@@ -230,10 +230,12 @@ SEVENTY_API int seventy_ar_norm(void *ctx, void *out, void *residual, const void
                                 int dim, float eps, cudaStream_t stream);
 
 /*
- * Two-shot all-reduce + residual add + RMS norm (csrc/allreduce.cu, ar_norm_2shot_kernel): rows <= 64 are split
- * into world contiguous shards; each row is reduced and normed by its home rank and the normed rows are gathered.
- * out is complete on every rank; residual is updated only on the home rank of each row, unless gather_residual is set
- * (then every rank gets the full updated residual). weight is required. Same context and limits as seventy_ar_norm.
+ * Two-shot all-reduce + residual add + RMS norm (csrc/allreduce.cu, ar_norm_push_all_kernel): rows <= 64 are split
+ * into world contiguous shards; the home rank of each row reduces it and sends the sum to every rank, and every rank
+ * adds its residual and norms. out and residual are complete on every rank (gather_residual is ignored). Without
+ * weight (may be null), out is the plain sum. SEVENTY_AR=home selects the previous kernel, where the home rank also
+ * norms and the residual is updated only there unless gather_residual is set (weight then required). Same context
+ * and limits as seventy_ar_norm.
  */
 SEVENTY_API int seventy_ar_norm_2shot(void *ctx_ptr, void *out, void *residual, const void *x, const float *weight,
                                       int rows, int dim, float eps, int gather_residual, cudaStream_t stream);

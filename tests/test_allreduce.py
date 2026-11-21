@@ -54,6 +54,10 @@ def run_rank(rank, world, port, queue):
             errors.append(f"rows {rows}: two-shot with gathered residual differs from one-shot")
         if not (torch.equal(out_c, out_a) and torch.equal(res_c[own], res_a[own])):
             errors.append(f"rows {rows}: two-shot (sharded residual) differs from one-shot")
+        if not torch.equal(res_c, res_a):
+            errors.append(f"rows {rows}: two-shot residual not complete on every rank")
+        if not torch.equal(ar.reduce(x).cpu(), total.half()):
+            errors.append(f"rows {rows}: FP16 all-reduce differs from the rank-order sum")
     g = torch.Generator().manual_seed(1234)
     for it in range(400):
         rows = (1, 16, 32, 64, 7, 24)[it % 6]
