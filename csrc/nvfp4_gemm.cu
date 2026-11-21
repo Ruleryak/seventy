@@ -95,6 +95,12 @@ __device__ __forceinline__ void store_activations(uint4 *stage, const uint4 (&r)
   }
 }
 
+/*
+ * One 64-k step for MT m-tiles: decode the lane's 64 codes and multiply them with the staged activations. From 6
+ * m-tiles the step runs as two passes of 4 k-groups (the same order of products per accumulator), so that the loop
+ * body fits the instruction cache: the fully unrolled body of 8 groups x MT m-tiles stalls on instruction fetch
+ * there (V100: 48 to 64 rows 2 to 12% faster this way, below 48 rows slower).
+ */
 template <int MT>
 __device__ __forceinline__ void step_mma(float (&acc)[MT][8], const uint4 *stage, uint4 w0, uint4 w1, uint32_t sw,
                                          int idx) {
@@ -103,21 +109,47 @@ __device__ __forceinline__ void step_mma(float (&acc)[MT][8], const uint4 *stage
   const __half2 s01 = __hmul2(*reinterpret_cast<__half2 *>(&sbits), two15);
   sbits = (((sw >> 16) & 0xffu) << 7) | ((sw >> 24) << 23);
   const __half2 s23 = __hmul2(*reinterpret_cast<__half2 *>(&sbits), two15);
-  const uint32_t words[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
-  const __half2 scales[4] = {__low2half2(s01), __high2half2(s01), __low2half2(s23), __high2half2(s23)};
+  if constexpr (MT < 6) {
+    const uint32_t words[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+    const __half2 scales[4] = {__low2half2(s01), __high2half2(s01), __low2half2(s23), __high2half2(s23)};
 #pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    const __half2 s = scales[j >> 1];
-    const uint32_t v = words[j];
-    const uint32_t b0 = hmul2_bits(code_pair_to_half2(v), s);
-    const uint32_t b1 = hmul2_bits(code_pair_to_half2(v << 4), s);
-    const uint32_t b2 = hmul2_bits(code_pair_to_half2(v << 8), s);
-    const uint32_t b3 = hmul2_bits(code_pair_to_half2(v << 12), s);
+    for (int j = 0; j < 8; ++j) {
+      const __half2 s = scales[j >> 1];
+      const uint32_t v = words[j];
+      const uint32_t b0 = hmul2_bits(code_pair_to_half2(v), s);
+      const uint32_t b1 = hmul2_bits(code_pair_to_half2(v << 4), s);
+      const uint32_t b2 = hmul2_bits(code_pair_to_half2(v << 8), s);
+      const uint32_t b3 = hmul2_bits(code_pair_to_half2(v << 12), s);
 #pragma unroll
-    for (int t = 0; t < MT; ++t) {
-      const uint4 a = stage[(t * 8 + idx) * kRowStride + j];
-      mma_8x8x4(acc[t], a.x, a.y, b0, b1);
-      mma_8x8x4(acc[t], a.z, a.w, b2, b3);
+      for (int t = 0; t < MT; ++t) {
+        const uint4 a = stage[(t * 8 + idx) * kRowStride + j];
+        mma_8x8x4(acc[t], a.x, a.y, b0, b1);
+        mma_8x8x4(acc[t], a.z, a.w, b2, b3);
+      }
+    }
+    return;
+  }
+#pragma unroll 1
+  for (int h = 0; h < 2; ++h) {
+    const uint4 w = h ? w1 : w0;
+    const __half2 s_lo = h ? __low2half2(s23) : __low2half2(s01);
+    const __half2 s_hi = h ? __high2half2(s23) : __high2half2(s01);
+    const uint32_t words[4] = {w.x, w.y, w.z, w.w};
+    const uint4 *st = stage + 4 * h;
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const __half2 s = jj < 2 ? s_lo : s_hi;
+      const uint32_t v = words[jj];
+      const uint32_t b0 = hmul2_bits(code_pair_to_half2(v), s);
+      const uint32_t b1 = hmul2_bits(code_pair_to_half2(v << 4), s);
+      const uint32_t b2 = hmul2_bits(code_pair_to_half2(v << 8), s);
+      const uint32_t b3 = hmul2_bits(code_pair_to_half2(v << 12), s);
+#pragma unroll
+      for (int t = 0; t < MT; ++t) {
+        const uint4 a = st[(t * 8 + idx) * kRowStride + jj];
+        mma_8x8x4(acc[t], a.x, a.y, b0, b1);
+        mma_8x8x4(acc[t], a.z, a.w, b2, b3);
+      }
     }
   }
 }
@@ -513,3 +545,4 @@ SEVENTY_API int seventy_nvfp4_gemm(void *out, const void *x, const void *wpk, co
   }
   return launch_status();
 }
+
