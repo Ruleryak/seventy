@@ -304,7 +304,9 @@ SEVENTY_API int seventy_ar_norm(void *ctx, void *out, void *residual, const void
 /*
  * Two-shot all-reduce + residual add + RMS norm (csrc/allreduce.cu, ar_norm_push_all_kernel): rows <= 64 are split
  * into world contiguous shards; the home rank of each row reduces it and sends the sum to every rank, and every rank
- * adds its residual and norms. out and residual are complete on every rank (gather_residual is ignored). Without
+ * adds its residual and norms (up to 8 rows every rank instead sums all ranks' rows itself, in the same order: one
+ * NVLink write per call, bitwise the same output). out and residual are complete on every rank (gather_residual is
+ * ignored). Without
  * weight (may be null), out is the plain sum. SEVENTY_AR=home selects the previous kernel, where the home rank also
  * norms and the residual is updated only there unless gather_residual is set (weight then required). Same context
  * and limits as seventy_ar_norm.

@@ -29,6 +29,7 @@ constexpr int kMaxRanks = 8;
 constexpr int kMaxBlocks = 64;
 constexpr int kThreads = 1024;
 constexpr int kVecs = 2;
+constexpr int kOneShotRows = 8;
 constexpr int64_t kSignalBytes = 2 * static_cast<int64_t>(kMaxBlocks) * kMaxRanks * sizeof(uint32_t);
 
 struct ArContext {
@@ -613,6 +614,104 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_all_kernel(ArContext ct
 }
 
 /*
+ * ar_norm_push_one_kernel: the one-shot form of ar_norm_push_all_kernel for up to kOneShotRows rows (V100, 4 GPUs,
+ * 2 NVLinks per pair: 0.5 to 0.9 us faster per call from 1 to 8 rows, slower from 16): every rank writes its row b
+ * into slot `rank` of every rank's phase-1 area at once, waits for all world slots of its own area, adds them in
+ * FP32 in rank order, rounds once to FP16 and goes on as ar_norm_push_all_kernel. The sum is the same as the home
+ * rank's there (bitwise the same output), with one NVLink write per call instead of two; each rank clears its own
+ * slots, and the slots alternate per row with the epoch bit as in the two-shot forms, so the forms can follow each
+ * other from call to call.
+ */
+__global__ void __launch_bounds__(kThreads) ar_norm_push_one_kernel(ArContext ctx, half *out, half *residual,
+                                                                    const half *x, const float *weight, int rows,
+                                                                    int dim, float eps) {
+  __shared__ float scratch[32];
+  const int b = blockIdx.x;
+  const int nt = blockDim.x;
+  const uint32_t parity = ctx.push_epochs[b] & 1u;
+  const int64_t ps = push_slot_bytes(ctx.slot_bytes);
+  const int64_t p1 = push_p1_offset(ctx.world, ctx.slot_bytes) + parity * ctx.world * ps;
+  const int vec_per_row = dim / 8;
+  const int64_t slot_vecs = ps / static_cast<int64_t>(sizeof(uint4));
+  const int64_t row_off = static_cast<int64_t>(b) * vec_per_row;
+  const int64_t slot_off = static_cast<int64_t>(b) * (dim / 4);
+  const uint4 empty = make_uint4(kEmpty, kEmpty, kEmpty, kEmpty);
+  {
+    const uint4 *src = reinterpret_cast<const uint4 *>(x) + row_off;
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) {
+      const int i = threadIdx.x + j * nt;
+      if (i >= vec_per_row) break;
+      const uint4 v = escape(src[i]);
+      for (int p = 0; p < ctx.world; ++p)
+        st_vol(reinterpret_cast<uint4 *>(ctx.buffers[p] + p1) + ctx.rank * slot_vecs + slot_off + i, v);
+    }
+  }
+  float r[kVecs][8];
+  uint4 *local = reinterpret_cast<uint4 *>(ctx.buffers[ctx.rank] + p1) + slot_off;
+#pragma unroll
+  for (int j = 0; j < kVecs; ++j) {
+    const int i = threadIdx.x + j * nt;
+    if (i >= vec_per_row) break;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int p = 0; p < ctx.world; ++p) {
+      float f[8];
+      unpack8(wait_full(local + p * slot_vecs + i), f);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) acc[k] += f[k];
+    }
+    for (int p = 0; p < ctx.world; ++p) st_vol(local + p * slot_vecs + i, empty);
+    unpack8(pack8(acc), r[j]);
+  }
+  uint4 *res = residual != nullptr ? reinterpret_cast<uint4 *>(residual) + row_off : nullptr;
+  uint4 *dst = reinterpret_cast<uint4 *>(out) + row_off;
+  uint4 rnew[kVecs];
+  float sumsq = 0.0f;
+#pragma unroll
+  for (int j = 0; j < kVecs; ++j) {
+    const int i = threadIdx.x + j * nt;
+    if (i >= vec_per_row) break;
+    if (res != nullptr) {
+      float old[8];
+      unpack8(res[i], old);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) r[j][k] += old[k];
+    }
+    rnew[j] = pack8(r[j]);
+    unpack8(rnew[j], r[j]);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) sumsq += r[j][k] * r[j][k];
+  }
+  if (weight == nullptr) {
+#pragma unroll
+    for (int j = 0; j < kVecs; ++j) {
+      const int i = threadIdx.x + j * nt;
+      if (i < vec_per_row) dst[i] = rnew[j];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) ctx.push_epochs[b] += 1;
+    return;
+  }
+  const float total = block_sum(sumsq, scratch);
+  const float inv = 1.0f / sqrtf(total / dim + eps);
+  const float4 *w4 = reinterpret_cast<const float4 *>(weight);
+#pragma unroll
+  for (int j = 0; j < kVecs; ++j) {
+    const int i = threadIdx.x + j * nt;
+    if (i >= vec_per_row) break;
+    const float4 wa = w4[2 * i], wb = w4[2 * i + 1];
+    const float w[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w};
+    float o[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) o[k] = r[j][k] * inv * w[k];
+    dst[i] = pack8(o);
+    if (res != nullptr) res[i] = rnew[j];
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) ctx.push_epochs[b] += 1;
+}
+
+/*
  * ar_sum_push_kernel: two-shot FP32 all-reduce of [rows, dim] on the push protocol (FP32 words), one block per row
  * b, same home ranks as ar_norm_push_kernel. The home rank adds the world partial rows in rank order, as
  * ar_sum_f32_kernel does, so the result is bitwise the same, and sends the sum to every other rank.
@@ -841,9 +940,14 @@ SEVENTY_API int seventy_ar_norm_2shot(void *ctx_ptr, void *out, void *residual, 
     int threads = (dim / 8 + 31) / 32 * 32;
     if (threads > kThreads) threads = kThreads;
     if (threads * kVecs < dim / 8) threads = kThreads;
-    ar_norm_push_all_kernel<<<rows, threads, 0, stream>>>(*ctx, static_cast<half *>(out),
-                                                          static_cast<half *>(residual),
-                                                          static_cast<const half *>(x), weight, rows, dim, eps);
+    if (rows <= kOneShotRows)
+      ar_norm_push_one_kernel<<<rows, threads, 0, stream>>>(*ctx, static_cast<half *>(out),
+                                                            static_cast<half *>(residual),
+                                                            static_cast<const half *>(x), weight, rows, dim, eps);
+    else
+      ar_norm_push_all_kernel<<<rows, threads, 0, stream>>>(*ctx, static_cast<half *>(out),
+                                                            static_cast<half *>(residual),
+                                                            static_cast<const half *>(x), weight, rows, dim, eps);
   }
   return launch_status();
 }
