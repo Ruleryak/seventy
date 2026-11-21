@@ -119,3 +119,33 @@ def test_silu_mul_scale_and_row_scale_gemm():
     got = kernels.dense_gemm(out, packed, row_scale=scale)
     want = (out.float() @ w.float().T) * scale[:, None]
     torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-2 * want.abs().max().item() / 100)
+
+
+@pytest.mark.parametrize("b, n, k, rank, sampled", [(1, 7, 16, 256, False), (5, 7, 16, 256, True), (3, 4, 8, 64, True),
+                                                    (8, 7, 16, 256, False)])
+def test_drafter_walk_matches_reference(b, n, k, rank, sampled):
+    from types import SimpleNamespace
+
+    from seventy.model.dflash2 import Drafter
+
+    torch.manual_seed(b * 100 + k)
+    vocab = 3000
+    d = SimpleNamespace(cfg=SimpleNamespace(top_k=k), sel_hidden=None, pred=(torch.randn(vocab, rank) * 0.3).half().cuda(),
+                        succ=(torch.randn(vocab, rank) * 0.3).half().cuda())
+    anchors = torch.randint(0, vocab, (b,)).cuda()
+    values = (torch.randn(b, n, k) * 3).cuda()
+    ids = torch.stack([torch.randperm(vocab)[:k] for _ in range(b * n)]).view(b, n, k).cuda()
+    hid = torch.randn(b, n, rank).cuda()
+    temps = torch.rand(b).cuda() + 0.3 if sampled else torch.zeros(b).cuda()
+    if sampled:
+        temps[0] = 0.0
+    gumbel = -torch.log(-torch.log(torch.rand(b, n, k).clamp(1e-6, 1 - 1e-6))).cuda() if sampled else None
+    d._mm = lambda h, w: h
+    import os
+
+    os.environ["SEVENTY_DRAFTER_WALK"] = "torch"
+    ref = Drafter.walk(d, anchors.view(b, 1), values, ids, hid, temps, gumbel)
+    del os.environ["SEVENTY_DRAFTER_WALK"]
+    got = Drafter.walk(d, anchors.view(b, 1), values, ids, hid, temps, gumbel)
+    assert torch.equal(got.tokens, ref.tokens)
+    assert torch.allclose(got.probs, ref.probs, atol=2e-5, rtol=1e-4)

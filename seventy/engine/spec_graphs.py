@@ -17,6 +17,8 @@ one transfer. The block tables are copied up to the widest row.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
@@ -36,6 +38,9 @@ class SpecGraphs:
         self.buckets = tuple(sorted(buckets))
         self.graphs: dict[int, tuple] = {}
         self.packed: dict[int, tuple] = {}
+        self.sent: dict[int, tuple] = {}
+        self.slot_tables: dict[int, np.ndarray] = {}
+        self.slot_len: dict[int, int] = {}
 
     def bucket(self, n: int) -> int | None:
         return next((b for b in self.buckets if b >= n), None)
@@ -89,10 +94,17 @@ class SpecGraphs:
         )
         stash: dict = {}
         (pred, vals, idx), cap = self.model.forward(step, self.cache, capture=self.layers, stash=stash, top=KMAX)
-        n, new = device_accept_top(pred.view(b, blk), vals.view(b, blk, -1), idx.view(b, blk, -1),
-                                   x["tokens"][:, 1:], x["q"], x["cand"], x["temp"], x["top_k"], x["top_p"],
-                                   x["min_p"], x["u_accept"], x["u_residual"])
-        n = cut_at_stops(n, new, x["stop"], x["limit"])
+        if vals.shape[-1] == KMAX and os.environ.get("SEVENTY_SPEC_ACCEPT") != "torch":
+            from ..ops import kernels
+
+            n, new = kernels.spec_accept(pred.view(b, blk), vals.view(b, blk, -1), idx.view(b, blk, -1),
+                                         x["tokens"][:, 1:], x["q"], x["cand"], x["temp"], x["top_k"], x["top_p"],
+                                         x["min_p"], x["u_accept"], x["u_residual"], x["stop"], x["limit"])
+        else:
+            n, new = device_accept_top(pred.view(b, blk), vals.view(b, blk, -1), idx.view(b, blk, -1),
+                                       x["tokens"][:, 1:], x["q"], x["cand"], x["temp"], x["top_k"], x["top_p"],
+                                       x["min_p"], x["u_accept"], x["u_residual"])
+            n = cut_at_stops(n, new, x["stop"], x["limit"])
         self.model.commit(step, self.cache, stash, (n + 1).int())
         feats = torch.cat([cap[i] for i in self.layers], dim=-1)
         self.drafter.write_context(feats, pos.reshape(-1), x["slots"].repeat_interleave(blk))
@@ -124,7 +136,9 @@ class SpecGraphs:
     def pack(self, rows: list[dict]) -> tuple:
         """rows: per sequence {tokens [block], start, delta (rotary position minus token index), slot, table, temp,
         top_k, top_p, min_p, q, cand, u_accept, u_residual, gumbel, stop (up to STOP_SLOTS ids), limit (most new
-        tokens)} (host values). Returns what run_packed takes (and what rank 0 sends to the other ranks)."""
+        tokens)} (host values), and table_key (sequence id, blocks epoch) to send only appended blocks. Returns
+        what run_packed takes (and what rank 0 sends to the other ranks): the block tables travel as updates of
+        each rank's per-slot tables, whole when a slot's sequence or block list changed, else the appended blocks."""
         b = self.bucket(len(rows))
         _, host_buf, views, defaults = self.packed[b]
         flat = host_buf.numpy()
@@ -145,18 +159,49 @@ class SpecGraphs:
                 v = r.get(key)
                 if v is not None:
                     views[key][i] = v.numpy() if isinstance(v, torch.Tensor) else v
-        tables = [np.asarray(r["table"], dtype=np.int32) for r in rows]
-        return b, len(rows), flat.tobytes(), tables
+        return b, len(rows), flat.tobytes(), self._table_updates(rows)
 
-    def run_packed(self, b: int, n: int, data: bytes, tables: list) -> dict[str, torch.Tensor]:
+    def _table_updates(self, rows: list[dict]) -> list[tuple]:
+        """(slot, first, total, ids) for each row whose block table differs from what the ranks have: the appended
+        blocks when the slot holds the same sequence with the same block list (table_key), else the whole table."""
+        updates = []
+        for r in rows:
+            slot, blocks, key = r["slot"], r["table"], r.get("table_key")
+            total = len(blocks)
+            sent = self.sent.get(slot)
+            same = key is not None and sent is not None and sent[0] == key
+            if same and sent[1] == total:
+                continue
+            first = sent[1] if same and sent[1] < total else 0
+            updates.append((slot, first, total, np.asarray(blocks[first:], dtype=np.int32)))
+            self.sent[slot] = (key, total)
+        return updates
+
+    def _apply_tables(self, updates: list) -> None:
+        """Bring this rank's per-slot block tables up to date: (slot, first, total, ids) sets entries
+        [first, total) of the slot's table to ids."""
+        for slot, first, total, ids in updates:
+            t = self.slot_tables.get(slot)
+            if t is None or len(t) < total:
+                grown = np.full(max(total, 64, 2 * (len(t) if t is not None else 0)), self.cache.scratch_block,
+                                dtype=np.int32)
+                if t is not None:
+                    grown[:first] = t[:first]
+                t = self.slot_tables[slot] = grown
+            t[first:total] = ids
+            self.slot_len[slot] = total
+
+    def run_packed(self, b: int, n: int, data: bytes, updates: list) -> dict[str, torch.Tensor]:
         graph, x, out = self.graphs[b]
-        dev_buf, host_buf, _, _ = self.packed[b]
+        dev_buf, host_buf, views, _ = self.packed[b]
         host_buf.numpy()[:] = np.frombuffer(data, dtype=np.uint8)
         dev_buf.copy_(host_buf, non_blocking=True)
-        width = max(len(t) for t in tables)
+        self._apply_tables(updates)
+        slots = [int(s) for s in views["slots"][:n]]
+        width = max(self.slot_len[s] for s in slots)
         table = np.full((b, width), self.cache.scratch_block, dtype=np.int32)
-        for i, t in enumerate(tables):
-            table[i, : len(t)] = t
+        for i, s in enumerate(slots):
+            table[i, : self.slot_len[s]] = self.slot_tables[s][: self.slot_len[s]]
         x["tables"][:, :width].copy_(torch.from_numpy(table), non_blocking=True)
         graph.replay()
         return {k: v[:n] for k, v in out.items()}

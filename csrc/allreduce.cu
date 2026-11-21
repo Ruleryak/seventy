@@ -826,10 +826,6 @@ SEVENTY_API int seventy_ar_norm_2shot(void *ctx_ptr, void *out, void *residual, 
     const char *v = getenv("SEVENTY_AR");
     return v != nullptr && strcmp(v, "home") == 0;
   }();
-  static const int all_threads = [] {
-    const char *v = getenv("SEVENTY_AR_THREADS");
-    return v != nullptr ? atoi(v) : 0;
-  }();
   const bool push = !flags && static_cast<int64_t>(rows) * dim * static_cast<int64_t>(sizeof(float)) <=
                                   push_slot_bytes(ctx->slot_bytes);
   if (weight == nullptr && (!push || home_norm)) return SEVENTY_ERR_INVALID_ARGUMENT;
@@ -842,7 +838,7 @@ SEVENTY_API int seventy_ar_norm_2shot(void *ctx_ptr, void *out, void *residual, 
                                                        static_cast<half *>(residual), static_cast<const half *>(x),
                                                        weight, rows, dim, eps, gather_residual);
   else {
-    int threads = all_threads > 0 ? all_threads : (dim / 8 + 31) / 32 * 32;
+    int threads = (dim / 8 + 31) / 32 * 32;
     if (threads > kThreads) threads = kThreads;
     if (threads * kVecs < dim / 8) threads = kThreads;
     ar_norm_push_all_kernel<<<rows, threads, 0, stream>>>(*ctx, static_cast<half *>(out),

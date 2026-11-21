@@ -294,6 +294,48 @@ def topk(x: torch.Tensor, k: int, id_offset: int = 0, ids: torch.Tensor | None =
     return values, out_ids
 
 
+def spec_accept(pred: torch.Tensor, vals: torch.Tensor, idx: torch.Tensor, drafts: torch.Tensor, q: torch.Tensor,
+                cand: torch.Tensor, temp: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor, min_p: torch.Tensor,
+                u_accept: torch.Tensor, u_residual: torch.Tensor, stop: torch.Tensor, limit: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+    """device_accept_top followed by cut_at_stops (seventy/engine/spec.py) in one kernel: (accepted drafts after the
+    cut int64 [B], new tokens int64 [B, k + 1])."""
+    b, k1, top = vals.shape
+    k = k1 - 1
+    c = q.shape[-1]
+    if drafts.stride(1) != 1:
+        drafts = drafts.contiguous()
+    n = torch.empty(b, dtype=torch.int64, device=vals.device)
+    new = torch.empty(b, k1, dtype=torch.int64, device=vals.device)
+    t = [pred.contiguous(), vals.contiguous(), idx.contiguous()]
+    rest = [q.float().contiguous(), cand.contiguous(), temp.float().contiguous(), top_k.contiguous(),
+            top_p.float().contiguous(), min_p.float().contiguous(), u_accept.float().contiguous(),
+            u_residual.float().contiguous()]
+    st, lim = stop.contiguous(), limit.contiguous()
+    code = lib().seventy_spec_accept(n.data_ptr(), new.data_ptr(), *(x.data_ptr() for x in t), drafts.data_ptr(),
+                                     drafts.stride(0), *(x.data_ptr() for x in rest), st.data_ptr(), st.shape[1],
+                                     lim.data_ptr(), b, k, top, c, _stream(vals))
+    check("spec_accept", code)
+    return n, new
+
+
+def drafter_walk(anchors: torch.Tensor, values: torch.Tensor, ids: torch.Tensor, hid: torch.Tensor,
+                 pred: torch.Tensor, succ: torch.Tensor, temps: torch.Tensor, gumbel: torch.Tensor | None
+                 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """The DFlash2 selector walk (Drafter.walk) in one kernel: (tokens int64 [b, n], probs FP32 [b, n, k])."""
+    b, n, k = ids.shape
+    rank = pred.shape[1]
+    tokens = torch.empty(b, n, dtype=torch.int64, device=ids.device)
+    probs = torch.empty(b, n, k, dtype=torch.float32, device=ids.device)
+    args = [anchors.contiguous(), values.float().contiguous(), ids.contiguous(), hid.float().contiguous(),
+            pred.contiguous(), succ.contiguous(), temps.float().contiguous()]
+    g = gumbel.float().contiguous() if gumbel is not None else None
+    code = lib().seventy_drafter_walk(tokens.data_ptr(), probs.data_ptr(), *(a.data_ptr() for a in args),
+                                      g.data_ptr() if g is not None else None, b, n, k, rank, _stream(ids))
+    check("drafter_walk", code)
+    return tokens, probs
+
+
 _last_tiles: tuple = (None, None)
 
 

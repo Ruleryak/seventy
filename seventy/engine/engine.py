@@ -268,7 +268,7 @@ class Engine:
             r = w.request
             n = w.count if w.logits == "all" else (1 if w.logits == "last" else 0)
             if w.logits == "all" and r.params.prompt_logprobs is not None:
-                targets = r.tokens[w.start + 1 : w.start + w.count + 1]
+                targets = r.token_range(w.start + 1, w.start + w.count + 1)
                 k = len(targets)
                 if k:
                     lps = logprobs_of(logits[row : row + k], torch.tensor(targets, device=logits.device),
@@ -353,7 +353,7 @@ class Engine:
     def _draft(self, requests: list[Request]) -> None:
         if not requests:
             return
-        d = self.runner.draft([r.tokens[-1] for r in requests], [r.computed for r in requests],
+        d = self.runner.draft([r.last_token for r in requests], [r.computed for r in requests],
                               [r.slot for r in requests], [r.params.temperature for r in requests],
                               [r.generator for r in requests])
         tokens = d.tokens.tolist()
@@ -384,8 +384,8 @@ class Engine:
             stop, limit = self._stops(r)
             if len(r.draft) != k or not eligible(p) or len(r.output) < p.min_tokens or len(stop) > STOP_SLOTS:
                 return None
-            row = {"tokens": [r.tokens[-1]] + r.draft, "start": w.start, "delta": r.rope_delta, "slot": r.slot,
-                   "table": r.blocks,
+            row = {"tokens": [r.last_token] + r.draft, "start": w.start, "delta": r.rope_delta, "slot": r.slot,
+                   "table": r.blocks, "table_key": (r.id, r.blocks_epoch),
                    "temp": p.temperature, "top_k": p.top_k if p.temperature > 0 else 1, "top_p": p.top_p,
                    "min_p": p.min_p, "q": r.draft_q, "cand": r.draft_cand, "stop": stop, "limit": limit}
             if p.temperature > 0:

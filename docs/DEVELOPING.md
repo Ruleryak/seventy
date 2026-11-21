@@ -103,6 +103,34 @@ compiled for sm70.
 - For profiling, build with line information: add `--config-settings=cmake.define.SEVENTY_LINEINFO=ON` to the
   install command.
 
+## Compare kernel paths
+
+Some parts have an earlier implementation that you can select for an A/B comparison. Set the variable for the
+engine or for the tests. Without the variable, the default path runs.
+
+| Variable | Value | Effect |
+|---|---|---|
+| `SEVENTY_PREFILL_ATTN` | `grouped` | Prefill attention on the verify kernel |
+| `SEVENTY_PREFILL_ATTN` | `tiles` | Prefill attention on the per-head prefill kernel |
+| `SEVENTY_VERIFY_ATTN` | `wmma` | Verify attention on the WMMA kernel |
+| `SEVENTY_AR` | `home` | All-reduce and norm where the home rank of a row also takes the norm |
+| `SEVENTY_AR` | `flags` | All-reduce on the flag protocol |
+| `SEVENTY_CUSTOM_ALLREDUCE` | `0` | NCCL for all all-reduces |
+| `SEVENTY_GEMM_WK` | `0` | NVFP4 GEMM without the warp split over k |
+| `SEVENTY_GDN_SCAN` | `single` | Gated DeltaNet prefill state scan in one kernel |
+| `SEVENTY_GDN_PREPARE` | `torch` | Gated DeltaNet prefill preparation in PyTorch |
+| `SEVENTY_DRAFTER_FUSED` | `0` | Drafter without the fused kernels |
+| `SEVENTY_DRAFTER_FP8` | `0` | Drafter layers in FP16 |
+| `SEVENTY_DRAFTER_FP8_EXTRA` | `fc,kv_all,sel_hidden,conv` | These drafter projections in FP8 too (fewer names select fewer) |
+| `SEVENTY_DRAFTER_WALK` | `torch` | Drafter selector walk in PyTorch |
+| `SEVENTY_SPEC_ACCEPT` | `torch` | Speculative acceptance in PyTorch |
+
+For example, to run the engine with the earlier prefill attention:
+
+```
+SEVENTY_PREFILL_ATTN=grouped .venv/bin/seventy engine --model /path/to/model --draft-model /path/to/drafter --gpus 0,1,2,3
+```
+
 ## Speed charts
 
 `bench/results/` has one results file for each release. The docstring of `bench/report.py` gives the format.

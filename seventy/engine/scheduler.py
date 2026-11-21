@@ -60,10 +60,32 @@ class Request:
     images: object | None = None
     cache_key: list[int] | None = None
     snapshot_done: bool = False
+    blocks_epoch: int = 0
+
+    def __setattr__(self, name, value):
+        """A new blocks list (not an append to the current one) bumps blocks_epoch, so that the spec graphs know
+        when a sequence's block table must be sent whole."""
+        if name == "blocks" and value is not self.__dict__.get("blocks"):
+            object.__setattr__(self, "blocks_epoch", self.__dict__.get("blocks_epoch", 0) + 1)
+        object.__setattr__(self, name, value)
 
     @property
     def tokens(self) -> list[int]:
         return self.prompt + self.output
+
+    @property
+    def last_token(self) -> int:
+        """tokens[-1], without building the token list (decode steps call this for every sequence)."""
+        return self.output[-1] if self.output else self.prompt[-1]
+
+    def token_range(self, start: int, end: int) -> list[int]:
+        """tokens[start:end], without building the whole token list."""
+        p = len(self.prompt)
+        if end <= p:
+            return self.prompt[start:end]
+        if start >= p:
+            return self.output[start - p : end - p]
+        return self.prompt[start:] + self.output[: end - p]
 
     @property
     def key_tokens(self) -> list[int]:
@@ -241,7 +263,7 @@ class Work:
     tokens: list[int] | None = None
 
     def ids(self) -> list[int]:
-        return self.tokens if self.tokens is not None else self.request.tokens[self.start : self.start + self.count]
+        return self.tokens if self.tokens is not None else self.request.token_range(self.start, self.start + self.count)
 
 
 @dataclass
@@ -377,7 +399,7 @@ class Scheduler:
                     break
             if r.status is Status.RUNNING:
                 if r.draft:
-                    plan.decode.append(Work(r, r.computed, count, "all", tokens=[r.tokens[-1]] + r.draft))
+                    plan.decode.append(Work(r, r.computed, count, "all", tokens=[r.last_token] + r.draft))
                 else:
                     plan.decode.append(Work(r, r.computed, 1, "last"))
         budget = self.prefill_budget

@@ -226,6 +226,31 @@ SEVENTY_API int seventy_topk(float *values, int *ids_out, const float *x, int64_
                              cudaStream_t stream);
 
 /*
+ * Speculative acceptance on the device (csrc/spec.cu): device_accept_top and cut_at_stops of seventy/engine/spec.py
+ * in one kernel. pred int64 [rows, k + 1]; vals FP32 and idx int64 [rows, k + 1, top] (top = 64, descending);
+ * drafts int64 [rows, k] (row stride drafts_ld); q FP32 and cand int64 [rows, k, c]; temp, top_p, min_p FP32 [rows];
+ * top_k int64 [rows]; u_accept FP32 [rows, k]; u_residual FP32 [rows, k + 1]; stop int64 [rows, stops] (-1 pads);
+ * limit int64 [rows]. Writes n_out int64 [rows] (accepted drafts after the cut) and new_out int64 [rows, k + 1].
+ */
+SEVENTY_API int seventy_spec_accept(int64_t *n_out, int64_t *new_out, const int64_t *pred, const float *vals,
+                                    const int64_t *idx, const int64_t *drafts, int64_t drafts_ld, const float *q,
+                                    const int64_t *cand, const float *temp, const int64_t *top_k, const float *top_p,
+                                    const float *min_p, const float *u_accept, const float *u_residual,
+                                    const int64_t *stop, int stops, const int64_t *limit, int rows, int k, int top,
+                                    int c, cudaStream_t stream);
+
+/*
+ * The DFlash2 selector walk on the device (csrc/spec.cu): tokens int64 [rows, n] and probs FP32 [rows, n, k] from
+ * anchors int64 [rows], candidate values FP32 [rows, n, k] and ids int64 [rows, n, k], the selector hidden states FP32
+ * [rows, n, rank], the predecessor and successor codebooks FP16 [vocab, rank], temperatures FP32 [rows] (0 = greedy)
+ * and optional Gumbel noise FP32 [rows, n, k]. k <= 32; rank a multiple of 32, at most 1024.
+ */
+SEVENTY_API int seventy_drafter_walk(int64_t *tokens, float *probs, const int64_t *anchors, const float *values,
+                                     const int64_t *ids, const float *hid, const void *pred, const void *succ,
+                                     const float *temps, const float *gumbel, int rows, int n, int k, int rank,
+                                     cudaStream_t stream);
+
+/*
  * Small-batch tensor-parallel all-reduce over peer GPU memory, fused with the residual add and RMS norm
  * (see csrc/allreduce.cu). seventy_ar_alloc allocates this rank's buffer of seventy_ar_buffer_bytes(world,
  * slot_bytes) bytes (slot_bytes a multiple of 32), prepares it, and returns its 64-byte CUDA IPC handle; seventy_ar_open maps a peer's handle; seventy_ar_context builds the

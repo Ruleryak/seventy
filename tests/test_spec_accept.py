@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from seventy.engine.sampling import RowState, SamplingParams
@@ -97,3 +98,70 @@ def test_logprobs_of_in_row_blocks_matches_one_block():
     assert len(a) == 300
     assert [(x.token, x.rank, [t for t, _ in x.top]) for x in a] == [(x.token, x.rank, [t for t, _ in x.top]) for x in b]
     assert max(abs(x.logprob - y.logprob) for x, y in zip(a, b)) < 1e-5
+
+
+def _random_batch(g, b, k, v, c, sampled):
+    logits = torch.randn(b, k + 1, v, generator=g) * 2
+    vals, idx = torch.topk(logits, KMAX, dim=-1)
+    pred = logits.argmax(-1)
+    drafts = pred[:, :k].clone()
+    flip = torch.rand(b, k, generator=g) < 0.25
+    drafts[flip] = idx[:, :k, 1][flip]
+    cand = torch.stack([torch.randperm(v, generator=g)[:c] for _ in range(b * k)]).view(b, k, c)
+    cand[..., 0] = drafts
+    q = torch.softmax(torch.randn(b, k, c, generator=g), -1)
+    temp = (torch.rand(b, generator=g) + 0.2) if sampled else torch.zeros(b)
+    if sampled:
+        temp[::3] = 0.0
+    top_k = torch.randint(1, KMAX + 1, (b,), generator=g)
+    top_p = torch.rand(b, generator=g) * 0.5 + 0.5
+    min_p = torch.rand(b, generator=g) * 0.1
+    stop = torch.full((b, 8), -1, dtype=torch.long)
+    stop[:, 0] = drafts[:, 2]
+    stop[::2, 0] = -1
+    limit = torch.randint(1, k + 3, (b,), generator=g)
+    return (pred, vals, idx, drafts, q, cand, temp, top_k, top_p, min_p, torch.rand(b, k, generator=g),
+            torch.rand(b, k + 1, generator=g), stop, limit)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("sampled", [False, True])
+def test_spec_accept_kernel_matches_torch(sampled):
+    from seventy.engine.spec import cut_at_stops, device_accept_top
+    from seventy.ops import kernels
+
+    g = torch.Generator().manual_seed(11 + sampled)
+    args = _random_batch(g, 300, 7, 500, 16, sampled)
+    n0, new0 = device_accept_top(*args[:12])
+    n0 = cut_at_stops(n0, new0, args[12], args[13])
+    n1, new1 = kernels.spec_accept(*(a.cuda() for a in args))
+    assert torch.equal(n1.cpu(), n0)
+    assert torch.equal(new1.cpu(), new0)
+
+
+@pytest.mark.gpu
+def test_spec_accept_kernel_preserves_target_distribution():
+    from seventy.ops import kernels
+
+    torch.manual_seed(1)
+    v, k, trials = 300, 1, 40000
+    logits = (torch.randn(1, k + 1, v) * 2).expand(trials, -1, -1).contiguous()
+    vals, idx = torch.topk(logits, KMAX, dim=-1)
+    cand = torch.arange(16)[None, None].expand(trials, k, 16).clone()
+    qraw = torch.softmax(torch.randn(16), 0)
+    q = qraw[None, None].expand(trials, k, 16).clone()
+    drafts = cand[:, 0].gather(1, torch.multinomial(qraw, trials, replacement=True)[:, None])
+    t = torch.ones(trials)
+    stop = torch.full((trials, 8), -1, dtype=torch.long)
+    n, new = kernels.spec_accept(*(a.cuda() for a in (
+        logits.argmax(-1), vals, idx, drafts, q, cand, t, torch.full((trials,), 5), torch.full((trials,), 0.9),
+        torch.zeros(trials), torch.rand(trials, k), torch.rand(trials, k + 1), stop, torch.full((trials,), 8))))
+    first = new[:, 0].cpu()
+    counts = torch.bincount(first, minlength=v).float() / trials
+    tv, ti = torch.topk(logits[0, 0], 5)
+    p = torch.softmax(tv, 0)
+    keep = (torch.cumsum(p, 0) - p) < 0.9
+    p = p * keep
+    p = p / p.sum()
+    want = torch.zeros(v).scatter(0, ti, p)
+    assert (counts - want).abs().max() < 0.01, (counts, want)

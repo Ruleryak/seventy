@@ -242,3 +242,60 @@ def test_prompt_logprobs_rows_per_step_are_capped():
         run_step(s, plan)
         steps += 1
         assert steps < 20
+
+
+def test_request_last_token_and_token_range_match_tokens():
+    from seventy.engine.sampling import SamplingParams
+    from seventy.engine.scheduler import Request
+
+    r = Request("a", list(range(10)), SamplingParams(), 0.0)
+    assert r.last_token == 9
+    r.output = [100, 101, 102]
+    assert r.last_token == 102
+    for a in range(0, 14):
+        for b in range(a, 14):
+            assert r.token_range(a, b) == r.tokens[a:b]
+
+
+def test_request_blocks_epoch_changes_only_on_new_list():
+    from seventy.engine.sampling import SamplingParams
+    from seventy.engine.scheduler import Request
+
+    r = Request("a", [1, 2, 3], SamplingParams(), 0.0)
+    e = r.blocks_epoch
+    r.blocks += [5, 6]
+    r.blocks.append(7)
+    assert r.blocks_epoch == e
+    r.blocks = [9]
+    assert r.blocks_epoch == e + 1
+    r.blocks = list(r.blocks)
+    assert r.blocks_epoch == e + 2
+
+
+def test_spec_graph_table_updates_track_appends_and_replacements():
+    import types
+
+    import numpy as np
+
+    from seventy.engine.spec_graphs import SpecGraphs
+
+    g = SpecGraphs.__new__(SpecGraphs)
+    g.sent, g.slot_tables, g.slot_len = {}, {}, {}
+    g.cache = types.SimpleNamespace(scratch_block=0)
+    peer = SpecGraphs.__new__(SpecGraphs)
+    peer.sent, peer.slot_tables, peer.slot_len = {}, {}, {}
+    peer.cache = g.cache
+
+    seqs = {3: ("a", 1, list(range(10, 80))), 5: ("b", 1, list(range(200, 205)))}
+    for step in range(40):
+        if step == 17:
+            seqs[3] = ("c", 1, [7, 8, 9])
+        if step == 25:
+            seqs[5] = ("b", 2, [1, 2])
+        for slot, (rid, epoch, blocks) in seqs.items():
+            if step % 3 == 0:
+                blocks.append(1000 + step)
+        rows = [{"slot": s, "table": b, "table_key": (rid, ep)} for s, (rid, ep, b) in seqs.items()]
+        peer._apply_tables(g._table_updates(rows))
+        for s, (_, _, b) in seqs.items():
+            assert peer.slot_tables[s][: peer.slot_len[s]].tolist() == b

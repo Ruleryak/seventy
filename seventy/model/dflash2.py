@@ -378,6 +378,13 @@ class Drafter:
         cfg = self.cfg
         b, n, kk = ids.shape
         hid = self._mm(h, self.sel_hidden).view(b, n, -1)
+        if (ids.is_cuda and kk <= 32 and self.pred.dtype == torch.float16 and self.pred.shape[1] % 32 == 0
+                and self.pred.shape[1] <= 1024 and os.environ.get("SEVENTY_DRAFTER_WALK") != "torch"):
+            from ..ops import kernels
+
+            tokens, probs = kernels.drafter_walk(anchors.view(b), values, ids, hid, self.pred, self.succ, temps,
+                                                 gumbel)
+            return Draft(tokens=tokens, probs=probs, candidates=ids)
         prev = torch.cat((anchors.view(b, 1, 1).expand(b, 1, kk), ids[:, :-1]), dim=1)
         edges = values[:, :, None, :] + torch.einsum("blpr,blcr->blpc", self.pred[prev].float() * hid[:, :, None],
                                                       self.succ[ids].float())
