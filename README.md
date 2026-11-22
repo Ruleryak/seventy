@@ -3,7 +3,7 @@
 seventy is an inference engine for Qwen3.5-family models (Qwen3.5, Qwen3.6, Qwen3.8) on NVIDIA V100 GPUs.
 It serves an OpenAI-compatible API and has a control panel in the browser.
 
-**Status:** version 1.1.0. The tests ran on 4 Tesla V100-SXM2-32GB GPUs with NVLink. The installation and a short check also ran on 4 Tesla V100-PCIE-16GB GPUs without peer-to-peer access (Ubuntu 22.04).
+**Status:** version 1.1.1. The tests ran on 4 Tesla V100-SXM2-32GB GPUs with NVLink. The release notes give the other systems that the release was tested on.
 
 - The design and the plan for version 1 are in [docs/DESIGN.md](docs/DESIGN.md).
 - To build and test the code, see [docs/DEVELOPING.md](docs/DEVELOPING.md).
@@ -110,7 +110,7 @@ Run as your normal user:
 ```bash
 uv venv --python 3.12 ~/seventy-env &&
 uv pip install --python ~/seventy-env --torch-backend=cu129 \
-  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.0/seventy-1.1.0-py3-none-manylinux_2_28_x86_64.whl" &&
+  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.1/seventy-1.1.1-py3-none-manylinux_2_28_x86_64.whl" &&
 ~/seventy-env/bin/seventy info
 ```
 

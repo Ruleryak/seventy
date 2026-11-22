@@ -31,7 +31,7 @@ Create the environment and install the release:
 ```bash
 uv venv --python 3.12 ~/seventy-env &&
 uv pip install --python ~/seventy-env --torch-backend=cu129 \
-  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.0/seventy-1.1.0-py3-none-manylinux_2_28_x86_64.whl"
+  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.1/seventy-1.1.1-py3-none-manylinux_2_28_x86_64.whl"
 ```
 
 All examples use the executables inside `~/seventy-env`, so you do not need to activate the environment or change your system Python.
@@ -43,7 +43,7 @@ Use this instead of the uv installation method:
 ```bash
 python3.12 -m venv ~/seventy-env &&
 ~/seventy-env/bin/python -m pip install \
-  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.0/seventy-1.1.0-py3-none-manylinux_2_28_x86_64.whl" \
+  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.1/seventy-1.1.1-py3-none-manylinux_2_28_x86_64.whl" \
   --extra-index-url https://download.pytorch.org/whl/cu129
 ```
 
@@ -55,7 +55,7 @@ python3.12 -m venv ~/seventy-env &&
 
 This reports the GPUs, NVIDIA driver, and kernel library. Resolve any reported compatibility or loading errors before starting the engine.
 
-The commands above install version **1.1.0**, with the versions of PyTorch and the other libraries that were tested with it. Running the install command again does not select a newer seventy release; use the wheel URL from the release you want to install.
+The commands above install version **1.1.1**, with the versions of PyTorch and the other libraries that were tested with it. Running the install command again does not select a newer seventy release; use the wheel URL from the release you want to install.
 
 ## Start with the control panel
 

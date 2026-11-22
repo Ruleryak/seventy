@@ -68,7 +68,7 @@ The wheel and the tests must come from the same release.
    ```
    uv venv --python 3.12 ~/seventy-test-env &&
    uv pip install --python ~/seventy-test-env --torch-backend=cu129 \
-     "seventy[test,reference] @ https://github.com/Ruleryak/seventy/releases/download/v1.1.0/seventy-1.1.0-py3-none-manylinux_2_28_x86_64.whl"
+     "seventy[test,reference] @ https://github.com/Ruleryak/seventy/releases/download/v1.1.1/seventy-1.1.1-py3-none-manylinux_2_28_x86_64.whl"
    ```
 
    From a wheel file:
@@ -76,13 +76,13 @@ The wheel and the tests must come from the same release.
    ```
    uv venv --python 3.12 ~/seventy-test-env &&
    uv pip install --python ~/seventy-test-env --torch-backend=cu129 \
-     "seventy[test,reference] @ file:///path/to/seventy-1.1.0-py3-none-manylinux_2_28_x86_64.whl"
+     "seventy[test,reference] @ file:///path/to/seventy-1.1.1-py3-none-manylinux_2_28_x86_64.whl"
    ```
 
 2. Get the tests of the same release:
 
    ```
-   git clone --depth 1 --branch v1.1.0 https://github.com/Ruleryak/seventy.git seventy-src
+   git clone --depth 1 --branch v1.1.1 https://github.com/Ruleryak/seventy.git seventy-src
    ```
 
 3. Install `objdump` for the tests of the kernel library. It is in the binutils package. On Ubuntu or Debian:
