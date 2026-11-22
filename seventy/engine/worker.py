@@ -65,6 +65,7 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
     faulthandler.register(signal.SIGUSR1, all_threads=True)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     _watch_parent()
+    distributed.share_cpus(size)
     try:
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         device = torch.device(device_name)

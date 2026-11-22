@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 import socket
 
 import torch
@@ -45,6 +46,38 @@ def shutdown() -> None:
         if torch.cuda.is_available() and torch.cuda.is_initialized():
             torch.cuda.synchronize()
         dist.destroy_process_group()
+
+
+def usable_cpus(cgroup: str = "/sys/fs/cgroup") -> int:
+    """CPUs this process may run on: its affinity mask, or fewer under a CPU quota of its cgroup (v2 cpu.max, or v1
+    cpu.cfs_quota_us), as in a container."""
+    n = len(os.sched_getaffinity(0))
+    try:
+        with open(os.path.join(cgroup, "cpu.max")) as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            n = min(n, int(quota) // int(period))
+    except (OSError, ValueError):
+        try:
+            with open(os.path.join(cgroup, "cpu", "cpu.cfs_quota_us")) as f:
+                quota = int(f.read())
+            with open(os.path.join(cgroup, "cpu", "cpu.cfs_period_us")) as f:
+                period = int(f.read())
+            if quota > 0:
+                n = min(n, quota // period)
+        except (OSError, ValueError):
+            pass
+    return max(1, n)
+
+
+def share_cpus(size: int) -> None:
+    """Give each of the size engine processes an equal share of the usable CPUs for PyTorch's CPU threads (unless
+    OMP_NUM_THREADS is set). PyTorch's default counts the cores of the machine and ignores a CPU quota; the
+    tensor-parallel processes then run many more threads than CPUs, and on a busy host each multithreaded CPU
+    operation (weight conversions at load time) waits for its slowest thread. On a rented 4-GPU machine with 80
+    cores, a quota of 38 CPUs and other load, small CPU operations took minutes."""
+    if "OMP_NUM_THREADS" not in os.environ:
+        torch.set_num_threads(max(1, usable_cpus() // size))
 
 
 def peer_access(size: int) -> bool:

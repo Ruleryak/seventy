@@ -1,6 +1,7 @@
 """The checks of `seventy engine` before it downloads or loads a model: the GPUs (from NVML) and the split of the
-model over the GPUs; and the engine's own check of the GPUs."""
+model over the GPUs; the engine's own check of the GPUs; and the CPU threads of each engine process."""
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -77,3 +78,37 @@ def test_engine_stops_on_other_gpus(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
     with pytest.raises(RuntimeError, match=r"GPU 3 \(NVIDIA A100-SXM4-40GB\) has compute capability 8.0"):
         engine._check_gpus([0])
+
+
+def test_usable_cpus_follows_a_cgroup_quota(tmp_path):
+    from seventy.engine import distributed
+
+    cores = len(os.sched_getaffinity(0))
+    assert distributed.usable_cpus(str(tmp_path)) == cores
+    (tmp_path / "cpu.max").write_text("max 100000\n")
+    assert distributed.usable_cpus(str(tmp_path)) == cores
+    (tmp_path / "cpu.max").write_text("150000 100000\n")
+    assert distributed.usable_cpus(str(tmp_path)) == min(cores, 1)
+    (tmp_path / "cpu.max").unlink()
+    (tmp_path / "cpu").mkdir()
+    (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("200000\n")
+    (tmp_path / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
+    assert distributed.usable_cpus(str(tmp_path)) == min(cores, 2)
+    (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("-1\n")
+    assert distributed.usable_cpus(str(tmp_path)) == cores
+
+
+def test_share_cpus_splits_the_cpus_and_keeps_omp_num_threads(monkeypatch):
+    from seventy.engine import distributed
+
+    before = torch.get_num_threads()
+    try:
+        monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+        distributed.share_cpus(4)
+        assert torch.get_num_threads() == max(1, distributed.usable_cpus() // 4)
+        monkeypatch.setenv("OMP_NUM_THREADS", "3")
+        torch.set_num_threads(5)
+        distributed.share_cpus(4)
+        assert torch.get_num_threads() == 5
+    finally:
+        torch.set_num_threads(before)

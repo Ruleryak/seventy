@@ -104,6 +104,7 @@ class Engine:
         self.config = config
         faulthandler.register(signal.SIGUSR1, all_threads=True)
         tp = config.tensor_parallel
+        distributed.share_cpus(tp)
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         self.device = torch.device(config.device)
         if self.device.type == "cuda" and self.device.index is None:

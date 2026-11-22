@@ -12,6 +12,7 @@ def run_rank(rank, world, port, queue):
     from seventy.engine import distributed
     from seventy.engine.allreduce import CustomAllReduce
 
+    distributed.share_cpus(world)
     torch.cuda.set_device(rank)
     distributed.init(rank, world, port, "nccl")
     dev = torch.device("cuda", rank)

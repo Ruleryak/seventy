@@ -27,6 +27,7 @@ def run_rank(rank, size, port, path, peer, queue):
     from seventy.engine.worker import build_step, load_shard
     from seventy.parallel import Parallel
 
+    distributed.share_cpus(size)
     torch.cuda.set_device(rank)
     dev = torch.device("cuda", rank)
     if size > 1:
