@@ -167,11 +167,11 @@ def test_prep_multimodal_positions_match_reference():
 
 
 @pytest.mark.parametrize("split_context", [0, 4096, 1 << 30])
-@pytest.mark.parametrize("seqs, tokens", [(1, 8), (4, 8), (3, 5), (8, 2)])
+@pytest.mark.parametrize("seqs, tokens", [(1, 8), (4, 8), (3, 5), (8, 2), (1, 1), (8, 1)])
 def test_verify_attention_splitd_matches_verify_kernel(seqs, tokens, split_context, monkeypatch):
     """The hybrid verify path (split-D kernel from split_context cached keys, the verify kernel below; fixed grid,
     splits chosen per tile on the GPU) gives the verify kernel's output for short and long contexts in one batch,
-    also with NaN in the reused workspace memory."""
+    also with NaN in the reused workspace memory, and the decode kernel's output for one row per sequence."""
     import math
 
     monkeypatch.setattr(kernels, "VERIFY_SPLITD_CONTEXT", split_context)

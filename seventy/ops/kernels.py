@@ -534,7 +534,8 @@ def verify_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache: torch.Tensor, 
                      block_tables: torch.Tensor, query_start_t: torch.Tensor, context_lens_t: torch.Tensor,
                      tokens: int, scale: float, k_scale: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
     """Gated causal attention [T, hq * 256] over INT8 caches for steps with the same number of new tokens per
-    sequence, at most 48 rows per KV head (speculative verify): seventy_verify_attention_hybrid, which runs the
+    sequence, at most 48 rows per KV head (speculative verify, and decode steps of one token per sequence, where it
+    is 4 to 6 times faster than the decode kernel from 2K to 100K): seventy_verify_attention_hybrid, which runs the
     sequences with at least VERIFY_SPLITD_CONTEXT cached keys on the split-D kernel and the others on the verify
     kernel, with a fixed number of key splits (about one block per SM), so the launch suits CUDA graphs. The tiles
     of a shape are made once and kept (graphs hold their addresses). In the engine (TP4, 4 streams) the split-D
