@@ -1,4 +1,7 @@
-"""The control panel: metrics parsing, the planner, the supervisor (with a stand-in engine) and the HTTP API."""
+"""The control panel: metrics parsing, the planner, the supervisor (with a stand-in engine) and the HTTP API.
+
+The stand-in engines set Python's SIGINT handler themselves. A process that starts with SIGINT ignored (for
+example under a background job of a non-interactive shell) would otherwise not stop on the supervisor's SIGINT."""
 
 import json
 import os
@@ -119,7 +122,8 @@ def test_plan_counts_the_state_slots_the_engine_allocates(model_path):
 
 
 STUB = r'''
-import http.server, sys, time
+import http.server, signal, sys, time
+signal.signal(signal.SIGINT, signal.default_int_handler)
 port = int(sys.argv[sys.argv.index("--port") + 1])
 mode = open(sys.argv[-1]).read().strip() if len(sys.argv) > 1 else "serve"
 print("seventy-stage: weights loading stub", flush=True)
@@ -223,6 +227,7 @@ def test_panel_api(tmp_path, monkeypatch):
 
 TREE_STUB = r'''
 import http.server, signal, subprocess, sys, time
+signal.signal(signal.SIGINT, signal.default_int_handler)
 port = int(sys.argv[sys.argv.index("--port") + 1])
 worker = subprocess.Popen([sys.executable, "-c",
                            "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(600)"])

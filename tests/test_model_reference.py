@@ -1,11 +1,13 @@
 """The text model against the transformers implementation, both in FP32 on the CPU, with the first
-SEVENTY_TEST_LAYERS layers (default 4) of the real checkpoint. Needs the `reference` extra."""
+SEVENTY_TEST_LAYERS layers (default 4) of the real checkpoint. Needs the `reference` extra and about 50 GiB of free
+host memory (both models hold the FP32 embedding and output head); with less, the tests skip."""
 
 import os
 
 import pytest
 import torch
 
+from conftest import available_memory
 from seventy import nvfp4
 from seventy.checkpoint import Checkpoint
 from seventy.config import load_config
@@ -13,7 +15,15 @@ from seventy.engine.cache import ModelCache
 from seventy.engine.step import SequenceChunk, StepInput
 from seventy.model.qwen3_5 import Qwen35TextModel
 
-pytestmark = [pytest.mark.model, pytest.mark.slow]
+NEED_MEMORY = 50 << 30
+
+pytestmark = [
+    pytest.mark.model,
+    pytest.mark.slow,
+    pytest.mark.skipif(available_memory() < NEED_MEMORY,
+                       reason=f"needs about {NEED_MEMORY >> 30} GiB of free host memory "
+                              f"({available_memory() >> 30} GiB available)"),
+]
 
 LAYERS = int(os.environ.get("SEVENTY_TEST_LAYERS", "4"))
 PROMPT = [9707, 11, 1052, 374, 264, 1273, 315, 279, 5662, 13, 576, 3974, 13876, 38835, 34208, 916, 279,
