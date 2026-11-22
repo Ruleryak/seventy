@@ -10,6 +10,9 @@ from . import __version__
 
 
 def cmd_info(args: argparse.Namespace) -> int:
+    import os
+
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     import torch
 
     from .ops import _lib
@@ -27,7 +30,8 @@ def cmd_info(args: argparse.Namespace) -> int:
     else:
         for i in range(torch.cuda.device_count()):
             p = torch.cuda.get_device_properties(i)
-            print(f"GPU {i}: {p.name}, {p.total_memory / 2**30:.1f} GiB, sm{p.major}{p.minor}")
+            note = "" if (p.major, p.minor) == (7, 0) else " (not a V100: seventy does not run on this GPU)"
+            print(f"GPU {i}: {p.name}, {p.total_memory / 2**30:.1f} GiB, sm{p.major}{p.minor}{note}")
         n = torch.cuda.device_count()
         if n > 1:
             missing = [f"{a}-{b}" for a in range(n) for b in range(a + 1, n)

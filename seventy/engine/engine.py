@@ -69,6 +69,22 @@ def _stage(name: str, detail: str = "") -> None:
     print(f"seventy-stage: {name} {detail}".rstrip(), flush=True)
 
 
+def _gpu_label(index: int) -> str:
+    """The GPU id as the user gave it in --gpus (CUDA_VISIBLE_DEVICES), for the CUDA device index."""
+    ids = [s.strip() for s in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if s.strip()]
+    return ids[index] if index < len(ids) else str(index)
+
+
+def _check_gpus(devices: list[int]) -> None:
+    """Stop on GPUs other than the V100 (compute capability 7.0), as the control panel does: the kernel library
+    holds sm70 code only, and seventy is tested only on V100 GPUs."""
+    for i in devices:
+        p = torch.cuda.get_device_properties(i)
+        if (p.major, p.minor) != (7, 0):
+            raise RuntimeError(f"GPU {_gpu_label(i)} ({p.name}) has compute capability {p.major}.{p.minor}; seventy "
+                               f"runs only on V100 GPUs (compute capability 7.0)")
+
+
 def _check_weights_fit(config: EngineConfig, devices: list[int]) -> None:
     """Stop before loading when the checkpoint files divided over the GPUs are larger than the smallest GPU: the
     load would end in a CUDA out-of-memory error. The weights take about the size of the checkpoint files."""
@@ -95,10 +111,12 @@ class Engine:
         path = Path(config.model)
         self.model_config = load_config(path)
         if self.device.type == "cuda":
-            _check_weights_fit(config, [self.device.index] if tp == 1 else list(range(tp)))
+            devices = [self.device.index] if tp == 1 else list(range(tp))
+            _check_gpus(devices)
+            _check_weights_fit(config, devices)
         if self.device.type == "cuda" and tp > 1 and not distributed.peer_access(tp):
-            print("seventy: the GPUs have no peer-to-peer access (no NVLink and no PCIe P2P); every all-reduce uses "
-                  "NCCL, which is slower", flush=True)
+            print("seventy: not every pair of these GPUs has peer-to-peer access (NVLink or PCIe P2P); every "
+                  "all-reduce uses NCCL, which is slower", flush=True)
         torch.cuda.set_device(self.device)
         reserve = int(config.activation_reserve_gib * 2**30)
         kv_dtype = torch.int8 if config.kv_dtype == "int8" else torch.float16
