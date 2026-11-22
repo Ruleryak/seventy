@@ -14,9 +14,13 @@ are matched on key_tokens, where image tokens stand for the image's content (sev
 
 Prompt snapshots: for prompts of SNAPSHOT_MIN tokens or more, prefill stops one token before the end of the prompt;
 the state at that point becomes an entry too, so the same prompt sent again computes only its last token (and a
-request that diverges inside its output still reuses its prompt). Eviction takes final entries that a newer entry
-extends (a conversation's earlier turns) first, then the least recently used. A snapshot is never superseded: only it
-serves the same prompt sent again.
+request that diverges inside its output still reuses its prompt).
+
+Eviction takes spare entries first, then the least recently used. An entry is spare when a newer entry extends it (a
+conversation's earlier turn; a snapshot only when a newer snapshot extends it: a final entry never supersedes the
+snapshot of its own prompt, which the next turn needs when it diverges inside the output), or when it diverged: a
+request matched a shorter entry with the same tokens at the start and went on differently (agent clients send the
+next turn without the model's earlier thinking, so the final entries of their turns never match again).
 """
 
 from __future__ import annotations
@@ -181,10 +185,11 @@ class CacheEntry:
     used: int
     snapshot: bool = False
     superseded: bool = False
+    diverged: bool = False
 
     @property
     def spare(self) -> bool:
-        return self.superseded
+        return self.superseded or self.diverged
 
 
 class PrefixCache:
@@ -207,6 +212,10 @@ class PrefixCache:
                 best = e
         if best is not None:
             best.used = next(self.clock)
+            n = len(best.tokens)
+            for e in self.entries:
+                if len(e.tokens) > n and not e.diverged and e.tokens[:n] == best.tokens:
+                    e.diverged = True
         return best
 
     def find(self, tokens: list[int]) -> CacheEntry | None:
@@ -228,7 +237,7 @@ class PrefixCache:
                 self.slots.give(slot)
                 return
         for e in self.entries:
-            if not e.snapshot and len(e.tokens) < n and tokens[: len(e.tokens)] == e.tokens:
+            if (not e.snapshot or snapshot) and len(e.tokens) < n and tokens[: len(e.tokens)] == e.tokens:
                 e.superseded = True
         while len(self.entries) >= self.max_entries:
             self.evict()

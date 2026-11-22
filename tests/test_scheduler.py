@@ -299,3 +299,44 @@ def test_spec_graph_table_updates_track_appends_and_replacements():
         peer._apply_tables(g._table_updates(rows))
         for s, (_, _, b) in seqs.items():
             assert peer.slot_tables[s][: peer.slot_len[s]].tolist() == b
+
+
+
+def test_agent_turns_that_diverge_inside_the_output_keep_their_prompt_snapshots():
+    """Agent clients send the next turn without the model's earlier thinking: it continues the previous prompt and
+    diverges inside the previous output, so only the prompt snapshot matches. Eight conversations run at once with
+    outputs of different lengths (fast conversations add entries while a slow one runs); every next turn must still
+    find its previous prompt with the default three entries per stream."""
+    import random
+
+    for seed in range(3):
+        rnd = random.Random(seed)
+        s = Scheduler(num_blocks=60000, block_size=16, num_slots=8 + 24 + 1, max_model_len=65536, prefill_budget=8192,
+                      max_running=8, cache_entries=24)
+        prompts = {c: list(range(100_000 * (c + 1), 100_000 * (c + 1) + 700)) for c in range(8)}
+        turn, active, previous, checked, misses = dict.fromkeys(range(8), 0), {}, {}, set(), 0
+
+        def new_turn(c):
+            p = prompts[c] + ([50_000 + 100 * c + turn[c]] * 40 if turn[c] else [])
+            r = Request(f"{c}-{turn[c]}", p, SamplingParams(max_tokens=rnd.choice([3, 5, 40, 120])))
+            s.add(r)
+            active[c], previous[c], prompts[c] = r, len(prompts[c]), p
+
+        for c in range(8):
+            new_turn(c)
+        while active:
+            plan = s.schedule()
+            for w in plan.prefill:
+                c = int(w.request.id.split("-")[0])
+                if w.request.id not in checked:
+                    checked.add(w.request.id)
+                    misses += turn[c] > 0 and w.start < previous[c] - 1
+            run_step(s, plan)
+            for c, r in list(active.items()):
+                if r.status is Status.FINISHED:
+                    turn[c] += 1
+                    if turn[c] < 6:
+                        new_turn(c)
+                    else:
+                        del active[c]
+        assert misses == 0, (seed, misses)
