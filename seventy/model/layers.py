@@ -30,6 +30,7 @@ class Linear:
     cols restricts W to an input column range (the shard of a row-parallel layer). NVFP4 weights stay packed;
     on the GPU, batches of up to SMALL_BATCH rows use the fused NVFP4 GEMM kernel, and larger batches (prefill)
     dequantize the weight to FP16 and use cuBLAS. On the CPU (reference runs) the weight is dequantized at each call.
+    quantize rounds dense modules to NVFP4 on the GPU (lossy: for drafters), one global scale per source row range.
     """
 
     def __init__(
@@ -40,6 +41,7 @@ class Linear:
         device: torch.device | str,
         cols: tuple[int, int] | None = None,
         keep_dense: bool = False,
+        quantize: bool = False,
     ):
         self.dtype = dtype
         self.parts: list[Nvfp4Weight] = []
@@ -56,7 +58,10 @@ class Linear:
                     self.parts.append(ckpt.nvfp4_part(s.module, rows=r, cols=cols).to(device))
                 else:
                     pieces.append(ckpt.dense_part(f"{s.module}.weight", rows=r, cols=cols))
-        if pieces:
+        if pieces and quantize and torch.device(device).type == "cuda" and dtype == torch.float16 \
+                and pieces[0].shape[1] % 64 == 0:
+            self.gemm = nvfp4.pack_for_gemm([nvfp4.quantize(to_device(_to_dtype(p, dtype), device)) for p in pieces])
+        elif pieces:
             self.dense = to_device(_to_dtype(torch.cat(pieces), dtype), device)
         elif keep_dense:
             self.dense = self._dequantize()

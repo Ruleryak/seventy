@@ -24,12 +24,16 @@ class ModelCache:
         device: torch.device | str,
         par: Parallel = SINGLE,
         kv_dtype: torch.dtype | None = None,
+        extra_attention_layers: tuple[int, ...] = (),
     ):
         """kv_dtype: the attention KV cache format, torch.int8 (with per-token, per-head FP32 scales) or the activation
         dtype. Default: int8 on CUDA, the activation dtype elsewhere.
 
         One extra block (index num_blocks) and one extra state slot (index num_slots) take the writes of padding
-        rows in CUDA-graph steps."""
+        rows in CUDA-graph steps.
+
+        extra_attention_layers: layer indices past the model's layers with a KV cache of their own (the MTP
+        drafter's attention layer), in the same blocks as the model's attention layers."""
         device = torch.device(device)
         self.block_size = block_size
         self.num_blocks = num_blocks
@@ -41,7 +45,8 @@ class ModelCache:
         hk = cfg.gdn_k_heads // par.size
         hv = cfg.gdn_v_heads // par.size
         conv_dim = 2 * hk * cfg.gdn_k_dim + hv * cfg.gdn_v_dim
-        na, nl = len(cfg.attention_layers), len(cfg.linear_layers)
+        attn = tuple(cfg.attention_layers) + tuple(extra_attention_layers)
+        na, nl = len(attn), len(cfg.linear_layers)
         kv_shape = (na, num_blocks + 1, block_size, kv_heads, cfg.head_dim)
         self.k_all = torch.zeros(kv_shape, dtype=self.kv_dtype, device=device)
         self.v_all = torch.zeros(kv_shape, dtype=self.kv_dtype, device=device)
@@ -52,13 +57,13 @@ class ModelCache:
         self.conv_all = torch.zeros(nl, num_slots + 1, conv_dim, cfg.conv_kernel - 1, dtype=dtype, device=device)
         self.state_all = torch.zeros(nl, num_slots + 1, hv, cfg.gdn_k_dim, cfg.gdn_v_dim, dtype=torch.float32,
                                      device=device)
-        self.k = {layer: self.k_all[i] for i, layer in enumerate(cfg.attention_layers)}
-        self.v = {layer: self.v_all[i] for i, layer in enumerate(cfg.attention_layers)}
+        self.k = {layer: self.k_all[i] for i, layer in enumerate(attn)}
+        self.v = {layer: self.v_all[i] for i, layer in enumerate(attn)}
         self.k_scale: dict[int, torch.Tensor] = {}
         self.v_scale: dict[int, torch.Tensor] = {}
         if self.k_scale_all is not None:
-            self.k_scale = {layer: self.k_scale_all[i] for i, layer in enumerate(cfg.attention_layers)}
-            self.v_scale = {layer: self.v_scale_all[i] for i, layer in enumerate(cfg.attention_layers)}
+            self.k_scale = {layer: self.k_scale_all[i] for i, layer in enumerate(attn)}
+            self.v_scale = {layer: self.v_scale_all[i] for i, layer in enumerate(attn)}
         self.conv = {layer: self.conv_all[i] for i, layer in enumerate(cfg.linear_layers)}
         self.state = {layer: self.state_all[i] for i, layer in enumerate(cfg.linear_layers)}
         self.slot_peers: list = []

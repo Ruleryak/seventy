@@ -26,6 +26,7 @@ from ..parallel import SINGLE, Parallel
 from ..upload import to_device
 
 RECURRENT_MAX_TOKENS = 32
+FINAL = -1
 GDN_COMMIT_LAYERS = os.environ.get("SEVENTY_GDN_COMMIT", "layers") != "loop"
 from .layers import Linear, Source, _to_dtype
 
@@ -35,7 +36,8 @@ def _norm_weight(ckpt: Checkpoint, name: str, device, offset: float) -> torch.Te
 
 
 class AttentionLayer:
-    def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense):
+    def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense,
+                 quantize: bool = False):
         d = cfg.head_dim
         h0, h1 = par.span(cfg.num_heads)
         k0, k1 = par.span(cfg.num_kv_heads)
@@ -47,10 +49,10 @@ class AttentionLayer:
                 Source(f"{p}.k_proj", ((d * k0, d * k1),)),
                 Source(f"{p}.v_proj", ((d * k0, d * k1),)),
             ],
-            dtype, device, keep_dense=keep_dense,
+            dtype, device, keep_dense=keep_dense, quantize=quantize,
         )
         self.o_proj = Linear(ckpt, [Source(f"{p}.o_proj")], dtype, device, cols=(d * h0, d * h1),
-                             keep_dense=keep_dense)
+                             keep_dense=keep_dense, quantize=quantize)
         self.q_norm = _norm_weight(ckpt, f"{p}.q_norm.weight", device, 1.0)
         self.k_norm = _norm_weight(ckpt, f"{p}.k_norm.weight", device, 1.0)
         self.eps = cfg.rms_norm_eps
@@ -171,11 +173,13 @@ class GatedDeltaNetLayer:
 
 
 class MLP:
-    def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense):
+    def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense,
+                 quantize: bool = False):
         i0, i1 = par.span(cfg.intermediate_size)
         self.gate_up = Linear(ckpt, [Source(f"{p}.gate_proj", ((i0, i1),)), Source(f"{p}.up_proj", ((i0, i1),))],
-                              dtype, device, keep_dense=keep_dense)
-        self.down = Linear(ckpt, [Source(f"{p}.down_proj")], dtype, device, cols=(i0, i1), keep_dense=keep_dense)
+                              dtype, device, keep_dense=keep_dense, quantize=quantize)
+        self.down = Linear(ckpt, [Source(f"{p}.down_proj")], dtype, device, cols=(i0, i1), keep_dense=keep_dense,
+                           quantize=quantize)
         self.par = par
 
     def __call__(self, x):
@@ -253,13 +257,20 @@ class Qwen35TextModel:
         rows = self.embed[(ids - v0).clamp(0, v1 - v0 - 1)] * inside[:, None].to(self.dtype)
         return self.par.all_reduce(rows)
 
-    def head(self, x: torch.Tensor) -> torch.Tensor:
-        """This rank's FP32 logits [rows, vocab shard] of hidden states x."""
+    def head(self, x: torch.Tensor, weight=None) -> torch.Tensor:
+        """This rank's FP32 logits [rows, vocab shard] of hidden states x (weight: another copy of the LM head shard,
+        a DenseWeight, DenseWeightFP8 or NVFP4 GemmWeight, such as the MTP drafter's NVFP4 copy)."""
         from ..ops.kernels import dense_gemm
 
+        from ..nvfp4 import GemmWeight
+
+        w = self.lm_head_packed if weight is None else weight
         x = x.contiguous()
-        return torch.cat([dense_gemm(x[i : i + 64], self.lm_head_packed) for i in range(0, x.shape[0], 64)]) \
-            if x.shape[0] else torch.empty(0, self.lm_head_packed.n, dtype=torch.float32, device=x.device)
+        if not x.shape[0]:
+            return torch.empty(0, w.n, dtype=torch.float32, device=x.device)
+        if isinstance(w, GemmWeight):
+            return torch.cat([kernels.nvfp4_gemm(x[i : i + 64], w).float() for i in range(0, x.shape[0], 64)])
+        return torch.cat([dense_gemm(x[i : i + 64], w) for i in range(0, x.shape[0], 64)])
 
     def local_logits(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's FP32 logits [rows, vocab shard] of final hidden states (FP16 products, FP32 accumulation)."""
@@ -280,10 +291,10 @@ class Qwen35TextModel:
         torch.distributed.all_gather(parts, out)
         return torch.cat(parts, dim=-1)
 
-    def head_top(self, x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def head_top(self, x: torch.Tensor, k: int, weight=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(argmax, top k logits, their token ids) of final hidden states x, from each rank's vocabulary shard: only
-        the shards' top k values and ids (one all-gather) cross the ranks, not the full logits."""
-        local = self.local_logits(x)
+        the shards' top k values and ids (one all-gather) cross the ranks, not the full logits. weight: as head."""
+        local = self.local_logits(x) if weight is None else self.head(x, weight)
         kk = min(k, local.shape[-1])
         if not local.is_cuda or kk > 64:
             v, i = torch.topk(local, kk, dim=-1)
@@ -310,7 +321,8 @@ class Qwen35TextModel:
         top: int = 0,
     ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
         """Run one step. Returns the logits of step.logit_rows (or, with top, head_top of those rows), and the
-        output hidden states (all rows) of the layers listed in capture.
+        output hidden states (all rows) of the layers listed in capture; FINAL in capture adds the final-normed
+        hidden states of all rows (the LM head's input) as captured[FINAL].
 
         With stash (a dict, speculative verify): Gated DeltaNet layers leave their state unchanged and keep their
         in_proj outputs in stash; commit() then writes the state for the accepted rows."""
@@ -340,6 +352,8 @@ class Qwen35TextModel:
             x, residual = self.par.reduce_norm(x, nxt, t.rms_norm_eps, residual, full_residual=i in capture)
             if i in capture:
                 captured[i] = residual.clone()
+        if FINAL in capture:
+            captured[FINAL] = x
         if top:
             return self.head_top(x[step.logit_rows], top), captured
         return self.logits(x[step.logit_rows]), captured

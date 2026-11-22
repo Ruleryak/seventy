@@ -112,7 +112,8 @@ def cmd_engine(args: argparse.Namespace) -> int:
         return 1
     try:
         model = resolve(args.model)
-        draft_model = resolve(args.draft_model, "drafter") if args.draft_model else None
+        draft_model = (resolve(args.draft_model, "drafter") if args.draft_model and args.draft_model != "mtp"
+                       else args.draft_model)
     except ModelNotFound as e:
         print(f"seventy: {e}", file=sys.stderr)
         return 1
@@ -121,7 +122,14 @@ def cmd_engine(args: argparse.Namespace) -> int:
     except UnsupportedModel as e:
         print("seventy cannot serve this model:\n" + "\n".join(f"  - {r}" for r in e.reasons))
         return 1
-    problems = memory.split_problems(cfg, tp, memory.DrafterShape.from_checkpoint(draft_model) if draft_model else None)
+    if draft_model == "mtp":
+        from .model.mtp import has_mtp
+
+        if not has_mtp(model):
+            print("seventy: --draft-model mtp needs a checkpoint with an MTP layer (mtp.* tensors)", file=sys.stderr)
+            return 1
+    shape = memory.DrafterShape.from_checkpoint(draft_model) if draft_model and draft_model != "mtp" else None
+    problems = memory.split_problems(cfg, tp, shape)
     if problems:
         print(f"seventy cannot split the model over {tp} GPUs:\n" + "\n".join(f"  - {p}" for p in problems),
               file=sys.stderr)
@@ -131,7 +139,8 @@ def cmd_engine(args: argparse.Namespace) -> int:
         max_model_len=min(args.max_model_len or cfg.text.max_position_embeddings, cfg.text.max_position_embeddings),
         gpu_memory_utilization=args.gpu_memory_utilization, prefill_budget=args.prefill_budget,
         kv_dtype=args.kv_cache_dtype, tensor_parallel=tp, cuda_graphs=not args.no_cuda_graphs,
-        draft_model=draft_model, prefix_cache=not args.no_prefix_cache, cache_entries=args.cache_entries,
+        draft_model=draft_model, mtp_tokens=args.mtp_tokens, prefix_cache=not args.no_prefix_cache,
+        cache_entries=args.cache_entries,
     )
     server = ServerConfig(
         engine=engine, served_model_name=args.served_model_name or served_name(args.model, model),
@@ -164,7 +173,9 @@ def main(argv: list[str] | None = None) -> int:
     eng = sub.add_parser("engine", help="serve a model with an OpenAI-compatible API")
     eng.add_argument("--model", required=True,
                      help="checkpoint folder, or a Hugging Face model ID (downloaded into the Hugging Face cache)")
-    eng.add_argument("--draft-model", help="DFlash2 drafter for speculative decoding: a folder or a model ID")
+    eng.add_argument("--draft-model", help="drafter for speculative decoding: a DFlash2 folder or model ID, or mtp "
+                     "(the model's own MTP layer)")
+    eng.add_argument("--mtp-tokens", type=int, default=4, help="tokens that the MTP drafter drafts per step")
     eng.add_argument("--served-model-name", help="the model name in the API (default: the name part of the model ID, "
                      "or the folder name)")
     eng.add_argument("--host", default="127.0.0.1")

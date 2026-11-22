@@ -415,6 +415,12 @@ def create_app(config: ServerConfig) -> FastAPI:
         m("spec_verify_steps_total", "counter", s.get("verify_steps", 0), "Speculative verify rows (one per sequence).")
         m("spec_draft_tokens_total", "counter", s.get("drafted_tokens", 0), "Draft tokens proposed.")
         m("spec_accepted_tokens_total", "counter", s.get("accepted_tokens", 0), "Draft tokens accepted.")
+        at = s.get("accepted_at") or []
+        if at:
+            lines.extend(["# HELP seventy:spec_accepted_tokens_per_pos_total Verify rows that accepted the draft at "
+                          "each position (0 is the first draft).",
+                          "# TYPE seventy:spec_accepted_tokens_per_pos_total counter"]
+                         + [f'seventy:spec_accepted_tokens_per_pos_total{{position="{j}"}} {v}' for j, v in enumerate(at)])
         m("vision_encodes_total", "counter", s.get("images", 0), "Images and video frame pairs encoded.")
         m("uptime_seconds", "gauge", round(s.get("uptime_s", 0.0), 1), "Seconds since the engine started.")
         lines.extend(client.ttft.lines("seventy:time_to_first_token_seconds",

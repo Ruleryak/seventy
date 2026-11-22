@@ -42,6 +42,7 @@ class EngineConfig:
     prefix_cache: bool = True
     cache_entries: int = 0
     draft_model: str | None = None
+    mtp_tokens: int = 4
 
 
 @dataclass
@@ -85,21 +86,39 @@ def _check_gpus(devices: list[int]) -> None:
                                f"runs only on V100 GPUs (compute capability 7.0)")
 
 
+def make_drafter(spec: str, model_path: str, model, device, dtype, par):
+    """The drafter of a draft spec: "mtp:K" (the model's own MTP layer, K tokens) or a DFlash2 checkpoint folder."""
+    if spec.startswith("mtp:"):
+        from ..model.mtp import MtpDrafter
+
+        return MtpDrafter(model_path, model, device, dtype, par=par, tokens=int(spec[4:]))
+    from ..model.dflash2 import Drafter
+
+    return Drafter(spec, model, device, dtype, par=par)
+
+
 def _check_weights_fit(config: EngineConfig, devices: list[int]) -> None:
     """Stop before loading when the checkpoint files divided over the GPUs are larger than the smallest GPU: the
     load would end in a CUDA out-of-memory error. The weights take about the size of the checkpoint files."""
     need = memory.checkpoint_bytes(config.model)
-    if config.draft_model:
+    if config.draft_model and config.draft_model != "mtp":
         need += memory.checkpoint_bytes(config.draft_model)
     per_gpu = need // len(devices)
     total = min(torch.cuda.get_device_properties(i).total_memory for i in devices)
     if per_gpu > total:
-        what = "the model and the drafter need" if config.draft_model else "the model needs"
+        what = "the model and the drafter need" if config.draft_model and config.draft_model != "mtp" else "the model needs"
         raise RuntimeError(f"{what} about {per_gpu / 2**30:.1f} GiB per GPU on {len(devices)} GPU(s), but the "
                            f"smallest GPU has {total / 2**30:.1f} GiB; use more GPUs (--gpus)")
 
 
 class Engine:
+    @staticmethod
+    def _draft_spec(config: EngineConfig) -> str | None:
+        """What the ranks build the drafter from: "mtp:K" for the model's MTP layer, else the drafter folder."""
+        if config.draft_model == "mtp":
+            return f"mtp:{config.mtp_tokens}"
+        return config.draft_model
+
     def __init__(self, config: EngineConfig):
         self.config = config
         faulthandler.register(signal.SIGUSR1, all_threads=True)
@@ -131,7 +150,7 @@ class Engine:
                 parent, child = ctx.Pipe()
                 p = ctx.Process(target=_worker_entry, daemon=True,
                                 args=(rank, tp, port, "nccl", f"cuda:{rank}", str(path), "float16",
-                                      config.gpu_memory_utilization, reserve, child, None, config.draft_model))
+                                      config.gpu_memory_utilization, reserve, child, None, self._draft_spec(config)))
                 p.start()
                 child.close()
                 self.workers.append(p)
@@ -145,10 +164,10 @@ class Engine:
         weights = torch.cuda.memory_allocated(self.device)
         self.drafter = None
         if config.draft_model:
-            from ..model.dflash2 import Drafter
-
-            _stage("drafter", f"loading {display_name(config.draft_model)}")
-            self.drafter = Drafter(config.draft_model, self.model, self.device, torch.float16, par=self.model.par)
+            _stage("drafter", "loading the MTP layer" if config.draft_model == "mtp"
+                   else f"loading {display_name(config.draft_model)}")
+            self.drafter = make_drafter(self._draft_spec(config), str(path), self.model, self.device, torch.float16,
+                                        self.model.par)
         torch.cuda.synchronize()
         drafter_bytes = torch.cuda.memory_allocated(self.device) - weights
         upload.release()
@@ -160,7 +179,8 @@ class Engine:
         entries = memory.prefix_entries(config.max_num_seqs, config.prefix_cache, config.cache_entries)
         total_slots = slots + entries
         kv_name = "int8" if kv_dtype == torch.int8 else "fp16"
-        per_block = memory.kv_bytes_per_block(self.model_config, config.block_size, kv_name, tp)
+        mtp = config.draft_model == "mtp"
+        per_block = memory.kv_bytes_per_block(self.model_config, config.block_size, kv_name, tp, extra_layers=int(mtp))
         ring = self.drafter.ring_bytes_per_slot() if self.drafter is not None else 0
         state = (total_slots + 1) * (memory.state_bytes_per_slot(self.model_config, tp) + ring)
         num_blocks = (budget_min - state) // per_block
@@ -172,7 +192,8 @@ class Engine:
         for conn in peers:
             conn.send(("init", num_blocks, config.block_size, total_slots, "int8" if kv_dtype == torch.int8 else "float16"))
         self.cache = ModelCache(self.model_config.text, num_blocks, config.block_size, total_slots, torch.float16,
-                                self.device, par=Parallel(0, tp), kv_dtype=kv_dtype)
+                                self.device, par=Parallel(0, tp), kv_dtype=kv_dtype,
+                                extra_attention_layers=(self.model_config.text.num_layers,) if mtp else ())
         if self.drafter is not None:
             self.drafter.allocate(total_slots)
             self.cache.slot_peers.append(self.drafter)
@@ -189,7 +210,8 @@ class Engine:
             buckets = tuple(b for b in BUCKETS if b <= limit)
             if limit not in buckets:
                 buckets += (limit,)
-            self.runner.capture_spec(need, buckets)
+            margin = self.drafter.table_margin(config.block_size) if self.runner.mtp else 0
+            self.runner.capture_spec(need + margin, buckets)
         if config.cuda_graphs and self.drafter is None:
             from .graphs import BUCKETS
 
@@ -213,7 +235,7 @@ class Engine:
         self.requests: dict[str, Request] = {}
         self.stats = {"steps": 0, "prompt_tokens": 0, "generated_tokens": 0, "preemptions": 0, "cache_hits": 0,
                       "cache_hit_tokens": 0, "verify_steps": 0, "drafted_tokens": 0, "accepted_tokens": 0,
-                      "images": 0}
+                      "images": 0, "accepted_at": [0] * (self.drafter.cfg.block - 1 if self.drafter else 0)}
 
     def _watch_workers(self) -> None:
         """A dead tensor-parallel worker leaves rank 0 waiting in a collective forever: end the process instead,
@@ -358,8 +380,7 @@ class Engine:
             for w in plan.prefill:
                 self._release_images(w.request)
             if self.drafter is not None:
-                self._draft([w.request for w in plan.prefill
-                             if w.request.status is Status.RUNNING and w.request.computed == w.request.length - 1])
+                self._draft_after_prefill(plan.prefill)
         self.stats["steps"] += 1
         self.stats["cache_hits"] = self.scheduler.cache.hits
         self.stats["cache_hit_tokens"] = self.scheduler.cache.hit_tokens
@@ -377,8 +398,45 @@ class Engine:
             result.append(out)
         return result
 
+    def _draft_after_prefill(self, work: list[Work]) -> None:
+        """First drafts of the sequences whose prompt this prefill step finished."""
+        done = lambda w: w.request.status is Status.RUNNING and w.request.computed == w.request.length - 1
+        if not self.runner.mtp:
+            self._draft([w.request for w in work if done(w)])
+            return
+        rows, picked, row = [], [], 0
+        for w in work:
+            if done(w):
+                rows.append(row + w.count - 1)
+                picked.append(w)
+            row += w.count
+        if not picked:
+            return
+        rs = [w.request for w in picked]
+        d = self.runner.mtp_first(rows, [r.last_token for r in rs], [w.start + w.count - 1 for w in picked],
+                                  [r.blocks for r in rs], [r.rope_delta for r in rs], [r.slot for r in rs])
+        self._keep_drafts(rs, d)
+
+    def _keep_drafts(self, requests: list[Request], d) -> None:
+        tokens = d.tokens.tolist()
+        probs, cands = d.probs.cpu(), d.candidates.cpu()
+        for i, r in enumerate(requests):
+            r.draft, r.draft_q, r.draft_cand = tokens[i], probs[i], cands[i]
+        self.stats["drafted_tokens"] += sum(len(t) for t in tokens)
+
     def _prefill_context(self, work: list[Work]) -> None:
-        """Drafter context for the prefill rows within the drafter's window of the sequence end."""
+        """Drafter context for the prefill rows within the drafter's window of the sequence end. With the MTP
+        drafter: its keys and values of every prefill row (the token after each row; the last prompt row waits for
+        the first draft)."""
+        if self.runner.mtp:
+            tokens = []
+            for w in work:
+                r = w.request
+                stop = min(w.start + w.count + 1, r.length)
+                nxt = r.token_range(w.start + 1, stop) if stop > w.start + 1 else []
+                tokens += list(nxt) + [0] * (w.count - len(nxt))
+            self.runner.mtp_prefill(tokens)
+            return
         window = self.drafter.cfg.window
         rows, positions, slots, row = [], [], [], 0
         for w in work:
@@ -402,6 +460,13 @@ class Engine:
         for i, r in enumerate(requests):
             r.draft, r.draft_q, r.draft_cand = tokens[i], probs[i], cands[i]
         self.stats["drafted_tokens"] += sum(len(t) for t in tokens)
+
+    def _count_accepted(self, n: int) -> None:
+        """Count n accepted drafts of one verify row, in total and at each draft position (0 .. n - 1)."""
+        self.stats["accepted_tokens"] += n
+        at = self.stats["accepted_at"]
+        for j in range(min(n, len(at))):
+            at[j] += 1
 
     def _stops(self, r: Request) -> tuple[list[int], int]:
         """A request's stop tokens and the most tokens it may still emit."""
@@ -448,7 +513,7 @@ class Engine:
             self.stats["verify_steps"] += len(work)
             for i, w in enumerate(work):
                 r, n = w.request, ns[i]
-                self.stats["accepted_tokens"] += n
+                self._count_accepted(n)
                 r.computed = w.start + n + 1
                 r.draft, r.draft_q, r.draft_cand = drafts[i], probs[i], cands[i]
                 o = outputs.setdefault(r.id, RequestOutput(r.id, [], False, None))
@@ -487,10 +552,11 @@ class Engine:
             row += n_rows
         self.runner.accept(lens, rows, positions, slots)
         self.stats["verify_steps"] += len(work)
+        mtp_drafts = self._mtp_after_verify(results) if self.runner.mtp else None
         survivors = []
         for w, n, new, L in results:
             r = w.request
-            self.stats["accepted_tokens"] += n
+            self._count_accepted(n)
             r.computed = w.start + n + 1
             r.draft, r.draft_q, r.draft_cand = [], None, None
             out = outputs.setdefault(r.id, RequestOutput(r.id, [], False, None))
@@ -513,7 +579,31 @@ class Engine:
                 self.scheduler.finish(r, reason)
             else:
                 survivors.append(r)
-        self._draft(survivors)
+        if mtp_drafts is None:
+            self._draft(survivors)
+            return
+        keep = {r.id for r in survivors}
+        tokens = mtp_drafts.tokens.tolist()
+        probs, cands = mtp_drafts.probs.cpu(), mtp_drafts.candidates.cpu()
+        for i, (w, _, _, _) in enumerate(results):
+            r = w.request
+            if r.id in keep:
+                r.draft, r.draft_q, r.draft_cand = tokens[i], probs[i], cands[i]
+                self.stats["drafted_tokens"] += len(tokens[i])
+
+    def _mtp_after_verify(self, results):
+        """MTP drafts after a verify step outside the CUDA graphs, for every sequence of the step (results: work,
+        accepted drafts, new tokens, logits)."""
+        row_tokens, last_rows, positions, row = [], [], [], 0
+        for w, n, new, L in results:
+            rows = L.shape[0]
+            row_tokens += [new[i] if i < len(new) else 0 for i in range(rows)]
+            last_rows.append(row + n)
+            positions.append(w.start + n + 1)
+            row += rows
+        rs = [w.request for w, _, _, _ in results]
+        return self.runner.mtp_verify(row_tokens, last_rows, positions, [r.blocks for r in rs],
+                                      [r.rope_delta for r in rs], [r.slot for r in rs])
 
     def close(self) -> None:
         """Stop the workers. Every rank tears its process group down at the same time (NCCL needs that)."""

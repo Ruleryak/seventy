@@ -87,22 +87,34 @@ def pack(values: torch.Tensor) -> torch.Tensor:
     return codes[:, 0::2] | (codes[:, 1::2] << 4)
 
 
-def quantize(weight: torch.Tensor) -> Nvfp4Weight:
-    """Round a dense FP32 weight to NVFP4 (round to nearest). Used to make test data."""
+def quantize(weight: torch.Tensor, global_scale: float | None = None, rows: int = 1024) -> Nvfp4Weight:
+    """Round a dense weight [n, k] to NVFP4 (round to nearest) on its device, rows at a time. global_scale defaults
+    to 448 * 6 / max |weight|. Used to make test data and the drafters' NVFP4 copies of dense weights (lossy). The
+    divisors are tensors on the weight's device: CUDA divides by a host number through its reciprocal, which rounds
+    differently, and block scales exactly between two E4M3 values then round the other way than on the CPU."""
     n, k = weight.shape
     if k % GROUP:
         raise ValueError(f"k = {k} is not a multiple of {GROUP}")
-    w = weight.float().view(n, k // GROUP, GROUP)
-    amax = w.abs().amax()
-    global_scale = float(448.0 * 6.0 / amax) if amax > 0 else 1.0
-    block = (w.abs().amax(-1) / 6.0 * global_scale).clamp(max=448.0)
-    scales = block.to(torch.float8_e4m3fn)
-    eff = scales.float() / global_scale
-    scaled = torch.where(eff.unsqueeze(-1) > 0, w / eff.unsqueeze(-1).clamp(min=1e-30), torch.zeros_like(w))
-    mags = torch.tensor(E2M1_VALUES[:8], dtype=torch.float32)
-    nearest = (scaled.abs().unsqueeze(-1) - mags).abs().argmin(-1)
-    q = mags[nearest] * torch.where(scaled < 0, -1.0, 1.0)
-    return Nvfp4Weight(pack(q.view(n, k)), scales.view(torch.uint8).contiguous(), global_scale)
+    if global_scale is None:
+        amax = max((weight[s : s + rows].float().abs().amax().cpu() for s in range(0, n, rows)),
+                   default=torch.tensor(0.0), key=float)
+        global_scale = float(448.0 * 6.0 / amax) if amax > 0 else 1.0
+    dev = weight.device
+    six = torch.tensor(6.0, device=dev)
+    gs = torch.tensor(global_scale, dtype=torch.float32, device=dev)
+    mags = torch.tensor(E2M1_VALUES[:8], dtype=torch.float32, device=dev)
+    packed, scales = [], []
+    for s in range(0, n, rows):
+        w = weight[s : s + rows].float().view(-1, k // GROUP, GROUP)
+        block = (w.abs().amax(-1) / six * gs).clamp(max=448.0)
+        sc = block.to(torch.float8_e4m3fn)
+        eff = sc.float() / gs
+        scaled = torch.where(eff.unsqueeze(-1) > 0, w / eff.unsqueeze(-1).clamp(min=1e-30), torch.zeros_like(w))
+        nearest = (scaled.abs().unsqueeze(-1) - mags).abs().argmin(-1)
+        q = mags[nearest] * torch.where(scaled < 0, -1.0, 1.0)
+        packed.append(pack(q.view(-1, k)))
+        scales.append(sc.view(torch.uint8))
+    return Nvfp4Weight(torch.cat(packed), torch.cat(scales).contiguous(), global_scale)
 
 
 GEMM_TILE = 32

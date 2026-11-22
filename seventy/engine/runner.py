@@ -43,7 +43,9 @@ class ModelRunner:
         self.peers = list(peers)
         self.graphs: DecodeGraphs | None = None
         self.drafter = drafter
+        self.mtp = drafter is not None and hasattr(drafter, "after_verify")
         self.layers = drafter.cfg.target_layers if drafter is not None else ()
+        self._run_step = None
         self._feats = None
         self._stash = None
         self._step = None
@@ -133,12 +135,14 @@ class ModelRunner:
         step = build_step(payload, self.cache.block_size, self.device, self.images)
         logits, cap = self.model.forward(step, self.cache, capture=self.layers if capture else ())
         self._feats = torch.cat([cap[i] for i in self.layers], dim=-1) if capture else None
+        self._run_step = step if capture else None
         return logits
 
     def run_payload(self, payload, capture: bool) -> None:
         step = build_step(payload, self.cache.block_size, self.device, self.images)
         _, cap = self.model.forward(step, self.cache, capture=self.layers if capture else ())
         self._feats = torch.cat([cap[i] for i in self.layers], dim=-1) if capture else None
+        self._run_step = step if capture else None
 
     def verify_payload(self, payload) -> None:
         self._step = build_step(payload, self.cache.block_size, self.device)
@@ -162,7 +166,8 @@ class ModelRunner:
         lens = torch.tensor(commit_lens, dtype=torch.int32, device=self.device)
         self.model.commit(self._step, self.cache, self._stash, lens)
         self._stash = None
-        self.context(rows, positions, slots, send=False)
+        if not self.mtp:
+            self.context(rows, positions, slots, send=False)
 
     def context(self, rows: list[int], positions: list[int], slots: list[int], send: bool = True) -> None:
         """Write the drafter context of rows of the last step's features."""
@@ -180,6 +185,40 @@ class ModelRunner:
         dev = self.device
         return self.drafter.draft(torch.tensor(anchors, device=dev), torch.tensor(starts, device=dev),
                                   torch.tensor(slots, device=dev), temperatures, generators)
+
+    def _tensors(self, *lists, dtype=torch.long):
+        return [torch.tensor(x, dtype=dtype, device=self.device) for x in lists]
+
+    def _tables(self, tables: list[list[int]]) -> torch.Tensor:
+        """Block tables padded with the scratch block, with columns past the longest table for the MTP drafts
+        (which run up to two blocks of rows past a sequence's end; the attention reads the table at each position)."""
+        width = max((len(t) for t in tables), default=1) + self.drafter.table_margin(self.cache.block_size)
+        out = torch.full((len(tables), max(width, 1)), self.cache.scratch_block, dtype=torch.int32)
+        for i, t in enumerate(tables):
+            out[i, : len(t)] = torch.tensor(t, dtype=torch.int32)
+        return out.to(self.device)
+
+    def mtp_prefill(self, row_tokens: list[int], send: bool = True) -> None:
+        """MTP keys and values of the last prefill step's rows (row_tokens: the token after each row)."""
+        if send:
+            self._send(("mtp_prefill", row_tokens))
+        (tokens,) = self._tensors(row_tokens)
+        self.drafter.run(tokens, self._feats, self._run_step, self.cache)
+
+    def mtp_first(self, rows, tokens, positions, tables, deltas, slots, send: bool = True):
+        """First drafts after a prefill: rows index the last prefill step's rows (each sequence's last prompt row)."""
+        if send:
+            self._send(("mtp_first", rows, tokens, positions, tables, deltas, slots))
+        r, tok, pos, dl, sl = self._tensors(rows, tokens, positions, deltas, slots)
+        return self.drafter.first(self._feats[r], tok, pos, self._tables(tables), dl, sl, self.cache)
+
+    def mtp_verify(self, row_tokens, last_rows, positions, tables, deltas, slots, send: bool = True):
+        """Drafts after a verify step outside the CUDA graphs: row_tokens is the token after each verify row,
+        last_rows each sequence's last accepted row, positions where the next MTP pass of each sequence goes."""
+        if send:
+            self._send(("mtp_verify", row_tokens, last_rows, positions, tables, deltas, slots))
+        rt, lr, pos, dl, sl = self._tensors(row_tokens, last_rows, positions, deltas, slots)
+        return self.drafter.after_rows(self._step, self._feats, rt, lr, pos, self._tables(tables), dl, sl, self.cache)
 
     def close(self) -> None:
         for p in self.peers:

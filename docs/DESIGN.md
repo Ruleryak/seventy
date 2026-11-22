@@ -10,7 +10,7 @@ numerics, the memory model, and the milestones.
 |---|---|
 | Architecture | `Qwen3_5ForConditionalGeneration` (`model_type: qwen3_5`): Qwen3.5, Qwen3.6, Qwen3.8. Gated DeltaNet layers plus gated full-attention layers, and the vision tower. |
 | Weights | NVFP4 (`compressed-tensors`, format `nvfp4-pack-quantized`, used weight-only) and BF16 (computed in FP16). |
-| Speculative decoding | DFlash2 drafters (`DFlash2DraftModel`). |
+| Speculative decoding | DFlash2 drafters (`DFlash2DraftModel`), or the MTP layer of the model (`--draft-model mtp`). |
 | GPUs | V100 16 GB and 32 GB; 1, 2 or 4 GPUs in tensor parallel; any set of GPU ids; NVLink or PCIe. Without peer-to-peer access between all GPUs, every all-reduce uses NCCL (identical requests in one batch can then differ at a near-tie). |
 | API | OpenAI-compatible HTTP: chat completions (streaming, tools, thinking on or off, images), completions with logprobs and prompt logprobs, tokenize, models, Prometheus metrics. |
 | Control panel | Startup screen, GPU picker, memory plan, live dashboard with history, model downloads, engine log, crash reports, automatic restart, API key. |
@@ -44,7 +44,7 @@ added as new model modules. The engine core does not assume one architecture.
 | `seventy/checkpoint.py` | safetensors index, tensor lookup, slices for tensor parallel. |
 | `seventy/nvfp4.py` | The NVFP4 format: unpack, dequantize, and the layout our GEMM kernels read. |
 | `seventy/ops/` | One Python function per operation. Each has a PyTorch reference implementation (`reference.py`) and a kernel path. CPU tensors always use the reference. |
-| `seventy/model/` | Model definitions: the Qwen3.5 text model, the vision tower, the DFlash2 drafter. |
+| `seventy/model/` | Model definitions: the Qwen3.5 text model, the vision tower, the DFlash2 drafter, the MTP drafter. |
 | `seventy/engine/` | Scheduler, KV and state cache, model runner, sampler, speculative decoding, workers. |
 | `seventy/api/` | HTTP server, chat template, tool-call and reasoning parsers. |
 | `seventy/panel/` | Control panel server and web UI. |
@@ -122,7 +122,8 @@ The planner and the engine use one memory model. Per GPU:
 
 - Per-request state: Gated DeltaNet state and convolution state for each linear-attention layer, plus the
   drafter state. This is independent of context length.
-- KV bytes per token: for each full-attention layer, K and V for the local KV heads, plus scales.
+- KV bytes per token: for each full-attention layer, K and V for the local KV heads, plus scales. The MTP drafter
+  adds one more attention layer (its own keys and values) and has no per-request state.
 - The engine measures the real peak of each piece at startup and stores it, so the panel can show what fits
   before it starts the engine.
 

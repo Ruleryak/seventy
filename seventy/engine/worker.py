@@ -76,9 +76,10 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
         cfg, model = load_shard(model_path, rank, size, device, dtype, layers)
         drafter = None
         if draft_path:
-            from ..model.dflash2 import Drafter
+            from .engine import make_drafter
 
-            drafter = Drafter(draft_path, model, device, dtype, par=model.par)
+            drafter = make_drafter(draft_path, model_path, model, device, dtype, model.par)
+        mtp = bool(draft_path) and draft_path.startswith("mtp:")
         upload.release()
         budget = (distributed.memory_budget(device, utilization, reserve_bytes) if device.type == "cuda"
                   else (1 << 40, 1 << 40))
@@ -86,7 +87,7 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
         kind, num_blocks, block_size, slots, kv_name = conn.recv()
         kv_dtype = getattr(torch, kv_name)
         cache = ModelCache(cfg.text, num_blocks, block_size, slots, dtype, device, par=Parallel(rank, size),
-                           kv_dtype=kv_dtype)
+                           kv_dtype=kv_dtype, extra_attention_layers=(cfg.text.num_layers,) if mtp else ())
         if drafter is not None:
             drafter.allocate(slots)
             cache.slot_peers.append(drafter)
@@ -109,6 +110,12 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
                 runner.context(*msg[1:], send=False)
             elif msg[0] == "draft":
                 runner.draft(msg[1], msg[2], msg[3], [0.0] * len(msg[1]), [None] * len(msg[1]))
+            elif msg[0] == "mtp_prefill":
+                runner.mtp_prefill(msg[1], send=False)
+            elif msg[0] == "mtp_first":
+                runner.mtp_first(*msg[1:], send=False)
+            elif msg[0] == "mtp_verify":
+                runner.mtp_verify(*msg[1:], send=False)
             elif msg[0] == "decode":
                 graphs.run(msg[1])
             elif msg[0] == "copy":

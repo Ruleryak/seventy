@@ -17,12 +17,13 @@ from .config import ModelConfig
 KV_DTYPES = ("int8", "fp16")
 
 
-def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int = 1) -> int:
-    """Bytes of one KV block on one rank: K and V of the local KV heads of every full-attention layer
-    (INT8 values plus one FP32 scale per token and head, or FP16)."""
+def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int = 1, extra_layers: int = 0) -> int:
+    """Bytes of one KV block on one rank: K and V of the local KV heads of every full-attention layer, and of
+    extra_layers more (the MTP drafter's attention layer), as INT8 values plus one FP32 scale per token and head,
+    or FP16."""
     t = cfg.text
     per_vec = t.head_dim + 4 if kv_dtype == "int8" else 2 * t.head_dim
-    return len(t.attention_layers) * 2 * block_size * (t.num_kv_heads // tp) * per_vec
+    return (len(t.attention_layers) + extra_layers) * 2 * block_size * (t.num_kv_heads // tp) * per_vec
 
 
 def prefix_entries(max_num_seqs: int, prefix_cache: bool, cache_entries: int = 0) -> int:

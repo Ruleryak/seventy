@@ -136,6 +136,7 @@ line. To see all options:
 | `--gpu-memory-utilization` | `0.90` | The part of each GPU's memory that seventy can use. The KV cache gets the memory that remains after the weights, the stream states, and 3 GiB for activations. |
 | `--kv-cache-dtype` | `int8` | With `fp16`, the KV cache is in FP16. Each token then needs two times the memory. |
 | `--cache-entries` | three per stream | The number of earlier prompts and replies that the prefix cache keeps, besides the running requests. Each one keeps a state in GPU memory, like a stream. More entries help many clients that come back to their conversations. |
+| `--mtp-tokens` | `4` | With `--draft-model mtp`: the number of tokens that the MTP layer drafts for each step. |
 | `--no-prefix-cache` | the prefix cache is on | Stops the reuse of earlier prompt text, for example a system prompt or the earlier turns of a chat. This releases the 3 extra states for each stream, but the engine must read repeated prompt text again. |
 | `--prefill-budget` | `8192` | The number of prompt tokens in one engine step. A smaller value needs less activation memory, but the engine reads long prompts more slowly. |
 | `--no-cuda-graphs` | CUDA graphs are on | Runs without CUDA graphs. Decoding is slower. Use it only to find a problem. |
@@ -164,6 +165,32 @@ To start on one 32 GB GPU with one stream:
   --gpus 0 \
   --max-num-seqs 1
 ```
+
+### Draft with the MTP layer of the model
+
+The Qwen3.8 27B model has its own MTP layer (multi-token prediction). The engine can use this layer as the
+drafter, in place of DFlash2. Then you do not download a drafter.
+
+On 4 V100 GPUs with NVLink, compared with DFlash2:
+
+- With 8 streams and contexts from 2K to 32K tokens, MTP gives approximately 15% to 35% more tokens per second
+  in total. At 100K tokens, the two drafters are approximately equal.
+- With 1 stream, DFlash2 is usually faster.
+- For agent work with long prompts (approximately 77K tokens), DFlash2 is faster: by approximately 30% with 4
+  agents, and by approximately 5% with 8 agents.
+
+Use MTP when many short requests run at the same time. For other work, use DFlash2.
+
+To start on four GPUs with the MTP drafter:
+
+```bash
+~/seventy-env/bin/seventy engine \
+  --model QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
+  --draft-model mtp \
+  --gpus 0,1,2,3
+```
+
+The control panel does not show the MTP drafter. To use it, start the engine with the engine command.
 
 ## Download models in advance
 
