@@ -73,7 +73,9 @@ API server process ──requests/tokens──────┘
   settings, one run folder per start (`runs/<time>/`, with the settings and the engine log), error reports,
   the measured memory profiles and the dashboard history (`history.sqlite`, 10-second averages, 30 days).
 - Start: the planner predicts the KV cache size with the engine's own memory model (`seventy/memory.py`); after
-  a start it uses what the engine measured. The engine prints `seventy-stage:` lines; the panel shows them.
+  a start it uses what the engine measured with the same model, drafter, GPU count, GPU memory size and KV format.
+  On GPUs with different memory sizes, every GPU gets the KV cache of the smallest GPU (a warning, not an error).
+  The engine prints `seventy-stage:` lines; the panel shows them.
 - Stop: SIGINT to the API process; the API process stops the engine process, which stops the tensor-parallel
   workers (they ignore SIGINT, so all ranks tear down together). SIGKILL to the whole session after 60 s.
 - Crash: an exit nobody asked for, a dead tensor-parallel worker (the engine ends itself), or 8 failed health

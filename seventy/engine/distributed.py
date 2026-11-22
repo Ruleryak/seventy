@@ -47,7 +47,8 @@ def shutdown() -> None:
         dist.destroy_process_group()
 
 
-def memory_budget(device: torch.device, utilization: float, reserve_bytes: int) -> int:
-    """Bytes this GPU can still give to the KV cache and state slots."""
+def memory_budget(device: torch.device, utilization: float, reserve_bytes: int) -> tuple[int, int]:
+    """(bytes this GPU can still give to the KV cache and state slots, its total memory). Every rank gets the KV
+    cache of the rank with the smallest budget; on GPUs with different memory sizes, that is the smallest GPU."""
     free, total = torch.cuda.mem_get_info(device)
-    return int(total * utilization) - (total - free) - reserve_bytes
+    return int(total * utilization) - (total - free) - reserve_bytes, total

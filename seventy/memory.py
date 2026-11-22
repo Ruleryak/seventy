@@ -25,6 +25,11 @@ def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int
     return len(t.attention_layers) * 2 * block_size * (t.num_kv_heads // tp) * per_vec
 
 
+def prefix_entries(max_num_seqs: int, prefix_cache: bool, cache_entries: int = 0) -> int:
+    """State slots the prefix cache keeps besides the running streams (cache_entries 0: three per stream)."""
+    return (cache_entries or 3 * max_num_seqs) if prefix_cache else 0
+
+
 def state_bytes_per_slot(cfg: ModelConfig, tp: int = 1) -> int:
     """Bytes of one Gated DeltaNet state slot on one rank: the FP32 recurrent state and the FP16 convolution
     state of every linear-attention layer."""

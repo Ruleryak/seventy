@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from seventy import memory
+from seventy.config import load_config
 from seventy.panel import hardware, planner, telemetry
 from seventy.panel.supervisor import Settings, Supervisor
 
@@ -58,14 +60,62 @@ def test_plan_for_the_real_checkpoint(model_path, tmp_path):
     p = planner.plan(s, inv, planner.Profiles(tmp_path))
     assert p["errors"] == [] and p["ok"] and not p["measured"]
     assert 1_500_000 < p["kv_tokens"] < 3_000_000
-    planner.Profiles(tmp_path).put(s, {"gpu_total": 31 << 30, "weights": 5 << 30, "drafter": 0, "graphs": 1 << 28,
-                                       "overhead": 1 << 30})
+    planner.Profiles(tmp_path).put(s, 32 << 30, {"gpu_total": 31 << 30, "weights": 5 << 30, "drafter": 0,
+                                                 "graphs": 1 << 28, "overhead": 1 << 30})
     q = planner.plan(s, inv, planner.Profiles(tmp_path))
     assert q["measured"] and q["kv_tokens"] < p["kv_tokens"]
     bad = planner.plan(Settings(model=str(model_path), gpus=[0, 1, 2]), inv)
     assert any("1, 2, 4 or 8" in e for e in bad["errors"])
     old = planner.plan(Settings(model=str(model_path), gpus=[0]), fake_inventory(cc=(8, 0)))
     assert any("not a V100" in e for e in old["errors"])
+
+
+def mixed_inventory(sizes):
+    inv = fake_inventory(len(sizes))
+    for g, size in zip(inv.gpus, sizes):
+        g.memory_total = size
+    return inv
+
+
+@pytest.mark.model
+def test_plan_for_gpus_of_different_sizes_uses_the_smallest(model_path):
+    s = Settings(model=str(model_path), gpus=[0, 1, 2, 3], max_model_len=262144)
+    mixed = planner.plan(s, mixed_inventory([32 << 30, 32 << 30, 16 << 30, 16 << 30]))
+    small = planner.plan(s, fake_inventory(mem=16 << 30))
+    assert mixed["errors"] == [] and mixed["ok"]
+    assert mixed["gpu_bytes"] == small["gpu_bytes"] and mixed["kv_tokens"] == small["kv_tokens"]
+    assert any("different memory sizes (16 GiB and 32 GiB)" in w for w in mixed["warnings"])
+    assert not any("different memory sizes" in w for w in small["warnings"])
+
+
+@pytest.mark.model
+def test_a_profile_is_kept_per_gpu_memory_size(model_path, tmp_path):
+    s = Settings(model=str(model_path), gpus=[0, 1, 2, 3], max_model_len=262144)
+    profiles = planner.Profiles(tmp_path)
+    profiles.put(s, 32 << 30, {"gpu_total": 31 << 30, "weights": 5 << 30, "drafter": 0, "graphs": 1 << 28,
+                               "overhead": 1 << 30})
+    assert planner.plan(s, fake_inventory(), profiles)["measured"]
+    small = planner.plan(s, fake_inventory(mem=16 << 30), profiles)
+    assert not small["measured"] and small["gpu_bytes"] < 16 << 30
+    profiles.put(s, 16 << 30, {"gpu_total": 15 << 30, "weights": 5 << 30, "drafter": 0, "graphs": 1 << 28,
+                               "overhead": 1 << 30})
+    mixed = planner.plan(s, mixed_inventory([32 << 30, 16 << 30, 32 << 30, 16 << 30]), profiles)
+    assert mixed["measured"] and mixed["gpu_bytes"] == 15 << 30
+
+
+def test_prefix_cache_entries_are_counted_as_in_the_engine():
+    assert memory.prefix_entries(8, True) == 24
+    assert memory.prefix_entries(8, True, 5) == 5
+    assert memory.prefix_entries(8, False, 5) == 0
+
+
+@pytest.mark.model
+def test_plan_counts_the_state_slots_the_engine_allocates(model_path):
+    cfg = load_config(model_path)
+    per_slot = memory.state_bytes_per_slot(cfg, 4)
+    for prefix_cache, slots in ((True, 8 + 24), (False, 8)):
+        s = Settings(model=str(model_path), gpus=[0, 1, 2, 3], max_num_seqs=8, prefix_cache=prefix_cache)
+        assert planner.plan(s, fake_inventory())["state"] == (slots + 1) * per_slot
 
 
 STUB = r'''

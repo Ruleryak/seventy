@@ -114,9 +114,10 @@ def create_app(host: str = "127.0.0.1", home: Path | None = None) -> FastAPI:
                         util = sup.settings.gpu_memory_utilization
                         overhead = (int(mem["gpu_total"] * util) - int(mem["reserve"]) - int(mem["budget_min"])
                                     - int(mem["weights"]) - int(mem.get("drafter", 0)))
-                        profiles.put(sup.settings, {"gpu_total": mem["gpu_total"], "weights": mem["weights"],
-                                                    "drafter": mem.get("drafter", 0), "graphs": mem.get("graphs", 0),
-                                                    "overhead": max(0, overhead)})
+                        gpu_bytes = planner.gpu_memory(hardware.inventory(), sup.settings.gpus)
+                        profiles.put(sup.settings, gpu_bytes, {
+                            "gpu_total": mem["gpu_total"], "weights": mem["weights"], "drafter": mem.get("drafter", 0),
+                            "graphs": mem.get("graphs", 0), "overhead": max(0, overhead)})
                     seen = st.run
                 except Exception:
                     pass

@@ -149,9 +149,6 @@ def gpu_set_problems(inv: Inventory, ids: list[int]) -> list[str]:
     for i in ids:
         if known[i].compute_capability != (7, 0):
             problems.append(f"GPU {i} ({known[i].name}) is not a V100 (sm70)")
-    sizes = {known[i].memory_total for i in ids}
-    if len(sizes) > 1:
-        problems.append("the GPUs have different memory sizes; the smallest one sets the KV cache size")
     return problems
 
 

@@ -164,7 +164,7 @@ If you completed the quickstart, seventy is already installed. The sections belo
 ### Requirements
 
 - Linux x86_64 with glibc 2.28 or later, for example Ubuntu 20.04 or later, Debian 11 or later, or RHEL 8 or later. Tested on Ubuntu 24.04 LTS.
-- 1, 2 or 4 NVIDIA V100 GPUs (16 GB or 32 GB). With more than one GPU, NVLink between the GPUs is recommended.
+- 1, 2 or 4 NVIDIA V100 GPUs (16 GB or 32 GB). With more than one GPU, NVLink between the GPUs is recommended. GPUs with different memory sizes can work together. Each GPU then gets the KV cache size of the smallest GPU.
 - A working NVIDIA driver. `nvidia-smi` must be able to list the GPUs. Tested with driver 580.178.04 (branch 580, the last branch for Volta). The CUDA 12.9 libraries need driver 525.60.13 or later; drivers before branch 580 are not tested.
 - Enough GPU memory for your model and settings. The panel calculates a memory plan before startup.
 - Internet access for installation and model downloads, and enough disk space for the downloaded files: approximately 20 GB for the NVFP4 27B model and 4 GB for its DFlash2 drafter.

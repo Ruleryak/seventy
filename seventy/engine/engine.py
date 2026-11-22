@@ -115,15 +115,16 @@ class Engine:
         drafter_bytes = torch.cuda.memory_allocated(self.device) - weights
         budgets = [distributed.memory_budget(self.device, config.gpu_memory_utilization, reserve)]
         for conn, proc in zip(peers, self.workers):
-            budgets.append(_expect(conn, "ready", proc))
+            budgets.append(tuple(_expect(conn, "ready", proc)))
+        budget_min, tightest_total = min(budgets)
         slots = config.max_num_seqs
-        entries = (config.cache_entries or 3 * config.max_num_seqs) if config.prefix_cache else 0
+        entries = memory.prefix_entries(config.max_num_seqs, config.prefix_cache, config.cache_entries)
         total_slots = slots + entries
         kv_name = "int8" if kv_dtype == torch.int8 else "fp16"
         per_block = memory.kv_bytes_per_block(self.model_config, config.block_size, kv_name, tp)
         ring = self.drafter.ring_bytes_per_slot() if self.drafter is not None else 0
         state = (total_slots + 1) * (memory.state_bytes_per_slot(self.model_config, tp) + ring)
-        num_blocks = (min(budgets) - state) // per_block
+        num_blocks = (budget_min - state) // per_block
         need = -(-config.max_model_len // config.block_size)
         if num_blocks < min(need, 64):
             raise RuntimeError(f"not enough GPU memory for the KV cache ({num_blocks} blocks)")
@@ -158,10 +159,10 @@ class Engine:
                 buckets += (slots,)
             self.runner.capture(need, buckets)
         torch.cuda.synchronize(self.device)
-        self.memory = {"gpu_total": torch.cuda.get_device_properties(self.device).total_memory,
+        self.memory = {"gpu_total": tightest_total,
                        "weights": weights, "drafter": drafter_bytes, "kv": num_blocks * per_block, "state": state,
                        "graphs": max(0, torch.cuda.memory_reserved(self.device) - before_graphs),
-                       "budget_min": min(budgets), "reserve": reserve}
+                       "budget_min": budget_min, "reserve": reserve}
         if self.workers:
             import threading
 
