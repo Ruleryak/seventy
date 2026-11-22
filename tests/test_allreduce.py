@@ -86,7 +86,14 @@ def run_rank(rank, world, port, queue):
     distributed.shutdown()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+def _peer_gpus() -> bool:
+    from seventy.engine.distributed import peer_access
+
+    n = torch.cuda.device_count()
+    return n >= 2 and peer_access(4 if n >= 4 else 2)
+
+
+@pytest.mark.skipif(not _peer_gpus(), reason="needs 2 GPUs with peer-to-peer access (NVLink or PCIe P2P)")
 def test_one_shot_and_two_shot_all_reduce():
     from seventy.engine import distributed
 

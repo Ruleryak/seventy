@@ -127,7 +127,7 @@ engine or for the tests. Without the variable, the default path runs.
 | `SEVENTY_VERIFY_ATTN` | `wmma` | Verify attention on the WMMA kernel |
 | `SEVENTY_AR` | `home` | All-reduce and norm where the home rank of a row also takes the norm |
 | `SEVENTY_AR` | `flags` | All-reduce on the flag protocol |
-| `SEVENTY_CUSTOM_ALLREDUCE` | `0` | NCCL for all all-reduces |
+| `SEVENTY_CUSTOM_ALLREDUCE` | `0` | NCCL for all all-reduces (the engine does this itself when the GPUs have no peer-to-peer access) |
 | `SEVENTY_GEMM_WK` | `0` | NVFP4 GEMM without the warp split over k |
 | `SEVENTY_GDN_SCAN` | `single` | Gated DeltaNet prefill state scan in one kernel |
 | `SEVENTY_GDN_PREPARE` | `torch` | Gated DeltaNet prefill preparation in PyTorch |

@@ -3,7 +3,7 @@
 seventy is an inference engine for Qwen3.5-family models (Qwen3.5, Qwen3.6, Qwen3.8) on NVIDIA V100 GPUs.
 It serves an OpenAI-compatible API and has a control panel in the browser.
 
-**Status:** version 1.1.0. The tests ran on 4 Tesla V100-SXM2-32GB GPUs with NVLink.
+**Status:** version 1.1.0. The tests ran on 4 Tesla V100-SXM2-32GB GPUs with NVLink. The installation and a short check also ran on 4 Tesla V100-PCIE-16GB GPUs without peer-to-peer access (Ubuntu 22.04).
 
 - The design and the plan for version 1 are in [docs/DESIGN.md](docs/DESIGN.md).
 - To build and test the code, see [docs/DEVELOPING.md](docs/DEVELOPING.md).
@@ -164,7 +164,7 @@ If you completed the quickstart, seventy is already installed. The sections belo
 ### Requirements
 
 - Linux x86_64 with glibc 2.28 or later, for example Ubuntu 20.04 or later, Debian 11 or later, or RHEL 8 or later. Tested on Ubuntu 24.04 LTS.
-- 1, 2 or 4 NVIDIA V100 GPUs (16 GB or 32 GB). With more than one GPU, NVLink between the GPUs is recommended. GPUs with different memory sizes can work together. Each GPU then gets the KV cache size of the smallest GPU.
+- 1, 2 or 4 NVIDIA V100 GPUs (16 GB or 32 GB). With more than one GPU, NVLink between the GPUs is recommended. Without NVLink or PCIe peer-to-peer access, tensor parallel uses NCCL for every all-reduce, which is slower. `seventy info` shows the peer access. GPUs with different memory sizes can work together. Each GPU then gets the KV cache size of the smallest GPU.
 - A working NVIDIA driver. `nvidia-smi` must be able to list the GPUs. Tested with driver 580.178.04 (branch 580, the last branch for Volta). The CUDA 12.9 libraries need driver 525.60.13 or later; drivers before branch 580 are not tested.
 - Enough GPU memory for your model and settings. The panel calculates a memory plan before startup.
 - Internet access for installation and model downloads, and enough disk space for the downloaded files: approximately 20 GB for the NVFP4 27B model and 4 GB for its DFlash2 drafter.
@@ -242,12 +242,22 @@ Settings, logs, and history are stored in `~/.local/state/seventy`. Use `--home`
 
 Use either a Hugging Face model ID or a local model directory for `--model` and `--draft-model`. Model IDs use the Hugging Face cache and download missing files on first use.
 
-Start on one GPU without a drafter:
+Start on one 32 GB GPU without a drafter:
 
 ```bash
 ~/seventy-env/bin/seventy engine \
   --model QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
   --gpus 0
+```
+
+The 27B model does not fit on one 16 GB GPU. With 16 GB GPUs, use four GPUs. Two 16 GB GPUs can run the model only with one stream, no prefix cache and no drafter:
+
+```bash
+~/seventy-env/bin/seventy engine \
+  --model QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
+  --gpus 0,1 \
+  --max-num-seqs 1 --no-prefix-cache \
+  --gpu-memory-utilization 0.97 --prefill-budget 2048
 ```
 
 Start on four GPUs with a drafter:
@@ -281,7 +291,7 @@ For the optional drafter:
 ~/seventy-env/bin/hf download incoai/Qwen3.8-27B-DFlash2
 ```
 
-These commands use the Hugging Face cache. The final output line of each command is `path=` followed by the downloaded directory; that directory can also be passed directly to the engine.
+These commands use the Hugging Face cache. The output of each command ends with `path:` and the downloaded directory. You can also give that directory to the engine.
 
 To keep a model in a named directory:
 

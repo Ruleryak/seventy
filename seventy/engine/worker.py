@@ -32,7 +32,8 @@ def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None
             from ..model.vision import VisionTower
 
             model.vision = VisionTower(cfg.vision, ckpt, device, par=Parallel(rank, size), prefix=prefix)
-    if size > 1 and torch.device(device).type == "cuda" and os.environ.get("SEVENTY_CUSTOM_ALLREDUCE", "1") != "0":
+    if (size > 1 and torch.device(device).type == "cuda" and os.environ.get("SEVENTY_CUSTOM_ALLREDUCE", "1") != "0"
+            and distributed.peer_access(size)):
         import dataclasses
 
         from .allreduce import CustomAllReduce

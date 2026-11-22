@@ -69,6 +69,20 @@ def _stage(name: str, detail: str = "") -> None:
     print(f"seventy-stage: {name} {detail}".rstrip(), flush=True)
 
 
+def _check_weights_fit(config: EngineConfig, devices: list[int]) -> None:
+    """Stop before loading when the checkpoint files divided over the GPUs are larger than the smallest GPU: the
+    load would end in a CUDA out-of-memory error. The weights take about the size of the checkpoint files."""
+    need = memory.checkpoint_bytes(config.model)
+    if config.draft_model:
+        need += memory.checkpoint_bytes(config.draft_model)
+    per_gpu = need // len(devices)
+    total = min(torch.cuda.get_device_properties(i).total_memory for i in devices)
+    if per_gpu > total:
+        what = "the model and the drafter need" if config.draft_model else "the model needs"
+        raise RuntimeError(f"{what} about {per_gpu / 2**30:.1f} GiB per GPU on {len(devices)} GPU(s), but the "
+                           f"smallest GPU has {total / 2**30:.1f} GiB; use more GPUs (--gpus)")
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         self.config = config
@@ -80,6 +94,11 @@ class Engine:
             self.device = torch.device("cuda", 0 if tp > 1 else torch.cuda.current_device())
         path = Path(config.model)
         self.model_config = load_config(path)
+        if self.device.type == "cuda":
+            _check_weights_fit(config, [self.device.index] if tp == 1 else list(range(tp)))
+        if self.device.type == "cuda" and tp > 1 and not distributed.peer_access(tp):
+            print("seventy: the GPUs have no peer-to-peer access (no NVLink and no PCIe P2P); every all-reduce uses "
+                  "NCCL, which is slower", flush=True)
         torch.cuda.set_device(self.device)
         reserve = int(config.activation_reserve_gib * 2**30)
         kv_dtype = torch.int8 if config.kv_dtype == "int8" else torch.float16

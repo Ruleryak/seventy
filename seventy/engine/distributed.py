@@ -47,6 +47,12 @@ def shutdown() -> None:
         dist.destroy_process_group()
 
 
+def peer_access(size: int) -> bool:
+    """Whether each pair of the first size CUDA devices can map the other's memory (NVLink, or PCIe peer-to-peer).
+    The custom all-reduce needs it; without it every all-reduce goes through NCCL. All ranks get the same answer."""
+    return all(torch.cuda.can_device_access_peer(a, b) for a in range(size) for b in range(size) if a != b)
+
+
 def memory_budget(device: torch.device, utilization: float, reserve_bytes: int) -> tuple[int, int]:
     """(bytes this GPU can still give to the KV cache and state slots, its total memory). Every rank gets the KV
     cache of the rank with the smallest budget; on GPUs with different memory sizes, that is the smallest GPU."""

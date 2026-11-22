@@ -28,6 +28,15 @@ def cmd_info(args: argparse.Namespace) -> int:
         for i in range(torch.cuda.device_count()):
             p = torch.cuda.get_device_properties(i)
             print(f"GPU {i}: {p.name}, {p.total_memory / 2**30:.1f} GiB, sm{p.major}{p.minor}")
+        n = torch.cuda.device_count()
+        if n > 1:
+            missing = [f"{a}-{b}" for a in range(n) for b in range(a + 1, n)
+                       if not (torch.cuda.can_device_access_peer(a, b) and torch.cuda.can_device_access_peer(b, a))]
+            if missing:
+                print(f"GPU peer access: none for {', '.join(missing)} (tensor parallel over these GPUs uses NCCL for "
+                      f"every all-reduce, which is slower)")
+            else:
+                print("GPU peer access: all pairs")
     if _lib.available():
         print(f"kernels: {_lib.path()} (ABI {_lib.ABI_VERSION})")
     else:
