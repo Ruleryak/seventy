@@ -7,12 +7,25 @@ tensor-parallel rank captures the same buckets in the same order, because the gr
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .cache import ModelCache
 from .step import StepInput
 
 BUCKETS = (1, 2, 4, 8, 16, 32, 64)
+
+
+def spec_buckets(limit: int, mode: str | None = None) -> tuple[int, ...]:
+    """Batch sizes that get a graph of a whole speculative step, up to limit sequences: every size (mode "all", the
+    default) or the powers of two and limit (mode "pow2"; SEVENTY_SPEC_BUCKETS sets the mode). A batch replays the
+    smallest graph that holds it. A speculative step computes a block of rows for each sequence (8 with DFlash2), and
+    at those row counts the verify GEMMs cost about as much as the rows they compute: with only the powers of two, 5
+    sequences ran in the graph of 8 and took almost its time (44.4 against 47.5 ms at 100K tokens of context)."""
+    if (mode or os.environ.get("SEVENTY_SPEC_BUCKETS", "all")) == "pow2":
+        return tuple(b for b in BUCKETS if b <= limit) + (() if limit in BUCKETS else (limit,))
+    return tuple(range(1, limit + 1))
 
 
 class DecodeGraphs:

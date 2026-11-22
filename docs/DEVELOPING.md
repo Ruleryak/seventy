@@ -202,6 +202,7 @@ engine or for the tests. Without the variable, the default path runs.
 | `SEVENTY_DRAFTER_FC_SPLIT` | `0` | The drafter's fc weight whole on every GPU (not split over the input columns) |
 | `SEVENTY_DRAFTER_WALK` | `torch` | Drafter selector walk in PyTorch |
 | `SEVENTY_SPEC_ACCEPT` | `torch` | Speculative acceptance in PyTorch |
+| `SEVENTY_SPEC_BUCKETS` | `pow2` | Graphs of speculative steps only for 1, 2, 4 and 8 sequences (a batch of 5 to 7 sequences replays the graph of 8) |
 
 For example, to run the engine with the earlier prefill attention:
 

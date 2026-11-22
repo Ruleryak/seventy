@@ -204,12 +204,10 @@ class Engine:
         if config.cuda_graphs:
             _stage("graphs", "capturing CUDA graphs")
         if config.cuda_graphs and self.drafter is not None:
-            from .graphs import BUCKETS
+            from .graphs import spec_buckets
 
             limit = max(1, min(slots, 64 // self.drafter.cfg.block))
-            buckets = tuple(b for b in BUCKETS if b <= limit)
-            if limit not in buckets:
-                buckets += (limit,)
+            buckets = spec_buckets(limit)
             margin = self.drafter.table_margin(config.block_size) if self.runner.mtp else 0
             self.runner.capture_spec(need + margin, buckets)
         if config.cuda_graphs and self.drafter is None:
