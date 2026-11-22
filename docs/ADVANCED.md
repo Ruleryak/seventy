@@ -6,9 +6,9 @@ network access, and the panel as a service.
 
 ## Requirements
 
-- Linux x86_64 with glibc 2.28 or later, for example Ubuntu 20.04 or later, Debian 11 or later, or RHEL 8 or later. Tested on Ubuntu 24.04 LTS.
-- 1, 2 or 4 NVIDIA V100 GPUs (16 GB or 32 GB). With more than one GPU, NVLink between the GPUs is recommended. Without NVLink or PCIe peer-to-peer access, tensor parallel uses NCCL for every all-reduce, which is slower. `seventy info` shows the peer access. GPUs with different memory sizes can work together. Each GPU then gets the KV cache size of the smallest GPU. GPUs other than the V100 are not supported: the engine and the panel stop with an error.
-- A working NVIDIA driver. `nvidia-smi` must be able to list the GPUs. Tested with driver 580.178.04 (branch 580, the last branch for Volta). The CUDA 12.9 libraries need driver 525.60.13 or later; drivers before branch 580 are not tested.
+- Linux x86_64 with glibc 2.28 or later, for example Ubuntu 20.04 or later, Debian 11 or later, or RHEL 8 or later. Version 1.1.1 was tested on Ubuntu 20.04, 22.04 and 24.04, and on Rocky Linux 8.10 (glibc 2.28).
+- 1, 2 or 4 NVIDIA V100 or V100S GPUs (16 GB or 32 GB). On a machine with more GPUs, choose 1, 2 or 4 of them with `--gpus`. With more than one GPU, NVLink between the GPUs is recommended. Without NVLink or PCIe peer-to-peer access, tensor parallel uses NCCL for every all-reduce, which is slower. `seventy info` shows the peer access. GPUs with different memory sizes can work together. Each GPU then gets the KV cache size of the smallest GPU. GPUs other than the V100 are not supported: the engine and the panel stop with an error.
+- A working NVIDIA driver. `nvidia-smi` must be able to list the GPUs. Tested with drivers 580.178.04 (branch 580, the last branch for Volta) and 570.133.20. The CUDA 12.9 libraries need driver 525.60.13 or later; drivers before branch 570 are not tested.
 - Enough GPU memory for your model and settings. The panel calculates a memory plan before startup.
 - Internet access for the installation and the model downloads, and enough disk space: approximately 8 GB for the seventy environment (PyTorch and the CUDA libraries), up to 8 GB more for the download cache of uv or pip, 20 GB for the NVFP4 27B model, and 4 GB for its DFlash2 drafter.
 - Bash and curl for the commands below. systemd is needed only for the service instructions.
