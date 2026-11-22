@@ -55,12 +55,6 @@ class Draft:
     candidates: torch.Tensor
 
 
-def has_mtp(path: str | Path) -> bool:
-    """Whether a checkpoint folder holds an MTP layer (mtp.fc and mtp.layers.0)."""
-    with Checkpoint(Path(path)) as ckpt:
-        return "mtp.fc.weight" in ckpt and "mtp.layers.0.mlp.down_proj.weight" in ckpt
-
-
 def _dense_rows(w, start: int, stop: int) -> torch.Tensor:
     """Rows [start, stop) (multiples of 32) of a packed FP16 DenseWeight as a dense FP16 tensor."""
     from ..ops.kernels import _LANES

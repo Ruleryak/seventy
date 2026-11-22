@@ -53,7 +53,9 @@
         <h2>2. Model</h2>
         <label>Target model <select id="f-model"></select></label>
         <div id="model-note" class="note"></div>
-        <label>DFlash2 drafter (speculative decoding) <select id="f-draft"></select></label>
+        <label>Drafter (speculative decoding) <select id="f-draft"></select></label>
+        <label id="f-mtp-box" hidden>MTP draft tokens per step <input id="f-mtp" type="number" min="1" max="7" value="4"></label>
+        <div id="draft-note" class="note"></div>
       </div>
       <div class="card"><h2>3. GPUs</h2><div id="f-gpus" class="gpu-pick"></div></div>
       <div class="card">

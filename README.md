@@ -141,6 +141,8 @@ In the panel:
 
 The drafter is optional. To use it, also download `incoai/Qwen3.8-27B-DFlash2` and select it before starting the engine. It requires additional GPU memory.
 
+Or, select **MTP layer of the model** as the drafter. This drafter uses the MTP layer of the model, so you do not download a drafter. With many short requests at the same time, it is faster than DFlash2. For agent work, DFlash2 is faster. Refer to [Draft with the MTP layer of the model](docs/ADVANCED.md#draft-with-the-mtp-layer-of-the-model).
+
 Keep the panel running. To run it in the background and start it at boot, see [Run the panel as a service](docs/ADVANCED.md#run-the-panel-as-a-service).
 
 ### 4. Send a request

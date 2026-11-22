@@ -190,7 +190,12 @@ To start on four GPUs with the MTP drafter:
   --gpus 0,1,2,3
 ```
 
-The control panel does not show the MTP drafter. To use it, start the engine with the engine command.
+To use the MTP drafter in the control panel:
+
+1. On the **Start** page, in **2. Model**, set **Drafter** to **MTP layer of the model**.
+2. Optional: change **MTP draft tokens per step** (1 to 7, default 4). This is the same as `--mtp-tokens`.
+
+If the model has no MTP layer, the panel disables this option.
 
 ## Download models in advance
 

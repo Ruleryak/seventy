@@ -101,7 +101,7 @@ def cmd_engine(args: argparse.Namespace) -> int:
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     from . import memory
     from .api.server import ServerConfig, run
-    from .config import UnsupportedModel, load_config
+    from .config import UnsupportedModel, has_mtp, load_config
     from .engine.engine import EngineConfig
     from .hub import ModelNotFound, resolve, served_name
 
@@ -123,8 +123,6 @@ def cmd_engine(args: argparse.Namespace) -> int:
         print("seventy cannot serve this model:\n" + "\n".join(f"  - {r}" for r in e.reasons))
         return 1
     if draft_model == "mtp":
-        from .model.mtp import has_mtp
-
         if not has_mtp(model):
             print("seventy: --draft-model mtp needs a checkpoint with an MTP layer (mtp.* tensors)", file=sys.stderr)
             return 1

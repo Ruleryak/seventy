@@ -297,3 +297,18 @@ def _parse_quant(raw: dict | None, dtype: str | None, reasons: list[str]) -> Qua
             except re.error:
                 reasons.append(f"quantization ignore pattern {pattern!r} is not a valid regular expression")
     return QuantConfig(method="nvfp4", group_size=group_size, ignore=ignore)
+
+
+def has_mtp(path: str | Path) -> bool:
+    """Whether a checkpoint folder holds an MTP layer (mtp.fc and mtp.layers.0), from the tensor names of its index
+    file, else of the header of its model.safetensors."""
+    p = Path(path)
+    try:
+        if (p / "model.safetensors.index.json").is_file():
+            names = json.loads((p / "model.safetensors.index.json").read_text())["weight_map"]
+        else:
+            with open(p / "model.safetensors", "rb") as f:
+                names = json.loads(f.read(int.from_bytes(f.read(8), "little")))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return "mtp.fc.weight" in names and "mtp.layers.0.mlp.down_proj.weight" in names

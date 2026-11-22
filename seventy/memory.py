@@ -105,13 +105,14 @@ class Plan:
 
 def plan(cfg: ModelConfig, gpu_bytes: int, used: int, tp: int, slots: int, block_size: int = 16,
          kv_dtype: str = "int8", utilization: float = 0.9, reserve: int = 3 << 30, drafter: DrafterShape | None = None,
-         max_model_len: int | None = None) -> Plan:
+         max_model_len: int | None = None, extra_layers: int = 0) -> Plan:
     """The KV blocks left on the tightest rank, as the engine computes them. gpu_bytes: the memory CUDA reports;
     used: what is in use after loading (weights, drafter, other); slots: state slots including prefix-cache
-    entries (the scratch slot is added here)."""
+    entries (the scratch slot is added here); extra_layers: attention layers in the KV cache besides the model's
+    (1 for the MTP drafter)."""
     per_slot = state_bytes_per_slot(cfg, tp) + (drafter_bytes_per_slot(drafter, tp) if drafter else 0)
     state = (slots + 1) * per_slot
-    per_block = kv_bytes_per_block(cfg, block_size, kv_dtype, tp)
+    per_block = kv_bytes_per_block(cfg, block_size, kv_dtype, tp, extra_layers)
     free = int(gpu_bytes * utilization) - used - reserve - state
     blocks = max(0, free // per_block)
     if max_model_len:

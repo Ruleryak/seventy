@@ -33,6 +33,7 @@ class Settings:
     model: str
     gpus: list[int]
     draft_model: str | None = None
+    mtp_tokens: int = 4
     max_model_len: int | None = None
     max_num_seqs: int = 8
     gpu_memory_utilization: float = 0.90
@@ -72,6 +73,8 @@ class Settings:
             cmd += ["--max-model-len", str(self.max_model_len)]
         if self.draft_model:
             cmd += ["--draft-model", self.draft_model]
+        if self.draft_model == "mtp":
+            cmd += ["--mtp-tokens", str(self.mtp_tokens)]
         if self.served_model_name:
             cmd += ["--served-model-name", self.served_model_name]
         if not self.thinking:

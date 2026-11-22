@@ -50,6 +50,13 @@ def test_settings_command_keeps_the_key_off_the_command_line(monkeypatch):
     assert s.public()["api_key"] == "set"
 
 
+def test_settings_command_passes_the_mtp_tokens_only_to_the_mtp_drafter():
+    cmd = Settings(model="/m", gpus=[0], draft_model="mtp", mtp_tokens=3).command()
+    assert cmd[cmd.index("--draft-model") + 1] == "mtp" and cmd[cmd.index("--mtp-tokens") + 1] == "3"
+    assert "--mtp-tokens" not in Settings(model="/m", gpus=[0], draft_model="/d").command()
+    assert "--draft-model" not in Settings(model="/m", gpus=[0]).command()
+
+
 def fake_inventory(n=4, mem=32 << 30, cc=(7, 0)):
     gpus = [hardware.Gpu(i, "Tesla V100-SXM2-32GB", f"u{i}", f"00000000:{i:02x}:00.0", mem, cc,
                          {j: 2 for j in range(n) if j != i}) for i in range(n)]
@@ -71,6 +78,33 @@ def test_plan_for_the_real_checkpoint(model_path, tmp_path):
     assert any("1, 2, 4 or 8" in e for e in bad["errors"])
     old = planner.plan(Settings(model=str(model_path), gpus=[0]), fake_inventory(cc=(8, 0)))
     assert any("not a V100" in e for e in old["errors"])
+
+
+@pytest.mark.model
+def test_plan_for_the_mtp_drafter(model_path, tmp_path):
+    """MTP: no drafter checkpoint, one more attention layer in the KV cache, a profile of its own; a model without
+    an MTP layer, or a draft count out of range, cannot start."""
+    from seventy.panel import models
+
+    inv = fake_inventory()
+    plain = planner.plan(Settings(model=str(model_path), gpus=[0, 1, 2, 3]), inv)
+    s = Settings(model=str(model_path), gpus=[0, 1, 2, 3], draft_model="mtp")
+    p = planner.plan(s, inv)
+    assert p["errors"] == [] and p["ok"] and p["weights"] == plain["weights"]
+    t = load_config(model_path).text
+    layers = len(t.attention_layers)
+    assert p["kv_tokens"] == pytest.approx(plain["kv_tokens"] * layers / (layers + 1), rel=0.01)
+    assert planner.profile_key(s, 1) != planner.profile_key(Settings(model=str(model_path), gpus=[0, 1, 2, 3]), 1)
+    assert '"mtp"' in planner.profile_key(s, 1)
+    assert any("1 to 7" in e for e in planner.plan(Settings(model=str(model_path), gpus=[0, 1, 2, 3],
+                                                             draft_model="mtp", mtp_tokens=0), inv)["errors"])
+    assert models.check(model_path).details["mtp"] is True
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    (bare / "config.json").write_text((Path(model_path) / "config.json").read_text())
+    (bare / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"model.x": "a.safetensors"}}))
+    no = planner.plan(Settings(model=str(bare), gpus=[0, 1, 2, 3], draft_model="mtp"), inv)
+    assert any("no MTP layer" in e for e in no["errors"])
 
 
 def mixed_inventory(sizes):

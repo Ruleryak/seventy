@@ -1,6 +1,6 @@
 """The parts of the MTP drafter that need no model on the GPU: NVFP4 rounding on the GPU, the NVFP4 copy of a packed
-LM head, the block table margin and the one-row draft steps past a sequence's blocks, and the acceptance counters
-per draft position."""
+LM head, the block table margin and the one-row draft steps past a sequence's blocks, the acceptance counters per draft
+position, and the check for an MTP layer in a checkpoint."""
 
 import types
 
@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from seventy import nvfp4
+from seventy.config import has_mtp
 from seventy.engine.engine import Engine
 from seventy.engine.runner import ModelRunner
 from seventy.model import mtp
@@ -73,4 +74,15 @@ def test_accepted_drafts_are_counted_per_position():
 
 
 def test_the_test_model_has_an_mtp_layer(model_path):
-    assert mtp.has_mtp(model_path)
+    assert has_mtp(model_path)
+
+
+def test_an_mtp_layer_is_found_in_a_single_file_checkpoint(tmp_path):
+    from safetensors.torch import save_file
+
+    names = ("mtp.fc.weight", "mtp.layers.0.mlp.down_proj.weight")
+    save_file({n: torch.zeros(2) for n in names}, str(tmp_path / "model.safetensors"))
+    assert has_mtp(tmp_path)
+    save_file({names[0]: torch.zeros(2)}, str(tmp_path / "model.safetensors"))
+    assert not has_mtp(tmp_path)
+    assert not has_mtp(tmp_path / "missing")

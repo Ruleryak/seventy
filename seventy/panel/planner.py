@@ -4,6 +4,7 @@ The memory CUDA reports per GPU, the weights, the drafter and the other memory i
 an earlier start with the same model, drafter, GPU count, GPU memory size and KV format measured (profiles.json in
 the panel home, written when the engine is ready). Without one: the checkpoint sizes divided over the GPUs, and fixed
 guesses for the CUDA context and communication buffers. The rest is seventy.memory, the model the engine itself uses.
+The MTP drafter (draft_model "mtp") is part of the model's checkpoint and adds one attention layer to the KV cache.
 GPUs with different memory sizes can run one engine: every GPU gets the KV cache of the smallest GPU, and the plan
 shows that GPU.
 """
@@ -14,7 +15,7 @@ import json
 from pathlib import Path
 
 from .. import memory
-from ..config import UnsupportedModel, load_config
+from ..config import UnsupportedModel, has_mtp, load_config
 from .hardware import Inventory, gpu_set_problems, nvlink_full
 from .supervisor import Settings
 
@@ -31,8 +32,8 @@ def gpu_memory(inv: Inventory, ids: list[int]) -> int:
 
 
 def profile_key(s: Settings, gpu_bytes: int) -> str:
-    return json.dumps([str(Path(s.model).resolve()), str(Path(s.draft_model).resolve()) if s.draft_model else None,
-                       len(s.gpus), s.kv_cache_dtype, gpu_bytes])
+    draft = s.draft_model if s.draft_model in (None, "", "mtp") else str(Path(s.draft_model).resolve())
+    return json.dumps([str(Path(s.model).resolve()), draft or None, len(s.gpus), s.kv_cache_dtype, gpu_bytes])
 
 
 class Profiles:
@@ -67,7 +68,12 @@ def plan(s: Settings, inv: Inventory, profiles: Profiles | None = None) -> dict:
         return out
     t = cfg.text
     drafter = None
-    if s.draft_model:
+    mtp = s.draft_model == "mtp"
+    if mtp and not has_mtp(s.model):
+        errors.append("the model has no MTP layer; choose a DFlash2 drafter or none")
+    if mtp and not 1 <= s.mtp_tokens <= 7:
+        errors.append("the MTP drafter drafts 1 to 7 tokens per step")
+    if s.draft_model and not mtp:
         try:
             drafter = memory.DrafterShape.from_checkpoint(s.draft_model)
         except (OSError, ValueError, KeyError) as e:
@@ -92,13 +98,13 @@ def plan(s: Settings, inv: Inventory, profiles: Profiles | None = None) -> dict:
         measured = None
         gpu_bytes = nvml_bytes - CUDA_HIDDEN
         weights = memory.checkpoint_bytes(s.model) // tp
-        if s.draft_model:
+        if s.draft_model and not mtp:
             weights += memory.checkpoint_bytes(s.draft_model) // tp
         overhead = OVERHEAD_GUESS.get(tp, OVERHEAD_GUESS_TP)
         graphs = None
     slots = s.max_num_seqs + memory.prefix_entries(s.max_num_seqs, s.prefix_cache)
     p = memory.plan(cfg, gpu_bytes, weights + overhead, tp, slots, 16, s.kv_cache_dtype, s.gpu_memory_utilization,
-                    RESERVE, drafter, max_len)
+                    RESERVE, drafter, max_len, int(mtp))
     out.update({
         "ok": p.blocks * 16 >= min(max_len, 1024),
         "measured": bool(measured),

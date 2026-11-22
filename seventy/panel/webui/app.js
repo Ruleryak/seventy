@@ -57,7 +57,7 @@ const fmt = {
     return v.toLocaleString(undefined, { maximumFractionDigits: d });
   },
   int(v) { return v === null || v === undefined ? "–" : Math.round(v).toLocaleString(); },
-  gib(b) { return b === null || b === undefined ? "–" : (b / 2 ** 30).toFixed(b >= 10 * 2 ** 30 ? 0 : 1) + " GiB"; },
+  gib(b) { return b === null || b === undefined ? "–" : b > 0 && b < 2 ** 30 ? Math.round(b / 2 ** 20) + " MiB" : (b / 2 ** 30).toFixed(b >= 10 * 2 ** 30 ? 0 : 1) + " GiB"; },
   pct(v) { return v === null || v === undefined ? "–" : (100 * v).toFixed(v >= 0.995 ? 0 : 1) + "%"; },
   secs(v) {
     if (v === null || v === undefined) return "–";
@@ -109,7 +109,7 @@ for (const b of document.querySelectorAll(".tabs button")) b.addEventListener("c
 let state = null;
 const STAGES = [
   ["process", "Start the engine process"], ["workers", "Start the tensor-parallel workers"], ["weights", "Load the weights"],
-  ["drafter", "Load the DFlash2 drafter"], ["cache", "Allocate the KV cache"], ["graphs", "Capture CUDA graphs"],
+  ["drafter", "Load the drafter"], ["cache", "Allocate the KV cache"], ["graphs", "Capture CUDA graphs"],
   ["server", "Start the API server"], ["ready", "Ready"],
 ];
 const STATE_LOOK = {
@@ -391,7 +391,7 @@ const CHARTS = [
     () => [{ name: "Running", color: COLORS[0], values: eng("running") }, { name: "Waiting", color: COLORS[1], values: eng("waiting") }]],
   ["kv", { title: "KV cache in use", sub: "share of the KV cache blocks", yMax: 1, fmt: fmt.pct, tick: (v) => Math.round(v * 100) + "%" },
     () => [{ name: "KV cache", color: COLORS[0], values: eng("kv_usage") }]],
-  ["spec", { title: "Tokens per verify step", sub: "DFlash2: accepted drafts plus the target's own token", fmt: (v) => v.toFixed(2) },
+  ["spec", { title: "Tokens per verify step", sub: "accepted drafts plus the target's own token", fmt: (v) => v.toFixed(2) },
     () => [{ name: "Tokens per step", color: COLORS[0], values: eng("tokens_per_step") }]],
   ["cache", { title: "Prompt tokens from the prefix cache", sub: "share of prompt tokens not computed again", yMax: 1, fmt: fmt.pct, tick: (v) => Math.round(v * 100) + "%" },
     () => [{ name: "Reused", color: COLORS[0], values: eng("cache_hit") }]],
@@ -431,12 +431,13 @@ function renderTiles() {
   const power = gpus.reduce((a, g) => a + (g.power || 0), 0);
   const info = state && state.engine;
   const restarts = state && state.status.restarts ? state.status.restarts.length : 0;
+  const drafter = state && state.status.settings ? state.status.settings.draft_model : null;
   const tiles = [
     ["Tokens per second", e ? fmt.num(e.gen_tps, 1) : "–", e ? `generated · prompt ${fmt.num(e.prompt_tps, 0)}` : "no engine"],
     ["Requests running", e ? fmt.int(e.running) : "–", e ? `${fmt.int(e.waiting)} waiting` : ""],
     ["Time to first token", e && e.ttft_p50 !== null && e.ttft_p50 !== undefined ? fmt.secs(e.ttft_p50) : "–", e && e.ttft_p95 ? `p95 ${fmt.secs(e.ttft_p95)}` : "p50, last interval"],
     ["KV cache in use", e ? fmt.pct(e.kv_usage) : "–", info ? `${fmt.num(info.kv_tokens)} tokens per GPU` : ""],
-    ["Tokens per step", e && e.tokens_per_step ? e.tokens_per_step.toFixed(2) : "–", info && info.draft ? "DFlash2 verify" : "DFlash2 off"],
+    ["Tokens per step", e && e.tokens_per_step ? e.tokens_per_step.toFixed(2) : "–", info && info.draft ? (drafter === "mtp" ? "MTP verify" : "DFlash2 verify") : "no drafter"],
     ["Prefix cache reuse", e && e.cache_hit !== null && e.cache_hit !== undefined ? fmt.pct(e.cache_hit) : "–", "of prompt tokens"],
     ["GPU power", gpus.length ? Math.round(power) + " W" : "–", gpus.length ? `${gpus.length} GPUs` : ""],
     ["Uptime", state && state.status.ready_at ? fmt.dur(Date.now() / 1000 - state.status.ready_at) : "–",
@@ -449,7 +450,7 @@ addEventListener("resize", () => { clearTimeout(window._rz); window._rz = setTim
 /* ---------- start ---------- */
 let inv = null, modelList = [], planTimer = null;
 const field = {
-  model: "f-model", draft_model: "f-draft", max_model_len: "f-maxlen", max_num_seqs: "f-seqs", gpu_memory_utilization: "f-util",
+  model: "f-model", draft_model: "f-draft", mtp_tokens: "f-mtp", max_model_len: "f-maxlen", max_num_seqs: "f-seqs", gpu_memory_utilization: "f-util",
   prefill_budget: "f-prefill", kv_cache_dtype: "f-kv", max_images_per_request: "f-images", max_videos_per_request: "f-videos",
   max_image_pixels: "f-pixels", served_model_name: "f-name", host: "f-host", port: "f-port", api_key: "f-key",
 };
@@ -460,11 +461,8 @@ async function loadStart() {
   } catch (e) { $("machine").textContent = e.message; return; }
   renderMachine();
   const targets = modelList.filter((m) => m.kind === "target");
-  const drafters = modelList.filter((m) => m.kind === "drafter");
   $("f-model").replaceChildren(...(targets.length ? targets : [{ path: "", name: "No models found (see Models)", ok: false }]).map((m) =>
     el("option", { value: m.path, disabled: !m.ok || !m.path }, `${m.name}${m.size ? " (" + fmt.gib(m.size) + ")" : ""}${m.ok ? "" : " — cannot serve"}`)));
-  $("f-draft").replaceChildren(el("option", { value: "" }, "None"), ...drafters.map((m) =>
-    el("option", { value: m.path, disabled: !m.ok }, `${m.name} (${fmt.gib(m.size)})`)));
   $("f-gpus").replaceChildren(...inv.gpus.map((g) => el("label", {},
     el("input", { type: "checkbox", value: g.id, checked: true, onchange: schedulePlan }),
     el("span", { class: "gname" }, `GPU ${g.id}`), el("span", {}, `${g.name} · ${fmt.gib(g.memory_total)}`),
@@ -472,7 +470,7 @@ async function loadStart() {
   const s = (state && (state.last_settings || state.last_good)) || {};
   if (s.model && targets.some((m) => m.path === s.model)) $("f-model").value = s.model;
   else { const ok = targets.find((m) => m.ok); if (ok) $("f-model").value = ok.path; }
-  $("f-draft").value = s.draft_model && drafters.some((m) => m.path === s.draft_model) ? s.draft_model : (drafters.find((m) => m.ok) || { path: "" }).path;
+  renderDrafters("draft_model" in s ? s.draft_model || "" : undefined);
   if (s.gpus) for (const c of $("f-gpus").querySelectorAll("input")) c.checked = s.gpus.includes(+c.value);
   for (const [k, id] of Object.entries(field)) if (k in s && s[k] !== null && k !== "model" && k !== "draft_model" && k !== "api_key") $(id).value = s[k];
   if ("thinking" in s) $("f-think").value = s.thinking ? "1" : "0";
@@ -507,10 +505,31 @@ function modelNote() {
   if (!$("f-maxlen").value && d.max_context) $("f-maxlen").value = d.max_context;
 }
 
+function renderDrafters(want) {
+  const m = modelList.find((x) => x.path === $("f-model").value);
+  const mtp = !!(m && m.details && m.details.mtp);
+  const drafters = modelList.filter((x) => x.kind === "drafter");
+  $("f-draft").replaceChildren(el("option", { value: "" }, "None"),
+    el("option", { value: "mtp", disabled: !mtp }, mtp ? "MTP layer of the model (no download)" : "MTP layer of the model (this model has none)"),
+    ...drafters.map((d) => el("option", { value: d.path, disabled: !d.ok }, `DFlash2: ${d.name} (${fmt.gib(d.size)})`)));
+  const valid = want === "" || (want === "mtp" && mtp) || drafters.some((d) => d.ok && d.path === want);
+  $("f-draft").value = valid ? want : (drafters.find((d) => d.ok) || { path: "" }).path;
+  draftNote();
+}
+
+function draftNote() {
+  const v = $("f-draft").value;
+  $("f-mtp-box").hidden = v !== "mtp";
+  $("draft-note").textContent = v === "mtp"
+    ? "The MTP layer of the model drafts the tokens. You do not download a drafter. With many short requests at the same time, MTP is faster than DFlash2. With one stream and for agent work with long prompts, DFlash2 is faster."
+    : v ? "DFlash2 is the fastest drafter for one stream and for agent work with long prompts."
+      : "Without a drafter, each step makes one token for each stream.";
+}
+
 function settingsFromForm() {
   const num = (id) => ($(id).value === "" ? null : +$(id).value);
   return {
-    model: $("f-model").value, draft_model: $("f-draft").value || null,
+    model: $("f-model").value, draft_model: $("f-draft").value || null, mtp_tokens: num("f-mtp") || 4,
     gpus: [...$("f-gpus").querySelectorAll("input:checked")].map((c) => +c.value),
     max_model_len: num("f-maxlen"), max_num_seqs: num("f-seqs") || 8, gpu_memory_utilization: num("f-util") || 0.9,
     prefill_budget: num("f-prefill") || 8192, kv_cache_dtype: $("f-kv").value, thinking: $("f-think").value === "1",
@@ -522,7 +541,8 @@ function settingsFromForm() {
 
 function schedulePlan() { clearTimeout(planTimer); planTimer = setTimeout(runPlan, 250); }
 for (const id of Object.values(field).concat(["f-think", "f-graphs", "f-prefix"])) $(id).addEventListener("input", schedulePlan);
-$("f-model").addEventListener("change", () => { $("f-maxlen").value = ""; modelNote(); schedulePlan(); });
+$("f-model").addEventListener("change", () => { $("f-maxlen").value = ""; modelNote(); renderDrafters($("f-draft").value); schedulePlan(); });
+$("f-draft").addEventListener("change", draftNote);
 $("btn-key").addEventListener("click", async () => { const r = await api("/api/api_key", { method: "POST" }); $("f-key").value = r.api_key; $("f-key").type = "text"; });
 $("btn-showkey").addEventListener("click", () => { $("f-key").type = $("f-key").type === "password" ? "text" : "password"; });
 

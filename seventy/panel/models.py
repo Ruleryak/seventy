@@ -1,7 +1,8 @@
 """Checkpoints on this machine and downloads from the Hugging Face Hub. No PyTorch.
 
 A folder is a target model when seventy.config accepts its config.json, and a drafter when its architecture is
-DFlash2DraftModel. Folders come from the Hugging Face cache (models--*/snapshots/*) and from folders the user adds.
+DFlash2DraftModel. A target's details tell whether it holds an MTP layer (the drafter option "mtp"). Folders come from
+the Hugging Face cache (models--*/snapshots/*) and from folders the user adds.
 Downloads use huggingface_hub with the endpoint from the panel settings or HF_ENDPOINT (default: the public Hub).
 """
 
@@ -15,7 +16,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from ..config import UnsupportedModel, load_config
+from ..config import UnsupportedModel, has_mtp, load_config
 from ..memory import checkpoint_bytes
 
 
@@ -67,7 +68,7 @@ def check(path: str | Path) -> ModelInfo:
     return ModelInfo(str(p), name, "target", not reasons, size, reasons, {
         "architecture": cfg.architecture, "layers": t.num_layers, "hidden": t.hidden_size,
         "weights": cfg.quant.method, "vision": cfg.vision is not None,
-        "max_context": t.max_position_embeddings, "kv_heads": t.num_kv_heads,
+        "max_context": t.max_position_embeddings, "kv_heads": t.num_kv_heads, "mtp": has_mtp(p),
     })
 
 
