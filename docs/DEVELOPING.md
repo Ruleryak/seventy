@@ -57,6 +57,66 @@
   SEVENTY_TEST_MODEL=/path/to/checkpoint .venv/bin/pytest -m model
   ```
 
+## Test an installed wheel
+
+Use these steps to test a release wheel on a machine, for example on a new machine before or after a release.
+The wheel and the tests must come from the same release.
+
+1. Install the wheel with the test tools and the reference libraries (Hugging Face Transformers and others).
+   The tests compare seventy with these libraries. From the release:
+
+   ```
+   uv venv --python 3.12 ~/seventy-test-env &&
+   uv pip install --python ~/seventy-test-env --torch-backend=cu129 \
+     "seventy[test,reference] @ https://github.com/Ruleryak/seventy/releases/download/v1.1.0/seventy-1.1.0-py3-none-manylinux_2_28_x86_64.whl"
+   ```
+
+   From a wheel file:
+
+   ```
+   uv venv --python 3.12 ~/seventy-test-env &&
+   uv pip install --python ~/seventy-test-env --torch-backend=cu129 \
+     "seventy[test,reference] @ file:///path/to/seventy-1.1.0-py3-none-manylinux_2_28_x86_64.whl"
+   ```
+
+2. Get the tests of the same release:
+
+   ```
+   git clone --depth 1 --branch v1.1.0 https://github.com/Ruleryak/seventy.git seventy-src
+   ```
+
+3. Install `objdump` for the tests of the kernel library. It is in the binutils package. On Ubuntu or Debian:
+
+   ```
+   sudo apt-get install -y binutils
+   ```
+
+   On RHEL, Rocky Linux or AlmaLinux:
+
+   ```
+   sudo dnf install -y binutils
+   ```
+
+4. Download the model for the tests that read the checkpoint:
+
+   ```
+   ~/seventy-test-env/bin/hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4
+   ```
+
+5. Run all tests with the `pytest` program of the environment, in the source folder:
+
+   ```
+   cd seventy-src && ~/seventy-test-env/bin/pytest
+   ```
+
+   Do not use `python -m pytest` here. It puts the current folder first on the module path, so Python imports
+   the source folder, which has no kernel library, and the GPU tests skip.
+
+On 4 V100 GPUs with peer-to-peer access, all tests pass. Without peer-to-peer access between the GPUs,
+`tests/test_allreduce.py` skips: the engine does not use the custom all-reduce on these GPUs, and
+`tests/test_tensor_parallel_gpu.py` tests the NCCL all-reduce that it uses. With fewer than 2 GPUs, the tests
+for 2 or more GPUs skip.
+
 ## Run from the source tree
 
 - The control panel, for this machine only (open http://127.0.0.1:8270/):
