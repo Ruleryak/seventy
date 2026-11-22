@@ -68,6 +68,30 @@ def cmd_check_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _gpu_problems(tp: int) -> list[str]:
+    """Why the first tp visible GPUs cannot run the engine, from NVML (no CUDA context in this process). Empty
+    when they can, or when NVML or the GPU ids are not available (the engine then finds the problems itself)."""
+    import os
+
+    from .panel.hardware import gpu_set_problems, inventory
+
+    inv = inventory()
+    if inv.error is not None:
+        return []
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        ids = list(range(tp))
+    else:
+        parts = [p.strip() for p in visible.split(",") if p.strip()]
+        if not all(p.isdigit() for p in parts):
+            return []
+        ids = [int(p) for p in parts]
+        if len(ids) < tp:
+            return [f"tensor parallel {tp} needs {tp} GPUs, but only {len(ids)} are given"]
+        ids = ids[:tp]
+    return gpu_set_problems(inv, ids)
+
+
 def cmd_engine(args: argparse.Namespace) -> int:
     import json
     import os
@@ -75,11 +99,17 @@ def cmd_engine(args: argparse.Namespace) -> int:
     if args.gpus:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    from . import memory
     from .api.server import ServerConfig, run
     from .config import UnsupportedModel, load_config
     from .engine.engine import EngineConfig
     from .hub import ModelNotFound, resolve, served_name
 
+    tp = args.tensor_parallel or (len(args.gpus.split(",")) if args.gpus else 1)
+    problems = _gpu_problems(tp)
+    if problems:
+        print("seventy cannot start on these GPUs:\n" + "\n".join(f"  - {p}" for p in problems), file=sys.stderr)
+        return 1
     try:
         model = resolve(args.model)
         draft_model = resolve(args.draft_model, "drafter") if args.draft_model else None
@@ -91,7 +121,11 @@ def cmd_engine(args: argparse.Namespace) -> int:
     except UnsupportedModel as e:
         print("seventy cannot serve this model:\n" + "\n".join(f"  - {r}" for r in e.reasons))
         return 1
-    tp = args.tensor_parallel or (len(args.gpus.split(",")) if args.gpus else 1)
+    problems = memory.split_problems(cfg, tp, memory.DrafterShape.from_checkpoint(draft_model) if draft_model else None)
+    if problems:
+        print(f"seventy cannot split the model over {tp} GPUs:\n" + "\n".join(f"  - {p}" for p in problems),
+              file=sys.stderr)
+        return 1
     engine = EngineConfig(
         model=model, max_num_seqs=args.max_num_seqs,
         max_model_len=min(args.max_model_len or cfg.text.max_position_embeddings, cfg.text.max_position_embeddings),

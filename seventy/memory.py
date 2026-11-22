@@ -59,6 +59,23 @@ class DrafterShape:
         )
 
 
+def split_problems(cfg: ModelConfig, tp: int, drafter: DrafterShape | None = None) -> list[str]:
+    """Why the model (and its drafter) cannot be split over tp GPUs (empty when it can): tensor parallel splits
+    each of these counts into equal parts."""
+    t = cfg.text
+    problems = [f"{total} {what} do not split over {tp} GPUs"
+                for what, total in (("attention KV heads", t.num_kv_heads), ("attention heads", t.num_heads),
+                                    ("Gated DeltaNet value heads", t.gdn_v_heads),
+                                    ("Gated DeltaNet key heads", t.gdn_k_heads), ("vocabulary rows", t.vocab_size),
+                                    ("MLP columns", t.intermediate_size))
+                if total % tp]
+    if cfg.vision is not None and (cfg.vision.num_heads % tp or cfg.vision.intermediate_size % tp):
+        problems.append(f"the vision tower does not split over {tp} GPUs")
+    if drafter is not None and drafter.kv_heads % tp:
+        problems.append(f"the drafter's {drafter.kv_heads} KV heads do not split over {tp} GPUs")
+    return problems
+
+
 def drafter_bytes_per_slot(shape: DrafterShape, tp: int = 1) -> int:
     """Bytes of one slot's drafter context ring on one rank (FP16 K and V of the rank's KV heads)."""
     return 2 * shape.layers * shape.ring * (shape.kv_heads // tp) * shape.head_dim * 2

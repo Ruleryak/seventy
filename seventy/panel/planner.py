@@ -66,21 +66,13 @@ def plan(s: Settings, inv: Inventory, profiles: Profiles | None = None) -> dict:
         errors.extend(reasons)
         return out
     t = cfg.text
-    for what, total in (("attention KV heads", t.num_kv_heads), ("attention heads", t.num_heads),
-                        ("Gated DeltaNet value heads", t.gdn_v_heads), ("Gated DeltaNet key heads", t.gdn_k_heads),
-                        ("vocabulary rows", t.vocab_size), ("MLP columns", t.intermediate_size)):
-        if total % tp:
-            errors.append(f"{total} {what} do not split over {tp} GPUs")
-    if cfg.vision is not None and (cfg.vision.num_heads % tp or cfg.vision.intermediate_size % tp):
-        errors.append(f"the vision tower does not split over {tp} GPUs")
     drafter = None
     if s.draft_model:
         try:
             drafter = memory.DrafterShape.from_checkpoint(s.draft_model)
-            if drafter.kv_heads % tp:
-                errors.append(f"the drafter's {drafter.kv_heads} KV heads do not split over {tp} GPUs")
         except (OSError, ValueError, KeyError) as e:
             errors.append(f"the drafter cannot be read: {e}")
+    errors.extend(memory.split_problems(cfg, tp, drafter))
     if s.kv_cache_dtype not in memory.KV_DTYPES:
         errors.append(f"KV cache format must be one of {', '.join(memory.KV_DTYPES)}")
     max_len = s.max_model_len or t.max_position_embeddings
