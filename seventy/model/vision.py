@@ -29,16 +29,17 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from ..checkpoint import Checkpoint
 from ..config import VisionConfig
 from ..parallel import SINGLE, Parallel
+from ..upload import to_device
 
 _EPS = 1e-6
 
 
 def _f16(t: torch.Tensor, device) -> torch.Tensor:
-    return t.to(torch.float16).to(device).contiguous()
+    return to_device(t.to(torch.float16), device)
 
 
 def _f32(t: torch.Tensor, device) -> torch.Tensor:
-    return t.float().to(device).contiguous()
+    return to_device(t.float(), device)
 
 
 def block_major(t: torch.Tensor, h: int, w: int, merge: int) -> torch.Tensor:

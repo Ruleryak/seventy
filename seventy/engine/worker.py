@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 
 from ..checkpoint import Checkpoint
+from .. import upload
 from ..config import load_config
 from ..model.qwen3_5 import Qwen35TextModel
 from ..parallel import Parallel
@@ -77,6 +78,7 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
             from ..model.dflash2 import Drafter
 
             drafter = Drafter(draft_path, model, device, dtype, par=model.par)
+        upload.release()
         budget = (distributed.memory_budget(device, utilization, reserve_bytes) if device.type == "cuda"
                   else (1 << 40, 1 << 40))
         conn.send(("ready", budget))

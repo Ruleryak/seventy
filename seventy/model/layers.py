@@ -11,6 +11,7 @@ from .. import nvfp4, ops
 from ..checkpoint import Checkpoint
 from ..nvfp4 import GemmWeight, Nvfp4Weight
 from ..ops import kernels
+from ..upload import to_device
 
 SMALL_BATCH = 64
 
@@ -56,7 +57,7 @@ class Linear:
                 else:
                     pieces.append(ckpt.dense_part(f"{s.module}.weight", rows=r, cols=cols))
         if pieces:
-            self.dense = _to_dtype(torch.cat(pieces), dtype).to(device)
+            self.dense = to_device(_to_dtype(torch.cat(pieces), dtype), device)
         elif keep_dense:
             self.dense = self._dequantize()
             self.parts = []

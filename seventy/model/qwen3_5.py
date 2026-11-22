@@ -23,6 +23,7 @@ from ..engine.spec import merge_top
 from ..engine.step import StepInput
 from ..ops import gdn_prefill, kernels
 from ..parallel import SINGLE, Parallel
+from ..upload import to_device
 
 RECURRENT_MAX_TOKENS = 32
 GDN_COMMIT_LAYERS = os.environ.get("SEVENTY_GDN_COMMIT", "layers") != "loop"
@@ -210,7 +211,7 @@ class Qwen35TextModel:
         p = ckpt.text_prefix
         v0, v1 = par.span(t.vocab_size)
         self.vocab_span = (v0, v1)
-        self.embed = _to_dtype(ckpt.rows(f"{p}embed_tokens.weight", v0, v1), dtype).to(device)
+        self.embed = to_device(_to_dtype(ckpt.rows(f"{p}embed_tokens.weight", v0, v1), dtype), device)
         count = t.num_layers if layers is None else layers
         self.layers = [Layer(t, ckpt, i, par, dtype, device, keep_dense) for i in range(count)]
         half = t.rotary_dim // 2
@@ -232,7 +233,7 @@ class Qwen35TextModel:
             self.gdn_params = tuple(stacked)
         self.final_norm = _norm_weight(ckpt, f"{p}norm.weight", device, 1.0)
         head = "lm_head.weight" if not t.tie_word_embeddings else f"{p}embed_tokens.weight"
-        self.lm_head = _to_dtype(ckpt.rows(head, v0, v1), dtype).to(device)
+        self.lm_head = to_device(_to_dtype(ckpt.rows(head, v0, v1), dtype), device)
         self.lm_head_packed = None
         if self.device.type == "cuda" and dtype == torch.float16:
             from ..ops.kernels import DenseWeight

@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .upload import to_device
+
 GROUP = 16
 E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
@@ -37,7 +39,7 @@ class Nvfp4Weight:
         return self.packed.shape[0], 2 * self.packed.shape[1]
 
     def to(self, device) -> "Nvfp4Weight":
-        return Nvfp4Weight(self.packed.to(device), self.scales.to(device), self.global_scale)
+        return Nvfp4Weight(to_device(self.packed, device), to_device(self.scales, device), self.global_scale)
 
     def rows(self, start: int, stop: int) -> "Nvfp4Weight":
         return Nvfp4Weight(self.packed[start:stop].contiguous(), self.scales[start:stop].contiguous(), self.global_scale)

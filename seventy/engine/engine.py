@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 import torch.multiprocessing as mp
 
-from .. import memory
+from .. import memory, upload
 from ..config import load_config
 from ..parallel import Parallel
 from . import distributed
@@ -150,6 +150,7 @@ class Engine:
             self.drafter = Drafter(config.draft_model, self.model, self.device, torch.float16, par=self.model.par)
         torch.cuda.synchronize()
         drafter_bytes = torch.cuda.memory_allocated(self.device) - weights
+        upload.release()
         budgets = [distributed.memory_budget(self.device, config.gpu_memory_utilization, reserve)]
         for conn, proc in zip(peers, self.workers):
             budgets.append(tuple(_expect(conn, "ready", proc)))

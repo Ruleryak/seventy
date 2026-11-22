@@ -51,6 +51,7 @@ from .. import ops
 from ..checkpoint import Checkpoint
 from ..ops import reference as R
 from ..parallel import SINGLE, Parallel
+from ..upload import to_device
 from .layers import _to_dtype
 
 
@@ -112,7 +113,7 @@ class DraftLayer:
         self.heads, self.kv = h1 - h0, k1 - k0
 
         def w(name, rows=None, cols=None):
-            return _to_dtype(ckpt.dense_part(f"{p}.{name}.weight", rows=rows, cols=cols), dtype).to(device)
+            return to_device(_to_dtype(ckpt.dense_part(f"{p}.{name}.weight", rows=rows, cols=cols), dtype), device)
 
         self.q = w("self_attn.q_proj", rows=(h0 * d, h1 * d))
         self.kv_w = torch.cat((w("self_attn.k_proj", rows=(k0 * d, k1 * d)), w("self_attn.v_proj", rows=(k0 * d, k1 * d))))
@@ -126,7 +127,7 @@ class DraftLayer:
         self.conv = {}
         for side in ("attention_conv", "mlp_conv"):
             self.conv[side] = (ckpt.tensor(f"{p}.{side}.base_kernel").float().to(device),
-                               _to_dtype(ckpt.tensor(f"{p}.{side}.kernel_projection.weight"), dtype).to(device))
+                               to_device(_to_dtype(ckpt.tensor(f"{p}.{side}.kernel_projection.weight"), dtype), device))
 
 
 class Drafter:
@@ -142,14 +143,15 @@ class Drafter:
             if par.size == 1 or (f1 - f0) % 64 or os.environ.get("SEVENTY_DRAFTER_FC_SPLIT", "1") == "0":
                 f0, f1 = 0, fc.shape[1]
             self.fc_cols = (f0, f1)
-            self.fc = _to_dtype(fc[:, f0:f1].contiguous(), dtype).to(device)
+            self.fc = to_device(_to_dtype(fc[:, f0:f1].contiguous(), dtype), device)
             del fc
             self.hidden_norm = ckpt.tensor("hidden_norm.weight").float().to(device)
             self.norm = ckpt.tensor("norm.weight").float().to(device)
             self.layers = [DraftLayer(cfg, ckpt, i, par, dtype, device) for i in range(cfg.layers)]
-            self.sel_hidden = _to_dtype(ckpt.tensor("candidate_selector.hidden_projection.weight"), dtype).to(device)
-            self.pred = _to_dtype(ckpt.tensor("candidate_selector.predecessor_codebook"), dtype).to(device)
-            self.succ = _to_dtype(ckpt.tensor("candidate_selector.successor_codebook"), dtype).to(device)
+            self.sel_hidden = to_device(_to_dtype(ckpt.tensor("candidate_selector.hidden_projection.weight"), dtype),
+                                        device)
+            self.pred = to_device(_to_dtype(ckpt.tensor("candidate_selector.predecessor_codebook"), dtype), device)
+            self.succ = to_device(_to_dtype(ckpt.tensor("candidate_selector.successor_codebook"), dtype), device)
         self.kv_all = torch.cat([layer.kv_w for layer in self.layers])
         self.cand_head = None
         self.fused = (self.device.type == "cuda" and dtype == torch.float16 and cfg.head_dim == 128
