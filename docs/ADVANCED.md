@@ -10,7 +10,7 @@ network access, and the panel as a service.
 - 1, 2 or 4 NVIDIA V100 GPUs (16 GB or 32 GB). With more than one GPU, NVLink between the GPUs is recommended. Without NVLink or PCIe peer-to-peer access, tensor parallel uses NCCL for every all-reduce, which is slower. `seventy info` shows the peer access. GPUs with different memory sizes can work together. Each GPU then gets the KV cache size of the smallest GPU. GPUs other than the V100 are not supported: the engine and the panel stop with an error.
 - A working NVIDIA driver. `nvidia-smi` must be able to list the GPUs. Tested with driver 580.178.04 (branch 580, the last branch for Volta). The CUDA 12.9 libraries need driver 525.60.13 or later; drivers before branch 580 are not tested.
 - Enough GPU memory for your model and settings. The panel calculates a memory plan before startup.
-- Internet access for installation and model downloads, and enough disk space for the downloaded files: approximately 20 GB for the NVFP4 27B model and 4 GB for its DFlash2 drafter.
+- Internet access for the installation and the model downloads, and enough disk space: approximately 8 GB for the seventy environment (PyTorch and the CUDA libraries), up to 8 GB more for the download cache of uv or pip, 20 GB for the NVFP4 27B model, and 4 GB for its DFlash2 drafter.
 - Bash and curl for the commands below. systemd is needed only for the service instructions.
 
 The uv installation method obtains Python 3.12 if necessary. The pip alternative requires an existing Python 3.12 installation with `venv` support.
@@ -152,8 +152,8 @@ The panel shows it in its memory plan.
 
 On one GPU, the stream states use a large part of the memory. Each stream needs about 147 MiB on one GPU
 (73 MiB on each of 2 GPUs, 37 MiB on each of 4 GPUs). With the prefix cache, each stream needs four times that.
-On one Tesla V100-SXM2-32GB, the KV cache holds 58,736 tokens with the default settings, and 188,256 tokens
-with one stream.
+On one 32 GB V100, the KV cache holds about 60,000 tokens with the default settings, and about 190,000 tokens
+with one stream. The numbers change a little with the driver and with other programs on the GPU.
 
 To start on one 32 GB GPU with one stream:
 

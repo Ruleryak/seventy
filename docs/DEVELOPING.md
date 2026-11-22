@@ -117,6 +117,9 @@ On 4 V100 GPUs with peer-to-peer access, all tests pass. Without peer-to-peer ac
 `tests/test_tensor_parallel_gpu.py` tests the NCCL all-reduce that it uses. With fewer than 2 GPUs, the tests
 for 2 or more GPUs skip.
 
+The tests in `tests/test_model_reference.py` need about 50 GB of free host memory, and skip with less. The other
+tests need about 16 GB.
+
 ## Run from the source tree
 
 - The control panel, for this machine only (open http://127.0.0.1:8270/):
