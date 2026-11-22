@@ -131,7 +131,7 @@ def cmd_engine(args: argparse.Namespace) -> int:
         max_model_len=min(args.max_model_len or cfg.text.max_position_embeddings, cfg.text.max_position_embeddings),
         gpu_memory_utilization=args.gpu_memory_utilization, prefill_budget=args.prefill_budget,
         kv_dtype=args.kv_cache_dtype, tensor_parallel=tp, cuda_graphs=not args.no_cuda_graphs,
-        draft_model=draft_model, prefix_cache=not args.no_prefix_cache,
+        draft_model=draft_model, prefix_cache=not args.no_prefix_cache, cache_entries=args.cache_entries,
     )
     server = ServerConfig(
         engine=engine, served_model_name=args.served_model_name or served_name(args.model, model),
@@ -179,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
     eng.add_argument("--kv-cache-dtype", choices=("int8", "fp16"), default="int8")
     eng.add_argument("--no-cuda-graphs", action="store_true")
     eng.add_argument("--no-prefix-cache", action="store_true")
+    eng.add_argument("--cache-entries", type=int, default=0,
+                     help="prefix-cache entries (state slots) besides the running streams (default: three per stream)")
     eng.add_argument("--default-chat-template-kwargs", help='JSON, for example {"enable_thinking": false}')
     eng.add_argument("--max-tokens-default", type=int)
     eng.add_argument("--max-image-pixels", type=int,

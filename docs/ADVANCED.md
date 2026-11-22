@@ -135,6 +135,7 @@ line. To see all options:
 | `--max-model-len` | the model's limit (262,144 tokens) | The maximum length of one request: the prompt and the output together. |
 | `--gpu-memory-utilization` | `0.90` | The part of each GPU's memory that seventy can use. The KV cache gets the memory that remains after the weights, the stream states, and 3 GiB for activations. |
 | `--kv-cache-dtype` | `int8` | With `fp16`, the KV cache is in FP16. Each token then needs two times the memory. |
+| `--cache-entries` | three per stream | The number of earlier prompts and replies that the prefix cache keeps, besides the running requests. Each one keeps a state in GPU memory, like a stream. More entries help many clients that come back to their conversations. |
 | `--no-prefix-cache` | the prefix cache is on | Stops the reuse of earlier prompt text, for example a system prompt or the earlier turns of a chat. This releases the 3 extra states for each stream, but the engine must read repeated prompt text again. |
 | `--prefill-budget` | `8192` | The number of prompt tokens in one engine step. A smaller value needs less activation memory, but the engine reads long prompts more slowly. |
 | `--no-cuda-graphs` | CUDA graphs are on | Runs without CUDA graphs. Decoding is slower. Use it only to find a problem. |
