@@ -1,10 +1,11 @@
 """CUDA graphs of whole speculative decoding steps, one per batch bucket B.
 
-One replay runs: the target's verify step over [anchor, d1 .. d7] for B sequences, acceptance on the device
-(seventy.engine.spec.device_accept_top on each rank's vocabulary top k, cut at stop tokens and token limits), the Gated DeltaNet commit of the
-accepted rows, the drafter context of all
-eight rows (rows past the accepted ones are overwritten by the next block before anything reads them), and the
-next draft from the new anchor. The host reads back the accepted counts, new tokens and next drafts once.
+One replay runs: the target's verify step over [anchor, d1 .. d(V-1)] for B sequences (V rows: the whole drafter
+block, or fewer when B is large, see verify_rows), acceptance on the device (seventy.engine.spec.device_accept_top on
+each rank's vocabulary top k, cut at stop tokens and token limits), the Gated DeltaNet commit of the accepted rows,
+the drafter context of all V rows (rows past the accepted ones are overwritten by the next block before anything
+reads them), and the next draft (a whole block) from the new anchor. The host reads back the accepted counts, new
+tokens and next drafts once.
 
 Every rank replays the same graph on the same inputs, which come from the host (including the random numbers
 drawn from each request's generator), so all ranks compute the same acceptance without extra communication.
@@ -28,6 +29,26 @@ from .spec import KMAX, STOP_SLOTS, cut_at_stops, device_accept_top
 from .step import StepInput
 
 
+ROW_BUDGET = 32
+MIN_ROWS = 4
+
+
+def verify_rows(batch: int, block: int, budget: int | None = None) -> int:
+    """Rows that a speculative step verifies for each of batch sequences: the anchor and the first drafts of the
+    drafter's block. Up to budget rows in total (default ROW_BUDGET, SEVENTY_SPEC_ROW_BUDGET; 0: always the whole
+    block), each sequence gets the whole block; above it, budget // batch rows, but at least MIN_ROWS.
+
+    The verify GEMMs of a step cost about as much as the rows they compute, while the drafts late in a block are
+    seldom accepted. Greedy probes of DFlash2 (block 8) on 4 V100s, 2K to 100K tokens of context, gave the most
+    tokens per second at 8 rows for 1 and 2 streams, about the same from 5 to 8 rows for 4 streams, 5 rows for 6
+    streams (+13 % to +19 %) and 4 rows for 8 streams (+15 % to +22 %): about 32 rows per step."""
+    if budget is None:
+        budget = int(os.environ.get("SEVENTY_SPEC_ROW_BUDGET", ROW_BUDGET))
+    if budget <= 0:
+        return block
+    return min(block, max(MIN_ROWS, budget // batch))
+
+
 class SpecGraphs:
     def __init__(self, model, drafter, cache: ModelCache, device: torch.device, max_blocks_per_seq: int,
                  buckets: tuple[int, ...]):
@@ -38,6 +59,7 @@ class SpecGraphs:
         self.layers = drafter.cfg.target_layers
         self.mtp = hasattr(drafter, "after_verify")
         self.buckets = tuple(sorted(buckets))
+        self.rows = {b: self.block if self.mtp else verify_rows(b, self.block) for b in self.buckets}
         self.graphs: dict[int, tuple] = {}
         self.packed: dict[int, tuple] = {}
         self.sent: dict[int, tuple] = {}
@@ -49,15 +71,16 @@ class SpecGraphs:
 
     def _fields(self, b: int) -> list[tuple[str, tuple[int, ...], torch.dtype, float]]:
         """(name, shape, dtype, padding value) of the packed inputs of bucket b."""
-        k, c = self.block - 1, self.top
+        v, c = self.rows[b], self.top
+        k = v - 1
         return [
-            ("tokens", (b, self.block), torch.long, 0), ("starts", (b,), torch.long, 0), ("delta", (b,), torch.long, 0),
+            ("tokens", (b, v), torch.long, 0), ("starts", (b,), torch.long, 0), ("delta", (b,), torch.long, 0),
             ("slots", (b,), torch.long, self.cache.scratch_slot), ("temp", (b,), torch.float32, 0.0),
             ("top_k", (b,), torch.long, 1), ("top_p", (b,), torch.float32, 1.0), ("min_p", (b,), torch.float32, 0.0),
             ("q", (b, k, c), torch.float32, 0.0), ("cand", (b, k, c), torch.long, 0),
             ("u_accept", (b, k), torch.float32, 0.0), ("u_residual", (b, k + 1), torch.float32, 0.0),
-            ("gumbel", (b, k, c), torch.float32, 0.0), ("stop", (b, STOP_SLOTS), torch.long, -1),
-            ("limit", (b,), torch.long, self.block),
+            ("gumbel", (b, self.block - 1, c), torch.float32, 0.0), ("stop", (b, STOP_SLOTS), torch.long, -1),
+            ("limit", (b,), torch.long, v),
         ]
 
     def _inputs(self, b: int) -> dict[str, torch.Tensor]:
@@ -81,7 +104,7 @@ class SpecGraphs:
         return x
 
     def _body(self, b: int, x: dict[str, torch.Tensor]):
-        blk, bs, dev = self.block, self.cache.block_size, self.device
+        blk, bs, dev = self.rows[b], self.cache.block_size, self.device
         offs = torch.arange(blk, device=dev)
         pos = x["starts"][:, None] + offs
         kv = x["tables"].gather(1, (pos // bs).int().long()).long() * bs + pos % bs
@@ -116,10 +139,11 @@ class SpecGraphs:
         self.drafter.write_context(feats, pos.reshape(-1), x["slots"].repeat_interleave(blk))
         rows = torch.arange(b, device=dev)
         anchors = new[rows, n]
-        h = self.drafter.hidden(anchors, x["starts"] + n + 1, x["slots"]).view(b, blk, -1)[:, 1:]
-        h = h.reshape(b * (blk - 1), -1)
+        db = self.block
+        h = self.drafter.hidden(anchors, x["starts"] + n + 1, x["slots"]).view(b, db, -1)[:, 1:]
+        h = h.reshape(b * (db - 1), -1)
         values, ids = self.drafter._candidates(h)
-        d = self.drafter.walk(anchors, values.view(b, blk - 1, -1), ids.view(b, blk - 1, -1), h, x["temp"],
+        d = self.drafter.walk(anchors, values.view(b, db - 1, -1), ids.view(b, db - 1, -1), h, x["temp"],
                               x["gumbel"])
         return {"n": n, "new": new, "drafts": d.tokens, "probs": d.probs, "cand": d.candidates}
 
@@ -149,8 +173,9 @@ class SpecGraphs:
         _, host_buf, views, defaults = self.packed[b]
         flat = host_buf.numpy()
         flat[:] = defaults
+        v = self.rows[b]
         for i, r in enumerate(rows):
-            views["tokens"][i] = r["tokens"]
+            views["tokens"][i] = r["tokens"][:v]
             views["starts"][i] = r["start"]
             views["delta"][i] = r.get("delta", 0)
             views["slots"][i] = r["slot"]
@@ -160,11 +185,12 @@ class SpecGraphs:
             views["min_p"][i] = r["min_p"]
             stops = r.get("stop", ())
             views["stop"][i, : len(stops)] = stops
-            views["limit"][i] = r.get("limit", self.block)
+            views["limit"][i] = min(r.get("limit", v), v)
             for key in ("q", "cand", "u_accept", "u_residual", "gumbel"):
-                v = r.get(key)
-                if v is not None:
-                    views[key][i] = v.numpy() if isinstance(v, torch.Tensor) else v
+                val = r.get(key)
+                if val is not None:
+                    val = val.numpy() if isinstance(val, torch.Tensor) else np.asarray(val)
+                    views[key][i] = val[: views[key].shape[1]]
         return b, len(rows), flat.tobytes(), self._table_updates(rows)
 
     def _table_updates(self, rows: list[dict]) -> list[tuple]:

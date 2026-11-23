@@ -203,6 +203,7 @@ engine or for the tests. Without the variable, the default path runs.
 | `SEVENTY_DRAFTER_WALK` | `torch` | Drafter selector walk in PyTorch |
 | `SEVENTY_SPEC_ACCEPT` | `torch` | Speculative acceptance in PyTorch |
 | `SEVENTY_SPEC_BUCKETS` | `pow2` | Graphs of speculative steps only for 1, 2, 4 and 8 sequences (a batch of 5 to 7 sequences replays the graph of 8) |
+| `SEVENTY_SPEC_ROW_BUDGET` | a number of rows | Rows of a speculative step before each sequence verifies fewer drafts (default 32; `0`: every sequence verifies the whole drafter block) |
 
 For example, to run the engine with the earlier prefill attention:
 

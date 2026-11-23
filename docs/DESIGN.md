@@ -32,6 +32,10 @@ added as new model modules. The engine core does not assume one architecture.
   tested with.
 - No Triton, no TileLang, no `torch.compile`. Decode and verify steps run as CUDA graphs. This removes compile
   caches and the minutes they add to a cold start.
+- A speculative step has a CUDA graph for each batch size up to 8 sequences (64 rows). Each sequence verifies the
+  whole drafter block until the step has 32 rows. With more sequences, each sequence verifies fewer drafts (32 rows
+  divided by the sequences, at least 4 rows), because the verify GEMMs cost about as much as the rows they compute
+  and late drafts are seldom accepted.
 - PyTorch provides tensors, the caching allocator, cuBLAS (dense FP16 GEMMs), NCCL (`torch.distributed`), and
   CUDA graphs.
 

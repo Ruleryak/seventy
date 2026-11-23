@@ -413,7 +413,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         m("prefix_cache_hit_tokens_total", "counter", s.get("cache_hit_tokens", 0),
           "Prompt tokens reused from the prefix cache (not computed).")
         m("spec_verify_steps_total", "counter", s.get("verify_steps", 0), "Speculative verify rows (one per sequence).")
-        m("spec_draft_tokens_total", "counter", s.get("drafted_tokens", 0), "Draft tokens proposed.")
+        m("spec_draft_tokens_total", "counter", s.get("drafted_tokens", 0), "Draft tokens proposed for verification.")
         m("spec_accepted_tokens_total", "counter", s.get("accepted_tokens", 0), "Draft tokens accepted.")
         at = s.get("accepted_at") or []
         if at:

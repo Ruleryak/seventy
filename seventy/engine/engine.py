@@ -526,7 +526,9 @@ class Engine:
                         break
                 if reason:
                     self.scheduler.finish(r, reason)
-            self.stats["drafted_tokens"] += sum(len(d) for d in drafts)
+            g = self.runner.spec_graphs
+            unverified = self.drafter.cfg.block - g.rows[g.bucket(len(work))]
+            self.stats["drafted_tokens"] += sum(len(d) for d in drafts) - len(work) * unverified
             return
         logits = self.runner.verify(work)
         lens, rows, positions, slots, results, row = [], [], [], [], [], 0
