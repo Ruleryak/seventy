@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from ..config import UnsupportedModel, has_mtp, kernel_problems, parse_config
-from ..memory import checkpoint_bytes, plan, prefix_entries, split_problems
+from ..memory import checkpoint_bytes, plan, prefix_entries, split_problems, tied_head_bytes
 
 
 def hub_cache() -> Path:
@@ -45,8 +45,8 @@ MTP_TENSORS = ("mtp.fc.weight", "mtp.layers.0.mlp.down_proj.weight")
 
 def fits(cfg, size: int, gpu_bytes: int, gpu_count: int) -> list[int]:
     """The GPU counts of this machine (up to gpu_count GPUs of gpu_bytes, as NVML reports) whose memory holds the
-    weights (size bytes, no drafter) and a KV cache of at least 1024 tokens with the default settings: the memory model
-    and the guesses of the panel's plan before a first start."""
+    weights (size bytes, no drafter, plus the head copy of tied embeddings) and a KV cache of at least 1024 tokens
+    with the default settings: the memory model and the guesses of the panel's plan before a first start."""
     from .planner import CUDA_HIDDEN, OVERHEAD_GUESS, OVERHEAD_GUESS_TP, RESERVE
 
     out = []
@@ -54,7 +54,8 @@ def fits(cfg, size: int, gpu_bytes: int, gpu_count: int) -> list[int]:
         if n > gpu_count or split_problems(cfg, n):
             continue
         slots = 8 + prefix_entries(8, True)
-        p = plan(cfg, gpu_bytes - CUDA_HIDDEN, size // n + OVERHEAD_GUESS.get(n, OVERHEAD_GUESS_TP), n, slots, 16,
+        used = size // n + tied_head_bytes(cfg, n) + OVERHEAD_GUESS.get(n, OVERHEAD_GUESS_TP)
+        p = plan(cfg, gpu_bytes - CUDA_HIDDEN, used, n, slots, 16,
                  "int8", 0.9, RESERVE, None, cfg.text.max_position_embeddings)
         if p.blocks * 16 >= 1024:
             out.append(n)

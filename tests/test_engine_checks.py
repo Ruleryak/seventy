@@ -1,5 +1,6 @@
-"""The checks of `seventy engine` before it downloads or loads a model: the GPUs (from NVML) and the split of the
-model over the GPUs; the engine's own check of the GPUs; and the CPU threads of each engine process."""
+"""The checks of `seventy engine` before it downloads or loads a model: the GPUs (from NVML), the split of the
+model over the GPUs, and the memory of the weights (with the head copy of tied embeddings); the engine's own check of
+the GPUs; the message when the KV cache does not fit; and the CPU threads of each engine process."""
 
 import os
 from types import SimpleNamespace
@@ -112,3 +113,44 @@ def test_share_cpus_splits_the_cpus_and_keeps_omp_num_threads(monkeypatch):
         assert torch.get_num_threads() == 5
     finally:
         torch.set_num_threads(before)
+
+
+def tiny_config(tied: bool, vocab: int = 1 << 20):
+    """A small Qwen3.5 text config (hidden 1024) with a large vocabulary, with or without tied embeddings."""
+    from seventy.config import parse_config
+
+    t = {"model_type": "qwen3_5_text", "attn_output_gate": True, "head_dim": 256, "hidden_act": "silu",
+         "hidden_size": 1024, "intermediate_size": 4096, "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+         "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128, "linear_num_key_heads": 4,
+         "linear_num_value_heads": 8, "linear_value_head_dim": 128, "max_position_embeddings": 262144,
+         "num_attention_heads": 8, "num_hidden_layers": 4, "num_key_value_heads": 4, "rms_norm_eps": 1e-6,
+         "rope_parameters": {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25,
+                             "mrope_section": [11, 11, 10], "mrope_interleaved": True},
+         "vocab_size": vocab, "dtype": "bfloat16", "tie_word_embeddings": tied}
+    return parse_config({"architectures": ["Qwen3_5ForCausalLM"], "text_config": t})
+
+
+def test_tied_embeddings_add_the_head_copy():
+    assert memory.tied_head_bytes(tiny_config(True), 1) == (1 << 20) * 1024 * 2
+    assert memory.tied_head_bytes(tiny_config(True), 4) == (1 << 20) * 1024 * 2 // 4
+    assert memory.tied_head_bytes(tiny_config(False), 1) == 0
+
+
+def test_weights_check_counts_the_head_copy_of_tied_embeddings(monkeypatch):
+    from seventy.engine import engine
+
+    monkeypatch.setattr(memory, "checkpoint_bytes", lambda path: 15 << 30)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: SimpleNamespace(total_memory=16 << 30))
+    config = SimpleNamespace(model="m", draft_model=None)
+    engine._check_weights_fit(config, [0], tiny_config(False))
+    with pytest.raises(RuntimeError, match=r"the model needs about 17.0 GiB per GPU on 1 GPU\(s\)"):
+        engine._check_weights_fit(config, [0], tiny_config(True))
+
+
+def test_kv_shortage_names_the_numbers_and_the_options():
+    short = memory.kv_shortage(2 << 30, 3 << 30, 8, 24)
+    assert "2.0 GiB is left after the weights and the activation reserve" in short
+    assert "the state of 8 streams and 24 prefix-cache entries takes 3.0 GiB" in short
+    assert "--max-num-seqs" in short and "--no-prefix-cache" in short and "--gpus" in short
+    over = memory.kv_shortage(-(1 << 29), 1 << 30, 8, 24)
+    assert "take 0.5 GiB more than the budget of the smallest GPU" in over and "--max-num-seqs" in over

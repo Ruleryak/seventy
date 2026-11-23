@@ -103,6 +103,21 @@ The 27B model does not fit on one 16 GB GPU. With 16 GB GPUs, use four GPUs. Two
   --gpu-memory-utilization 0.97 --prefill-budget 2048
 ```
 
+One 16 GB GPU can run a smaller model, for example `Qwen/Qwen3.5-4B` (BF16), with 2 streams. The KV cache then holds
+about 41,000 tokens:
+
+```bash
+~/seventy-env/bin/seventy engine \
+  --model Qwen/Qwen3.5-4B \
+  --gpus 0 \
+  --max-num-seqs 2
+```
+
+With the default of 8 streams, the state of the streams and of their prefix-cache entries leaves no memory for the
+KV cache on one 16 GB GPU, and the engine stops with a message that names these options. The MTP drafter also takes
+KV cache memory: `Qwen/Qwen3.5-9B` on two 16 GB GPUs holds about 140,000 tokens without a drafter and about 45,000
+with `--draft-model mtp`.
+
 Start on four GPUs with a drafter:
 
 ```bash

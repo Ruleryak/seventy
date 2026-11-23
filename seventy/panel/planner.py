@@ -98,7 +98,7 @@ def plan(s: Settings, inv: Inventory, profiles: Profiles | None = None) -> dict:
     else:
         measured = None
         gpu_bytes = nvml_bytes - CUDA_HIDDEN
-        weights = memory.checkpoint_bytes(s.model) // tp
+        weights = memory.checkpoint_bytes(s.model) // tp + memory.tied_head_bytes(cfg, tp)
         if s.draft_model and not mtp:
             weights += memory.checkpoint_bytes(s.draft_model) // tp
         overhead = OVERHEAD_GUESS.get(tp, OVERHEAD_GUESS_TP)
@@ -122,7 +122,8 @@ def plan(s: Settings, inv: Inventory, profiles: Profiles | None = None) -> dict:
         "nvlink_full": nvlink_full(inv, s.gpus) if tp > 1 else None,
     })
     if not out["ok"]:
-        errors.append("the GPUs have no room left for a KV cache with these settings")
+        errors.append("the GPUs have no room left for a KV cache with these settings; use fewer streams, no "
+                      "prefix cache, or more GPUs")
     elif p.kv_tokens < max_len:
         warnings.append(f"the KV cache holds {p.kv_tokens:,} tokens, less than one request at the maximum context "
                         f"({max_len:,}); long requests will wait or be cut")

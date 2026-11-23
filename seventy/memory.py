@@ -87,6 +87,29 @@ def checkpoint_bytes(path: str | Path) -> int:
     return sum(f.stat().st_size for f in Path(path).glob("*.safetensors"))
 
 
+def tied_head_bytes(cfg: ModelConfig, tp: int = 1) -> int:
+    """Bytes on one rank of the output head that the checkpoint files do not hold. With tied embeddings
+    (tie_word_embeddings), the files store the embedding once, and the engine keeps the head as its own FP16 copy of
+    the rank's vocab rows: about 1.2 GiB for a 2560-wide model with a 248K vocabulary on one GPU."""
+    t = cfg.text
+    return t.vocab_size * t.hidden_size * 2 // tp if t.tie_word_embeddings else 0
+
+
+def kv_shortage(free: int, state: int, streams: int, entries: int) -> str:
+    """Why the engine cannot start: free is what one rank has after the weights, the drafter, the other memory in
+    use and the activation reserve; state is what the state slots of the streams and the prefix-cache entries take
+    from it. The message names the options that free memory."""
+    gib = 2**30
+    if free <= 0:
+        why = (f"the weights and the activation reserve take {-free / gib:.1f} GiB more than the budget of the "
+               f"smallest GPU (--gpu-memory-utilization)")
+    else:
+        why = (f"{free / gib:.1f} GiB is left after the weights and the activation reserve, and the state of "
+               f"{streams} streams and {entries} prefix-cache entries takes {state / gib:.1f} GiB of it")
+    return (f"not enough GPU memory for the KV cache: {why}. Use fewer streams (--max-num-seqs), no prefix cache "
+            f"(--no-prefix-cache), or more GPUs (--gpus)")
+
+
 @dataclass(frozen=True)
 class Plan:
     """What one rank holds and how many KV tokens fit."""

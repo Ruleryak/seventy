@@ -97,13 +97,14 @@ def make_drafter(spec: str, model_path: str, model, device, dtype, par):
     return Drafter(spec, model, device, dtype, par=par)
 
 
-def _check_weights_fit(config: EngineConfig, devices: list[int]) -> None:
+def _check_weights_fit(config: EngineConfig, devices: list[int], cfg) -> None:
     """Stop before loading when the checkpoint files divided over the GPUs are larger than the smallest GPU: the
-    load would end in a CUDA out-of-memory error. The weights take about the size of the checkpoint files."""
+    load would end in a CUDA out-of-memory error. The weights take about the size of the checkpoint files, plus the
+    copy of the output head of a model with tied embeddings."""
     need = memory.checkpoint_bytes(config.model)
     if config.draft_model and config.draft_model != "mtp":
         need += memory.checkpoint_bytes(config.draft_model)
-    per_gpu = need // len(devices)
+    per_gpu = need // len(devices) + memory.tied_head_bytes(cfg, len(devices))
     total = min(torch.cuda.get_device_properties(i).total_memory for i in devices)
     if per_gpu > total:
         what = "the model and the drafter need" if config.draft_model and config.draft_model != "mtp" else "the model needs"
@@ -133,7 +134,7 @@ class Engine:
         if self.device.type == "cuda":
             devices = [self.device.index] if tp == 1 else list(range(tp))
             _check_gpus(devices)
-            _check_weights_fit(config, devices)
+            _check_weights_fit(config, devices, self.model_config)
         if self.device.type == "cuda" and tp > 1 and not distributed.peer_access(tp):
             print("seventy: not every pair of these GPUs has peer-to-peer access (NVLink or PCIe P2P); every "
                   "all-reduce uses NCCL, which is slower", flush=True)
@@ -186,7 +187,7 @@ class Engine:
         num_blocks = (budget_min - state) // per_block
         need = -(-config.max_model_len // config.block_size)
         if num_blocks < min(need, 64):
-            raise RuntimeError(f"not enough GPU memory for the KV cache ({num_blocks} blocks)")
+            raise RuntimeError(memory.kv_shortage(budget_min, state, slots, entries))
         num_blocks = min(num_blocks, need * total_slots)
         _stage("cache", f"{num_blocks * config.block_size} KV tokens on each GPU")
         for conn in peers:

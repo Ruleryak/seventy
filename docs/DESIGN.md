@@ -125,6 +125,8 @@ The planner and the engine use one memory model. Per GPU:
 
 `weights (shard) + workspace + CUDA graph pools + per-request state x requests + KV bytes per token x tokens`
 
+- Weights: the checkpoint files divided over the GPUs. With tied embeddings (`tie_word_embeddings`), the engine
+  also keeps its own FP16 copy of the output head (the rank's vocab rows), which the files do not hold.
 - Per-request state: Gated DeltaNet state and convolution state for each linear-attention layer, plus the
   drafter state. This is independent of context length.
 - KV bytes per token: for each full-attention layer, K and V for the local KV heads, plus scales. The MTP drafter

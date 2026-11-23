@@ -258,6 +258,10 @@ def test_classify_targets_and_drafters():
     big = models.classify(hub_config(), "r", "r", 60 << 30, True, gpu_bytes=32 << 30, gpu_count=4)
     two = models.classify(hub_config(), "r", "r", 60 << 30, True, gpu_bytes=32 << 30, gpu_count=2)
     assert (small.details["fits"], big.details["fits"], two.details["fits"]) == ([1, 2, 4], [4], [])
+    untied = models.classify(hub_config(vocab_size=1 << 20), "r", "r", 24 << 30, True, gpu_bytes=32 << 30, gpu_count=4)
+    tied = models.classify(hub_config(vocab_size=1 << 20, tie_word_embeddings=True), "r", "r", 24 << 30, True,
+                           gpu_bytes=32 << 30, gpu_count=4)
+    assert (untied.details["fits"], tied.details["fits"]) == ([1, 2, 4], [2, 4])
     drafter = models.classify({"architectures": ["DFlash2DraftModel"], "dflash_config": {"block_size": 8}}, "d", "d", 5, False)
     assert drafter.ok and drafter.kind == "drafter"
 
