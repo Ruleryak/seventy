@@ -4,6 +4,7 @@ A folder is a target model when seventy.config accepts its config.json, and a dr
 DFlash2DraftModel. A target's details tell whether it holds an MTP layer (the drafter option "mtp"). Folders come from
 the Hugging Face cache (models--*/snapshots/*) and from folders the user adds.
 Downloads use huggingface_hub with the endpoint from the panel settings or HF_ENDPOINT (default: the public Hub).
+check_remote applies the same checks to a Hub repository before its download, from config.json and the file list.
 """
 
 from __future__ import annotations
@@ -16,8 +17,8 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from ..config import UnsupportedModel, has_mtp, load_config
-from ..memory import checkpoint_bytes
+from ..config import UnsupportedModel, has_mtp, kernel_problems, parse_config
+from ..memory import checkpoint_bytes, plan, prefix_entries, split_problems
 
 
 def hub_cache() -> Path:
@@ -38,6 +39,59 @@ class ModelInfo:
     details: dict = field(default_factory=dict)
 
 
+GPU_COUNTS = (1, 2, 4, 8)
+MTP_TENSORS = ("mtp.fc.weight", "mtp.layers.0.mlp.down_proj.weight")
+
+
+def fits(cfg, size: int, gpu_bytes: int, gpu_count: int) -> list[int]:
+    """The GPU counts of this machine (up to gpu_count GPUs of gpu_bytes, as NVML reports) whose memory holds the
+    weights (size bytes, no drafter) and a KV cache of at least 1024 tokens with the default settings: the memory model
+    and the guesses of the panel's plan before a first start."""
+    from .planner import CUDA_HIDDEN, OVERHEAD_GUESS, OVERHEAD_GUESS_TP, RESERVE
+
+    out = []
+    for n in GPU_COUNTS:
+        if n > gpu_count or split_problems(cfg, n):
+            continue
+        slots = 8 + prefix_entries(8, True)
+        p = plan(cfg, gpu_bytes - CUDA_HIDDEN, size // n + OVERHEAD_GUESS.get(n, OVERHEAD_GUESS_TP), n, slots, 16,
+                 "int8", 0.9, RESERVE, None, cfg.text.max_position_embeddings)
+        if p.blocks * 16 >= 1024:
+            out.append(n)
+    return out
+
+
+def classify(raw: dict, where: str, name: str, size: int, tokenizer: bool, mtp: bool | None = None,
+             generation: dict | None = None, gpu_bytes: int = 0, gpu_count: int = 0) -> ModelInfo:
+    """Whether seventy can serve a checkpoint, from its config.json and facts about its files: the size of its
+    safetensors files, whether it has tokenizer.json, and whether it holds an MTP layer (None: not known). The same
+    rules for a folder on this machine and for a repository on the Hub before its download. With gpu_bytes and
+    gpu_count (the smallest GPU and the number of GPUs of this machine), details["fits"] lists the GPU counts whose
+    memory holds the weights."""
+    if "DFlash2DraftModel" in (raw.get("architectures") or []):
+        d = raw.get("dflash_config") or {}
+        return ModelInfo(where, name, "drafter", size > 0, size, [] if size else ["no safetensors files"],
+                         {"block_size": d.get("block_size"), "target_layers": d.get("target_layer_ids"),
+                          "layers": raw.get("num_hidden_layers")})
+    try:
+        cfg = parse_config(raw, generation=generation)
+    except UnsupportedModel as e:
+        return ModelInfo(where, name, "target", False, size, list(e.reasons))
+    reasons = kernel_problems(cfg)
+    if not size:
+        reasons.append("no safetensors files")
+    if not tokenizer:
+        reasons.append("no tokenizer.json")
+    t = cfg.text
+    return ModelInfo(where, name, "target", not reasons, size, reasons, {
+        "architecture": cfg.architecture, "layers": t.num_layers, "hidden": t.hidden_size,
+        "weights": cfg.quant.method, "vision": cfg.vision is not None,
+        "max_context": t.max_position_embeddings, "kv_heads": t.num_kv_heads, "mtp": mtp,
+        "gpu_counts": [n for n in GPU_COUNTS if not split_problems(cfg, n)],
+        "fits": fits(cfg, size, gpu_bytes, gpu_count) if gpu_bytes and size else None,
+    })
+
+
 def check(path: str | Path) -> ModelInfo:
     """What a folder holds and whether seventy can serve it (kind: target, drafter or unknown)."""
     p = Path(path)
@@ -47,29 +101,43 @@ def check(path: str | Path) -> ModelInfo:
         return ModelInfo(str(p), name, "unknown", False, 0, ["the folder has no config.json"])
     try:
         raw = json.loads(cfg_file.read_text())
+        gen_file = p / "generation_config.json"
+        generation = json.loads(gen_file.read_text()) if gen_file.is_file() else None
     except (OSError, ValueError) as e:
         return ModelInfo(str(p), name, "unknown", False, 0, [f"config.json cannot be read: {e}"])
-    size = checkpoint_bytes(p)
-    if "DFlash2DraftModel" in (raw.get("architectures") or []):
-        d = raw.get("dflash_config") or {}
-        return ModelInfo(str(p), name, "drafter", size > 0, size, [] if size else ["no safetensors files"],
-                         {"block_size": d.get("block_size"), "target_layers": d.get("target_layer_ids"),
-                          "layers": raw.get("num_hidden_layers")})
-    try:
-        cfg = load_config(p)
-    except UnsupportedModel as e:
-        return ModelInfo(str(p), name, "target", False, size, list(e.reasons))
-    reasons = []
-    if not size:
-        reasons.append("no safetensors files")
-    if not (p / "tokenizer.json").is_file():
-        reasons.append("no tokenizer.json")
-    t = cfg.text
-    return ModelInfo(str(p), name, "target", not reasons, size, reasons, {
-        "architecture": cfg.architecture, "layers": t.num_layers, "hidden": t.hidden_size,
-        "weights": cfg.quant.method, "vision": cfg.vision is not None,
-        "max_context": t.max_position_embeddings, "kv_heads": t.num_kv_heads, "mtp": has_mtp(p),
-    })
+    return classify(raw, str(p), name, checkpoint_bytes(p), (p / "tokenizer.json").is_file(), has_mtp(p), generation)
+
+
+def check_remote(repo: str, revision: str | None = None, endpoint: str | None = None,
+                 token: str | None = None, gpu_bytes: int = 0, gpu_count: int = 0) -> ModelInfo:
+    """Whether seventy can serve a Hub repository, before its download: the file list, config.json and, for the MTP
+    layer, model.safetensors.index.json or the header of a single model.safetensors. Nothing is written to the
+    Hugging Face cache."""
+    from huggingface_hub import HfApi, HfFileSystem
+
+    repo = repo.strip()
+    if repo.count("/") != 1 or any(c.isspace() for c in repo):
+        raise ValueError("a repository id looks like owner/name")
+    info = HfApi(endpoint=endpoint or None, token=token or None).model_info(repo, revision=revision,
+                                                                             files_metadata=True)
+    files = {s.rfilename: s.size or 0 for s in info.siblings or []}
+    size = sum(v for k, v in files.items() if k.endswith(".safetensors"))
+    if "config.json" not in files:
+        reasons = ["the repository has only GGUF files; seventy reads safetensors checkpoints"] \
+            if any(k.endswith(".gguf") for k in files) else ["the repository has no config.json"]
+        return ModelInfo(repo, repo, "unknown", False, size, reasons)
+    fs = HfFileSystem(endpoint=endpoint or None, token=token or None)
+    base = f"{repo}@{revision}" if revision else repo
+    raw = json.loads(fs.read_text(f"{base}/config.json"))
+    mtp = None
+    if "model.safetensors.index.json" in files:
+        names = json.loads(fs.read_text(f"{base}/model.safetensors.index.json")).get("weight_map", {})
+        mtp = all(n in names for n in MTP_TENSORS)
+    elif "model.safetensors" in files:
+        with fs.open(f"{base}/model.safetensors", "rb", block_size=0) as f:
+            n = int.from_bytes(f.read(8), "little")
+            mtp = all(t in json.loads(f.read(n)) for t in MTP_TENSORS) if 0 < n < 1 << 28 else None
+    return classify(raw, repo, repo, size, "tokenizer.json" in files, mtp, gpu_bytes=gpu_bytes, gpu_count=gpu_count)
 
 
 def _name(p: Path) -> str:

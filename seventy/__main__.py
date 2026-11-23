@@ -52,13 +52,16 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 
 def cmd_check_model(args: argparse.Namespace) -> int:
-    from .config import UnsupportedModel, load_config
+    from .config import UnsupportedModel, kernel_problems, load_config
 
     try:
         cfg = load_config(args.path)
+        reasons = kernel_problems(cfg)
     except UnsupportedModel as e:
+        reasons = e.reasons
+    if reasons:
         print("seventy cannot serve this model:")
-        for reason in e.reasons:
+        for reason in reasons:
             print(f"  - {reason}")
         return 1
     t = cfg.text
@@ -101,7 +104,7 @@ def cmd_engine(args: argparse.Namespace) -> int:
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     from . import memory
     from .api.server import ServerConfig, run
-    from .config import UnsupportedModel, has_mtp, load_config
+    from .config import UnsupportedModel, has_mtp, kernel_problems, load_config
     from .engine.engine import EngineConfig
     from .hub import ModelNotFound, resolve, served_name
 
@@ -119,8 +122,11 @@ def cmd_engine(args: argparse.Namespace) -> int:
         return 1
     try:
         cfg = load_config(model)
+        reasons = kernel_problems(cfg)
     except UnsupportedModel as e:
-        print("seventy cannot serve this model:\n" + "\n".join(f"  - {r}" for r in e.reasons))
+        reasons = e.reasons
+    if reasons:
+        print("seventy cannot serve this model:\n" + "\n".join(f"  - {r}" for r in reasons))
         return 1
     if draft_model == "mtp":
         if not has_mtp(model):

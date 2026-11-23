@@ -76,6 +76,7 @@ label.check { flex-direction: row; align-items: center; gap: 8px; }
 label.check input { width: auto; }
 label.wide { grid-column: 1 / -1; }
 label[hidden] { display: none; }
+#m-check[hidden] { display: none; }
 
 .top {
   display: flex; align-items: center; gap: 16px; padding: 10px 20px;

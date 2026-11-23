@@ -10,6 +10,8 @@ from pathlib import Path
 ARCHITECTURES = ("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
 TEXT_MODEL_TYPES = ("qwen3_5_text", "qwen3_5")
 LAYER_TYPES = ("linear_attention", "full_attention")
+ATTENTION_HEAD_DIM = 256
+GDN_HEAD_DIM = 128
 
 
 class UnsupportedModel(ValueError):
@@ -120,7 +122,8 @@ def parse_config(raw: dict, path: Path | None = None, generation: dict | None = 
     vision = None
     if architecture == "Qwen3_5ForConditionalGeneration" and not raw.get("language_model_only", False):
         vision = _parse_vision(raw.get("vision_config"), reasons)
-    quant = _parse_quant(raw.get("quantization_config"), raw.get("dtype") or raw.get("torch_dtype"), reasons)
+    dtype = raw.get("dtype") or raw.get("torch_dtype") or text_raw.get("dtype") or text_raw.get("torch_dtype")
+    quant = _parse_quant(raw.get("quantization_config"), dtype, reasons)
     if reasons:
         raise UnsupportedModel(reasons)
     return ModelConfig(
@@ -191,6 +194,8 @@ def _parse_text(raw: dict, generation: dict | None, reasons: list[str]) -> TextC
     gdn_v_heads = _require(raw, "linear_num_value_heads", reasons)
     if gdn_k_heads and gdn_v_heads % gdn_k_heads:
         reasons.append(f"{gdn_v_heads} linear value heads are not a multiple of {gdn_k_heads} key heads")
+    gdn_k_dim = _require(raw, "linear_key_head_dim", reasons)
+    gdn_v_dim = _require(raw, "linear_value_head_dim", reasons)
     conv_kernel = _require(raw, "linear_conv_kernel_dim", reasons)
     if not 2 <= conv_kernel <= 4:
         reasons.append(f"linear_conv_kernel_dim {conv_kernel} is not supported (2 to 4)")
@@ -219,8 +224,8 @@ def _parse_text(raw: dict, generation: dict | None, reasons: list[str]) -> TextC
         mrope_section=section,
         gdn_k_heads=gdn_k_heads,
         gdn_v_heads=gdn_v_heads,
-        gdn_k_dim=_require(raw, "linear_key_head_dim", reasons),
-        gdn_v_dim=_require(raw, "linear_value_head_dim", reasons),
+        gdn_k_dim=gdn_k_dim,
+        gdn_v_dim=gdn_v_dim,
         conv_kernel=conv_kernel,
         max_position_embeddings=_require(raw, "max_position_embeddings", reasons),
         tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
@@ -297,6 +302,19 @@ def _parse_quant(raw: dict | None, dtype: str | None, reasons: list[str]) -> Qua
             except re.error:
                 reasons.append(f"quantization ignore pattern {pattern!r} is not a valid regular expression")
     return QuantConfig(method="nvfp4", group_size=group_size, ignore=ignore)
+
+
+def kernel_problems(cfg: ModelConfig) -> list[str]:
+    """Why the CUDA kernels cannot run the model (empty when they can): the attention kernels are built for heads of
+    ATTENTION_HEAD_DIM, the Gated DeltaNet kernels for heads of GDN_HEAD_DIM. parse_config accepts other sizes, which
+    the PyTorch path (tests on the CPU) runs."""
+    t, out = cfg.text, []
+    if t.head_dim != ATTENTION_HEAD_DIM:
+        out.append(f"attention head size {t.head_dim} is not supported (the attention kernels need {ATTENTION_HEAD_DIM})")
+    if (t.gdn_k_dim, t.gdn_v_dim) != (GDN_HEAD_DIM, GDN_HEAD_DIM):
+        out.append(f"Gated DeltaNet head sizes {t.gdn_k_dim}/{t.gdn_v_dim} are not supported (the kernels need "
+                   f"{GDN_HEAD_DIM})")
+    return out
 
 
 def has_mtp(path: str | Path) -> bool:

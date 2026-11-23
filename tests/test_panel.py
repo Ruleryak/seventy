@@ -226,6 +226,112 @@ def test_supervisor_start_stop_crash_restart(tmp_path, stub_engine):
     sup.stop(timeout=10)
 
 
+def hub_config(**text) -> dict:
+    """A config.json of a Qwen3.5 checkpoint as the Hub serves it, with the dtype in text_config only."""
+    t = {"model_type": "qwen3_5_text", "attn_output_gate": True, "head_dim": 256, "hidden_act": "silu",
+         "hidden_size": 1024, "intermediate_size": 4096, "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+         "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128, "linear_num_key_heads": 4,
+         "linear_num_value_heads": 8, "linear_value_head_dim": 128, "max_position_embeddings": 262144,
+         "num_attention_heads": 8, "num_hidden_layers": 4, "num_key_value_heads": 4, "rms_norm_eps": 1e-6,
+         "rope_parameters": {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25,
+                             "mrope_section": [11, 11, 10], "mrope_interleaved": True},
+         "vocab_size": 4096, "dtype": "bfloat16"}
+    t.update(text)
+    return {"architectures": ["Qwen3_5ForCausalLM"], "text_config": t}
+
+
+def test_classify_targets_and_drafters():
+    from seventy.panel import models
+
+    ok = models.classify(hub_config(), "r", "r", 10 << 30, True, True)
+    assert ok.ok and ok.kind == "target" and ok.details["mtp"] is True and ok.details["gpu_counts"] == [1, 2, 4]
+    rope = {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25, "mrope_section": [6, 5, 5],
+            "mrope_interleaved": True}
+    small_heads = models.classify(hub_config(head_dim=128, rope_parameters=rope), "r", "r", 1, True)
+    assert not small_heads.ok and any("attention head size 128" in r for r in small_heads.reasons)
+    moe = hub_config()
+    moe["architectures"] = ["Qwen3_5MoeForConditionalGeneration"]
+    assert not models.classify(moe, "r", "r", 1, True).ok
+    assert models.classify(hub_config(), "r", "r", 0, False).reasons == ["no safetensors files", "no tokenizer.json"]
+    assert ok.details["fits"] is None
+    small = models.classify(hub_config(), "r", "r", 10 << 30, True, gpu_bytes=32 << 30, gpu_count=4)
+    big = models.classify(hub_config(), "r", "r", 60 << 30, True, gpu_bytes=32 << 30, gpu_count=4)
+    two = models.classify(hub_config(), "r", "r", 60 << 30, True, gpu_bytes=32 << 30, gpu_count=2)
+    assert (small.details["fits"], big.details["fits"], two.details["fits"]) == ([1, 2, 4], [4], [])
+    drafter = models.classify({"architectures": ["DFlash2DraftModel"], "dflash_config": {"block_size": 8}}, "d", "d", 5, False)
+    assert drafter.ok and drafter.kind == "drafter"
+
+
+class FakeHub:
+    """HfApi and HfFileSystem for check_remote: a repository's files (name -> bytes) and nothing written anywhere."""
+
+    def __init__(self, files: dict):
+        self.files = files
+
+    def api(self, **kw):
+        files = self.files
+
+        class Api:
+            def model_info(self, repo, revision=None, files_metadata=False):
+                sib = [type("S", (), {"rfilename": k, "size": len(v)})() for k, v in files.items()]
+                return type("I", (), {"siblings": sib})()
+        return Api()
+
+    def fs(self, **kw):
+        import io
+
+        files = self.files
+
+        class Fs:
+            def read_text(self, path):
+                return files[path.split("/", 2)[2]].decode()
+
+            def open(self, path, mode="rb", block_size=0):
+                return io.BytesIO(files[path.split("/", 2)[2]])
+        return Fs()
+
+
+def test_check_remote_reads_only_the_config_and_index(monkeypatch, tmp_path):
+    import huggingface_hub
+
+    from seventy.panel import models
+
+    index = {"weight_map": {"mtp.fc.weight": "a", "mtp.layers.0.mlp.down_proj.weight": "a"}}
+    hub = FakeHub({"config.json": json.dumps(hub_config()).encode(), "tokenizer.json": b"{}",
+                   "model.safetensors.index.json": json.dumps(index).encode(), "model-00001.safetensors": b"x" * 100})
+    monkeypatch.setattr(huggingface_hub, "HfApi", hub.api)
+    monkeypatch.setattr(huggingface_hub, "HfFileSystem", hub.fs)
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "cache"))
+    info = models.check_remote("owner/model")
+    assert info.ok and info.size == 100 and info.details["mtp"] is True
+    assert not (tmp_path / "cache").exists()
+    gguf = FakeHub({"model-Q4_K_M.gguf": b"x"})
+    monkeypatch.setattr(huggingface_hub, "HfApi", gguf.api)
+    only = models.check_remote("owner/gguf")
+    assert not only.ok and "only GGUF" in only.reasons[0]
+    with pytest.raises(ValueError):
+        models.check_remote("not a repo")
+
+
+def test_downloads_check_the_repository_first(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from seventy.panel import app as panel
+    from seventy.panel import models
+
+    monkeypatch.setattr(hardware, "inventory", lambda *a, **k: fake_inventory())
+    monkeypatch.setattr(hardware, "sample", lambda: [])
+    bad = models.ModelInfo("o/m", "o/m", "target", False, 1, ["architecture X is not supported"])
+    monkeypatch.setattr(models, "check_remote", lambda *a, **k: bad)
+    started = []
+    monkeypatch.setattr(models.Downloads, "start", lambda self, *a, **k: started.append(a) or models.Download("i", a[0], None, None))
+    with TestClient(panel.create_app("127.0.0.1", tmp_path / "home")) as c:
+        r = c.post("/api/downloads", json={"repo": "o/m"})
+        assert r.status_code == 422 and "architecture X" in r.json()["detail"] and not started
+        assert c.post("/api/downloads", json={"repo": "o/m", "force": True}).status_code == 200 and started
+        assert c.post("/api/models/check-remote", json={"repo": "o/m"}).json()["reasons"] == bad.reasons
+
+
 def test_panel_api(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 

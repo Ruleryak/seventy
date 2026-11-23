@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 
 from .. import memory
-from ..config import UnsupportedModel, has_mtp, load_config
+from ..config import UnsupportedModel, has_mtp, kernel_problems, load_config
 from .hardware import Inventory, gpu_set_problems, nvlink_full
 from .supervisor import Settings
 
@@ -66,6 +66,7 @@ def plan(s: Settings, inv: Inventory, profiles: Profiles | None = None) -> dict:
         reasons = e.reasons if isinstance(e, UnsupportedModel) else [str(e)]
         errors.extend(reasons)
         return out
+    errors.extend(kernel_problems(cfg))
     t = cfg.text
     drafter = None
     mtp = s.draft_model == "mtp"

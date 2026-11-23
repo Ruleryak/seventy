@@ -616,8 +616,40 @@ $("btn-adddir").addEventListener("click", async () => {
   $("m-dir").value = "";
   loadModels();
 });
-$("btn-download").addEventListener("click", async () => {
-  try { await api("/api/downloads", { body: { repo: $("m-repo").value } }); $("m-repo").value = ""; renderDownloads(); } catch (e) { alert(e.message); }
+function checkLine(m) {
+  const d = m.details || {};
+  if (!m.ok) return [el("span", { class: "badge bad" }, el("span", { class: "ico" }, "✕"), "cannot serve"), " ", (m.reasons || []).join("; ")];
+  const facts = m.kind === "drafter" ? [`DFlash2 drafter, block ${d.block_size}`, fmt.gib(m.size)]
+    : [`${d.architecture}`, `weights ${d.weights}`, fmt.gib(m.size), d.vision ? "images and video" : "text only",
+      d.fits === null || d.fits === undefined ? "" : d.fits.length ? `fits on ${d.fits.join(", ")} of this machine's GPUs`
+        : "does not fit on this machine's GPUs", d.mtp === true ? "MTP layer" : d.mtp === false ? "no MTP layer" : ""];
+  return [el("span", { class: "badge ok" }, el("span", { class: "ico" }, "✓"), "compatible"), " ", facts.filter(Boolean).join(" · ")];
+}
+async function startDownload(force) {
+  const repo = $("m-repo").value.trim();
+  const box = $("m-check");
+  if (!repo) return;
+  box.hidden = false;
+  box.replaceChildren(force ? "Starting the download…" : "Checking the repository…");
+  try {
+    await api("/api/downloads", { body: { repo, force } });
+    $("m-repo").value = "";
+    box.hidden = true;
+    renderDownloads();
+  } catch (e) {
+    box.replaceChildren(el("span", { class: "error" }, e.message), " ",
+      el("button", { class: "ghost", onclick: () => startDownload(true) }, "Download anyway"));
+  }
+}
+$("btn-download").addEventListener("click", () => startDownload(false));
+$("btn-check").addEventListener("click", async () => {
+  const repo = $("m-repo").value.trim();
+  const box = $("m-check");
+  if (!repo) return;
+  box.hidden = false;
+  box.replaceChildren("Checking the repository…");
+  try { box.replaceChildren(...checkLine(await api("/api/models/check-remote", { body: { repo } }))); }
+  catch (e) { box.replaceChildren(el("span", { class: "error" }, e.message)); }
 });
 async function renderDownloads() {
   const list = await api("/api/downloads").catch(() => []);

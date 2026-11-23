@@ -192,6 +192,27 @@ def create_app(host: str = "127.0.0.1", home: Path | None = None) -> FastAPI:
     async def model_check(body: dict):
         return vars(await asyncio.to_thread(models.check, str(body.get("path", ""))))
 
+    def hub_access(body: dict) -> tuple[str | None, str | None]:
+        p = prefs.load()
+        return (body.get("endpoint") or p["hf_endpoint"] or os.environ.get("HF_ENDPOINT") or None,
+                body.get("token") or os.environ.get("HF_TOKEN"))
+
+    async def remote_check(body: dict) -> models.ModelInfo:
+        endpoint, hf_token = hub_access(body)
+        inv = await asyncio.to_thread(hardware.inventory)
+        gpu_bytes = min((g.memory_total for g in inv.gpus), default=0)
+        try:
+            return await asyncio.to_thread(models.check_remote, str(body.get("repo", "")), body.get("revision") or None,
+                                           endpoint, hf_token, gpu_bytes, len(inv.gpus))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            raise HTTPException(502, f"the repository cannot be checked: {type(e).__name__}: {e}"[:400])
+
+    @app.post("/api/models/check-remote")
+    async def model_check_remote(body: dict):
+        return vars(await remote_check(body))
+
     @app.post("/api/plan")
     async def make_plan(body: dict):
         s = settings_from(body)
@@ -272,11 +293,13 @@ def create_app(host: str = "127.0.0.1", home: Path | None = None) -> FastAPI:
 
     @app.post("/api/downloads")
     async def download(body: dict):
-        p = prefs.load()
-        endpoint = body.get("endpoint") or p["hf_endpoint"] or os.environ.get("HF_ENDPOINT") or None
+        if not body.get("force"):
+            info = await remote_check(body)
+            if not info.ok:
+                raise HTTPException(422, f"seventy cannot serve {info.name}: " + "; ".join(info.reasons))
+        endpoint, hf_token = hub_access(body)
         try:
-            d = downloads.start(str(body.get("repo", "")), body.get("revision") or None, endpoint,
-                                body.get("token") or os.environ.get("HF_TOKEN"))
+            d = downloads.start(str(body.get("repo", "")), body.get("revision") or None, endpoint, hf_token)
         except ValueError as e:
             raise HTTPException(400, str(e))
         return d.to_dict()

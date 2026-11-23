@@ -89,6 +89,7 @@ API server process ──requests/tokens──────┘
   the panel prints the URL with the token. The engine's API key goes to the engine in its environment, never
   on the command line.
 - Downloads use the endpoint in the panel settings, or `HF_ENDPOINT`, or the public Hub.
+- Before a download, the panel reads `config.json`, the file list and, for the MTP layer, the safetensors index of the repository, and applies the checks of a local folder (`seventy.config`, the kernel head sizes, the split over 1, 2, 4 and 8 GPUs). It estimates the GPU counts of the machine whose memory holds the weights with the memory model of the plan. A download of a checkpoint that fails the checks starts only on request (**Download anyway**). Compatible means that the checkpoint passes the checks; the README lists the tested models.
 
 ## Numerics
 

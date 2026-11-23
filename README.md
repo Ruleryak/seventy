@@ -143,7 +143,7 @@ Open the URL printed in the terminal, including its access token.
 
 In the panel:
 
-1. Use **Models** to download `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4`.
+1. Use **Models** to download `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4`. Before a download, the panel reads the configuration and the file list of the repository. It tells you if the checkpoint is compatible with seventy and on how many of your GPUs its weights fit. **Check** shows this without a download.
 2. Select the model and the GPUs you want to use, review the memory plan, and start the engine.
 
 The drafter is optional. To use it, also download `incoai/Qwen3.8-27B-DFlash2` and select it before starting the engine. It requires additional GPU memory.

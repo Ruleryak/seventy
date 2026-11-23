@@ -146,3 +146,22 @@ def test_real_model_config(model_path):
     assert t.rotary_dim == 64 and t.mrope_section == (11, 11, 10)
     assert t.conv_dim == 10240
     assert 248044 in t.eos_token_ids
+
+
+def test_dtype_in_the_text_config_counts():
+    raw = small_config()
+    del raw["dtype"]
+    raw["text_config"]["dtype"] = "bfloat16"
+    assert parse_config(raw).quant.method == "bf16"
+
+
+def test_kernel_problems_name_the_head_sizes():
+    from seventy.config import kernel_problems
+
+    problems = kernel_problems(parse_config(small_config()))
+    assert any("attention head size 32" in p for p in problems)
+    assert any("Gated DeltaNet head sizes 16/16" in p for p in problems)
+    raw = small_config()
+    raw["text_config"].update(head_dim=256, linear_key_head_dim=128, linear_value_head_dim=128,
+                              rope_parameters=dict(raw["text_config"]["rope_parameters"], mrope_section=[11, 11, 10]))
+    assert kernel_problems(parse_config(raw)) == []
