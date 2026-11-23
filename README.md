@@ -29,8 +29,9 @@ seventy check-model /path/to/checkpoint
 
 ## Speed
 
-These charts show the speed of seventy on 4 Tesla V100-SXM2-32GB GPUs with NVLink (tensor parallel 4). The engine
-uses the NVFP4 27B model, the DFlash2 drafter and the INT8 KV cache. Thinking is on. Each request makes 512 tokens.
+These charts show the speed of seventy 1.1.2 on 4 Tesla V100-SXM2-32GB GPUs with NVLink (tensor parallel 4), at a power
+limit of 250 W per GPU (the default limit of these GPUs is 300 W). The engine uses the NVFP4 27B model, the DFlash2
+drafter and the INT8 KV cache. Thinking is on. Each request makes 512 tokens.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/speed-total-dark.svg">
@@ -59,33 +60,33 @@ uses the NVFP4 27B model, the DFlash2 drafter and the INT8 KV cache. Thinking is
 
 | Context (tokens) | Streams | Tokens/s per stream | Tokens/s in total |
 |---:|---:|---:|---:|
-| 2,000 | 1 | 250 | 250 |
-| 2,000 | 4 | 197 | 781 |
-| 2,000 | 8 | 111 | 877 |
-| 32,000 | 1 | 216 | 216 |
-| 32,000 | 4 | 140 | 558 |
-| 32,000 | 8 | 86 | 668 |
-| 100,000 | 1 | 190 | 191 |
-| 100,000 | 4 | 96 | 383 |
-| 100,000 | 8 | 58 | 467 |
-| 128,000 | 1 | 177 | 178 |
-| 128,000 | 4 | 100 | 398 |
-| 128,000 | 8 | 49 | 388 |
-| 192,000 | 1 | 164 | 164 |
-| 192,000 | 4 | 104 | 392 |
-| 192,000 | 8 | 43 | 335 |
-| 256,000 | 1 | 138 | 138 |
-| 256,000 | 4 | 62 | 250 |
-| 256,000 | 8 | 38 | 301 |
+| 2,000 | 1 | 272 | 272 |
+| 2,000 | 4 | 226 | 894 |
+| 2,000 | 8 | 122 | 971 |
+| 32,000 | 1 | 207 | 207 |
+| 32,000 | 4 | 143 | 578 |
+| 32,000 | 8 | 79 | 625 |
+| 100,000 | 1 | 180 | 180 |
+| 100,000 | 4 | 101 | 401 |
+| 100,000 | 8 | 55 | 437 |
+| 128,000 | 1 | 181 | 181 |
+| 128,000 | 4 | 91 | 358 |
+| 128,000 | 8 | 48 | 382 |
+| 192,000 | 1 | 167 | 167 |
+| 192,000 | 4 | 75 | 301 |
+| 192,000 | 8 | 42 | 327 |
+| 256,000 | 1 | 147 | 147 |
+| 256,000 | 4 | 66 | 261 |
+| 256,000 | 8 | 37 | 298 |
 
 | Prompt (tokens) | Prefill tokens/s | Time to the first token |
 |---:|---:|---:|
-| 2,000 | 3,839 | 0.5 s |
-| 32,000 | 4,087 | 7.8 s |
-| 100,000 | 3,102 | 32.2 s |
-| 128,000 | 2,832 | 45.2 s |
-| 192,000 | 2,369 | 81.1 s |
-| 256,000 | 2,035 | 125.8 s |
+| 2,000 | 3,826 | 0.5 s |
+| 32,000 | 4,092 | 7.8 s |
+| 100,000 | 3,106 | 32.2 s |
+| 128,000 | 2,831 | 45.2 s |
+| 192,000 | 2,368 | 81.1 s |
+| 256,000 | 2,038 | 125.6 s |
 
 </details>
 
