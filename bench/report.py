@@ -304,7 +304,8 @@ def change(now: float | None, before: float | None) -> str:
 
 
 def slug(run: dict) -> str:
-    return "run-" + "".join(ch if ch.isalnum() else "-" for ch in run["release"].lower())
+    key = run["release"] + ("-" + run["note"] if run.get("note") else "")
+    return "run-" + "".join(ch if ch.isalnum() else "-" for ch in key.lower())
 
 
 def best_label(value: float | None, best: tuple | None, name: str) -> str:

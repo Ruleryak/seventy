@@ -29,9 +29,14 @@ seventy check-model /path/to/checkpoint
 
 ## Speed
 
-These charts show the speed of seventy 1.1.2 on 4 Tesla V100-SXM2-32GB GPUs with NVLink (tensor parallel 4), at a power
-limit of 250 W per GPU (the default limit of these GPUs is 300 W). The engine uses the NVFP4 27B model, the DFlash2
-drafter and the INT8 KV cache. Thinking is on. Each request makes 512 tokens.
+These charts show the speed of seventy 1.1.2 on 4 Tesla V100-SXM2-32GB GPUs with NVLink (tensor parallel 4), at the
+default power limit of 300 W per GPU. The GPUs are GPUs 0 to 3 of a rented machine with 8 GPUs: each pair of the 4 GPUs
+has 1 or 2 NVLink links. The engine uses the NVFP4 27B model, the DFlash2 drafter and the INT8 KV cache. Thinking is on.
+Each request makes 512 tokens.
+
+The same release on a machine with 4 GPUs (2 NVLink links between each pair) at a power limit of 250 W per GPU made
+1% to 2% fewer prompt tokens per second, and decoded about 5% to 15% slower with 4 and 8 streams in most tests. The
+numbers are in [bench/results/1.1.2.json](bench/results/1.1.2.json).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/speed-total-dark.svg">
@@ -60,33 +65,33 @@ drafter and the INT8 KV cache. Thinking is on. Each request makes 512 tokens.
 
 | Context (tokens) | Streams | Tokens/s per stream | Tokens/s in total |
 |---:|---:|---:|---:|
-| 2,000 | 1 | 272 | 272 |
-| 2,000 | 4 | 226 | 894 |
-| 2,000 | 8 | 122 | 971 |
-| 32,000 | 1 | 207 | 207 |
-| 32,000 | 4 | 143 | 578 |
-| 32,000 | 8 | 79 | 625 |
-| 100,000 | 1 | 180 | 180 |
-| 100,000 | 4 | 101 | 401 |
-| 100,000 | 8 | 55 | 437 |
-| 128,000 | 1 | 181 | 181 |
-| 128,000 | 4 | 91 | 358 |
-| 128,000 | 8 | 48 | 382 |
-| 192,000 | 1 | 167 | 167 |
-| 192,000 | 4 | 75 | 301 |
-| 192,000 | 8 | 42 | 327 |
-| 256,000 | 1 | 147 | 147 |
-| 256,000 | 4 | 66 | 261 |
-| 256,000 | 8 | 37 | 298 |
+| 2,000 | 1 | 322 | 322 |
+| 2,000 | 4 | 200 | 809 |
+| 2,000 | 8 | 125 | 986 |
+| 32,000 | 1 | 194 | 194 |
+| 32,000 | 4 | 158 | 630 |
+| 32,000 | 8 | 85 | 667 |
+| 100,000 | 1 | 167 | 168 |
+| 100,000 | 4 | 106 | 423 |
+| 100,000 | 8 | 59 | 462 |
+| 128,000 | 1 | 205 | 205 |
+| 128,000 | 4 | 94 | 379 |
+| 128,000 | 8 | 54 | 436 |
+| 192,000 | 1 | 162 | 162 |
+| 192,000 | 4 | 97 | 400 |
+| 192,000 | 8 | 53 | 408 |
+| 256,000 | 1 | 148 | 148 |
+| 256,000 | 4 | 71 | 287 |
+| 256,000 | 8 | 39 | 316 |
 
 | Prompt (tokens) | Prefill tokens/s | Time to the first token |
 |---:|---:|---:|
-| 2,000 | 3,826 | 0.5 s |
-| 32,000 | 4,092 | 7.8 s |
-| 100,000 | 3,106 | 32.2 s |
-| 128,000 | 2,831 | 45.2 s |
-| 192,000 | 2,368 | 81.1 s |
-| 256,000 | 2,038 | 125.6 s |
+| 2,000 | 3,832 | 0.5 s |
+| 32,000 | 4,124 | 7.8 s |
+| 100,000 | 3,160 | 31.6 s |
+| 128,000 | 2,880 | 44.4 s |
+| 192,000 | 2,414 | 79.5 s |
+| 256,000 | 2,079 | 123.1 s |
 
 </details>
 
