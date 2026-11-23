@@ -124,6 +124,19 @@ def gpus() -> str:
     return f"{len(names)} x {names[0]}" if names else ""
 
 
+def power_limit() -> str:
+    """The power limit of the GPUs from nvidia-smi, for example "300 W", or "250 to 300 W" when they differ."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=power.limit", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, check=True).stdout.split()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    watts = sorted({round(float(w)) for w in out if w.replace(".", "", 1).isdigit()})
+    if not watts:
+        return ""
+    return f"{watts[0]} W" if len(watts) == 1 else f"{watts[0]} to {watts[-1]} W"
+
+
 def commit() -> str:
     try:
         return subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True,
@@ -156,6 +169,7 @@ def main() -> None:
     ap.add_argument("--note", default="")
     ap.add_argument("--commit", default=None, help="default: the git commit of this folder")
     ap.add_argument("--gpus", default=None, help='for example "4 x Tesla V100-SXM2-32GB, NVLink"')
+    ap.add_argument("--power-limit", default=None, help='for example "300 W" (default: from nvidia-smi)')
     ap.add_argument("--out", required=True, type=Path)
     args = ap.parse_args()
     key = os.environ.get("SEVENTY_API_KEY")
@@ -213,6 +227,7 @@ def main() -> None:
             "%Y-%m-%dT%H:%MZ"),
         "setup": {
             "gpus": args.gpus or gpus(),
+            "power_limit": args.power_limit or power_limit(),
             "tensor_parallel": info.get("tensor_parallel"),
             "model": info.get("model_name") or Path(info.get("model", model)).name,
             "drafter": draft,

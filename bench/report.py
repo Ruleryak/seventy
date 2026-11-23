@@ -16,8 +16,9 @@ decode: requests of `context` prompt tokens that are already in the prefix cache
 per_stream is the output tokens/s of one request (first to last token), total the output tokens/s of all requests
 together while all of them run; each list has one value per run. prefill: prompt tokens/s of one cold prompt.
 method: how the numbers were measured. 2 is bench/sweep.py. A file without it is method 1 (earlier sweeps, where
-total is the sum of the per-stream rates). A release is compared only with earlier releases of the same method: the
-change, the lighter lines and the best value so far of each figure.
+total is the sum of the per-stream rates). setup.power_limit is the power limit of the GPUs (bench/sweep.py reads it
+from nvidia-smi). A release is compared only with earlier releases of the same method on the same GPUs (setup.gpus)
+at the same power limit: the change, the lighter lines and the best value so far of each figure.
 
 --markdown prints the tables of the newest release for the README. --images writes the README charts of the newest
 release (sorted by date), light and dark, with the release before it (same method) as lighter lines. --html writes
@@ -63,9 +64,16 @@ def method(run: dict) -> int:
     return int(run.get("method", 1))
 
 
+def machine(run: dict) -> tuple:
+    """The GPUs and their power limit: speeds compare only on the same GPUs at the same power limit."""
+    s = run.get("setup", {})
+    return s.get("gpus", ""), s.get("power_limit", "")
+
+
 def earlier(runs: list[dict], i: int) -> list[dict]:
-    """The releases before runs[i] that were measured with the same method, oldest first."""
-    return [r for r in runs[:i] if method(r) == method(runs[i])]
+    """The releases before runs[i] that were measured with the same method on the same GPUs at the same power
+    limit, oldest first."""
+    return [r for r in runs[:i] if method(r) == method(runs[i]) and machine(r) == machine(runs[i])]
 
 
 def best_points(runs: list[dict], kind: str) -> dict:
@@ -391,7 +399,8 @@ def run_block(run: dict, prev: dict | None, history: list[dict], latest: bool) -
     return f"""<div class="run" data-id="{slug(run)}"{'' if latest else ' hidden'}>
 <section class="band head"><h1>{title}</h1>
 <p class="setup">Release {html.escape(run['release'])}{note}, {how}, on {html.escape(run['date'][:10])} on
-{html.escape(s.get('gpus', ''))} with tensor parallel {s.get('tensor_parallel', '')}:
+{html.escape(s.get('gpus', ''))}{f" at a power limit of {html.escape(s['power_limit'])}" if s.get('power_limit') else ''}
+with tensor parallel {s.get('tensor_parallel', '')}:
 {html.escape(s.get('model', ''))}, drafter {html.escape(s.get('drafter', 'none'))}, {html.escape(s.get('kv_cache', ''))}
 KV cache, thinking {'on' if s.get('thinking') else 'off'}, {s.get('output_tokens', '')} output tokens per request.
 {compare}</p>

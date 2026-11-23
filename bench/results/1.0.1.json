@@ -8,6 +8,7 @@
   "date": "2026-11-21T09:33Z",
   "setup": {
     "gpus": "4 x Tesla V100-SXM2-32GB, NVLink",
+    "power_limit": "250 W",
     "tensor_parallel": 4,
     "model": "QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4",
     "drafter": "incoai/Qwen3.8-27B-DFlash2",
