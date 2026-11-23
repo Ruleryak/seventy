@@ -1,6 +1,6 @@
 # seventy
 
-seventy is an inference engine for Qwen3.5-family models (Qwen3.5, Qwen3.6, Qwen3.8) on NVIDIA V100 GPUs.
+seventy is an inference engine for Qwen3.5-family models (Qwen3.5, Qwen3.6, Qwen3.8) on NVIDIA V100 (sm70) GPUs.
 It serves an OpenAI-compatible API and has a control panel in the browser.
 
 **Status:** version 1.1.2. The tests ran on 4 Tesla V100-SXM2-32GB GPUs with NVLink. The release notes give the other systems that the release was tested on.
@@ -144,6 +144,14 @@ In the panel:
 The drafter is optional. To use it, also download `incoai/Qwen3.8-27B-DFlash2` and select it before starting the engine. It requires additional GPU memory.
 
 Or, select **MTP layer of the model** as the drafter. This drafter uses the MTP layer of the model, so you do not download a drafter. With many short requests at the same time, it is faster than DFlash2. For agent work, DFlash2 is faster. Refer to [Draft with the MTP layer of the model](docs/ADVANCED.md#draft-with-the-mtp-layer-of-the-model).
+
+The **Start** page shows the GPUs and their NVLink links, the model and the drafter, and the memory plan of one GPU before the engine starts:
+
+![The Start page of the control panel: the GPUs and their NVLink links, the model and the drafter, and the memory plan of one GPU](docs/images/panel-start-dark.png)
+
+The **Dashboard** shows the speed, the requests, the KV cache and the GPUs while the engine runs (here with 6 streams at 32K tokens of context):
+
+![The Dashboard of the control panel: tokens per second, requests, time to first token, KV cache in use, tokens per verify step, GPU utilization and GPU power](docs/images/panel-dashboard-dark.png)
 
 Keep the panel running. To run it in the background and start it at boot, see [Run the panel as a service](docs/ADVANCED.md#run-the-panel-as-a-service).
 
