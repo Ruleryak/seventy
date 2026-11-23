@@ -525,10 +525,13 @@ document.addEventListener('focusin',e=>{const t=e.target.closest('[data-tip]');i
 def write_html(runs: list[dict], path: Path) -> None:
     """One page with every release, newest first in the picker; each release is drawn over the one before it."""
     blocks, pick = [], []
+    names = [r["name"] for r in runs]
     for i in range(len(runs) - 1, -1, -1):
         run, history = runs[i], earlier(runs, i)
         blocks.append(run_block(run, history[-1] if history else None, history, i == len(runs) - 1))
         tag = "" if method(run) == 2 else '<small class="m1">old method</small>'
+        if names.count(run["name"]) > 1 and run.get("note"):
+            tag += f'<small class="m1">{html.escape(run["note"])}</small>'
         pick.append(f'<button type="button" data-run="{slug(run)}" aria-pressed="false">'
                     f'{html.escape(run["name"])}{tag}</button>')
     path.write_text(PAGE.replace("__PICK__", "".join(pick)).replace("__RUNS__", "\n".join(blocks)))
