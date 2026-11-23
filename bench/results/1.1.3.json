@@ -1,0 +1,50 @@
+{
+  "format": 1,
+  "method": 2,
+  "release": "1.1.3",
+  "name": "1.1.3",
+  "note": "250 W",
+  "commit": "028e9e4",
+  "date": "2026-11-23T18:49Z",
+  "setup": {
+    "gpus": "4 x Tesla V100-SXM2-32GB, NVLink",
+    "power_limit": "250 W",
+    "tensor_parallel": 4,
+    "model": "QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4",
+    "drafter": "incoai/Qwen3.8-27B-DFlash2",
+    "kv_cache": "int8",
+    "thinking": true,
+    "output_tokens": 512,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "prompt": "Python standard library source code"
+  },
+  "decode": [
+    {"context": 2000, "streams": 1, "per_stream": [381.9, 260.5], "total": [382.3, 260.7], "ttft_cached": [0.147, 0.072]},
+    {"context": 2000, "streams": 4, "per_stream": [200.1, 207.6], "total": [776.2, 821.3], "ttft_cached": [0.12, 0.12]},
+    {"context": 2000, "streams": 8, "per_stream": [144.7, 137.6], "total": [1138.2, 1084.1], "ttft_cached": [0.202, 0.198]},
+    {"context": 32000, "streams": 1, "per_stream": [212.1, 190.5], "total": [212.3, 190.7], "ttft_cached": [0.136, 0.072]},
+    {"context": 32000, "streams": 4, "per_stream": [125.4, 155.6], "total": [497.7, 636.0], "ttft_cached": [0.369, 0.375]},
+    {"context": 32000, "streams": 8, "per_stream": [106.2, 101.4], "total": [828.3, 796.1], "ttft_cached": [0.47, 0.567]},
+    {"context": 100000, "streams": 1, "per_stream": [168.9, 202.2], "total": [169.1, 202.4], "ttft_cached": [0.276, 0.1]},
+    {"context": 100000, "streams": 4, "per_stream": [104.5, 99.9], "total": [402.2, 400.8], "ttft_cached": [0.558, 0.216]},
+    {"context": 100000, "streams": 8, "per_stream": [65.9, 65.7], "total": [520.1, 526.6], "ttft_cached": [0.325, 0.326]},
+    {"context": 128000, "streams": 1, "per_stream": [159.8, 145.8], "total": [160.0, 145.9], "ttft_cached": [0.134, 0.116]},
+    {"context": 128000, "streams": 4, "per_stream": [89.8, 88.5], "total": [360.6, 355.8], "ttft_cached": [0.229, 0.271]},
+    {"context": 128000, "streams": 8, "per_stream": [53.6, 56.3], "total": [431.0, 445.9], "ttft_cached": [0.391, 0.366]},
+    {"context": 192000, "streams": 1, "per_stream": [142.9, 147.9], "total": [143.1, 148.0], "ttft_cached": [0.135, 0.139]},
+    {"context": 192000, "streams": 4, "per_stream": [81.7, 90.1], "total": [310.8, 364.3], "ttft_cached": [0.303, 0.36]},
+    {"context": 192000, "streams": 8, "per_stream": [45.7, 47.6], "total": [359.0, 374.4], "ttft_cached": [0.49, 0.496]},
+    {"context": 256000, "streams": 1, "per_stream": [146.5, 129.0], "total": [146.7, 129.1], "ttft_cached": [0.149, 0.149]},
+    {"context": 256000, "streams": 4, "per_stream": [61.6, 67.0], "total": [249.2, 260.6], "ttft_cached": [0.413, 0.37]},
+    {"context": 256000, "streams": 8, "per_stream": [36.7, 40.3], "total": [289.6, 318.3], "ttft_cached": [0.51, 0.573]}
+  ],
+  "prefill": [
+    {"context": 2000, "tokens_per_s": [3055, 3944, 3981, 3965, 3946, 3975, 3987, 3907]},
+    {"context": 32000, "tokens_per_s": [4093, 4090, 4076, 4081, 4081, 4072, 4067, 4065]},
+    {"context": 100000, "tokens_per_s": [3099, 3100, 3102, 3102, 3107, 3105, 3106, 3104]},
+    {"context": 128000, "tokens_per_s": [2808, 2833, 2806, 2831, 2835, 2834, 2808, 2835]},
+    {"context": 192000, "tokens_per_s": [2370, 2366, 2367, 2368, 2368, 2367, 2368, 2368]},
+    {"context": 256000, "tokens_per_s": [2039, 2028, 2035, 2036, 2037, 2038, 2037, 2023]}
+  ]
+}

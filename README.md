@@ -20,6 +20,7 @@ Tested models:
 |---|---|
 | `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` | target model (text, images, videos) |
 | `incoai/Qwen3.8-27B-DFlash2` | drafter for the model above |
+| `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.5-4B`, `Qwen/Qwen3.5-2B`, `Qwen/Qwen3.5-0.8B` | official BF16 checkpoints, tested on 16 GB GPUs (the 9B also with its MTP layer as the drafter) |
 
 To check a checkpoint folder before you start it:
 
@@ -29,14 +30,15 @@ seventy check-model /path/to/checkpoint
 
 ## Speed
 
-These charts show the speed of seventy 1.1.2 on 4 Tesla V100-SXM2-32GB GPUs with NVLink (tensor parallel 4), at the
+These charts show the speed of seventy 1.1.3 on 4 Tesla V100-SXM2-32GB GPUs with NVLink (tensor parallel 4), at the
 default power limit of 300 W per GPU. The GPUs are GPUs 0 to 3 of a rented machine with 8 GPUs: each pair of the 4 GPUs
 has 1 or 2 NVLink links. The engine uses the NVFP4 27B model, the DFlash2 drafter and the INT8 KV cache. Thinking is on.
-Each request makes 512 tokens.
+Each request makes 512 tokens. The lighter lines show 1.1.2 on the same kind of machine. Version 1.1.4 changes only the
+memory checks; its speed is the same as the speed of 1.1.3.
 
 The same release on a machine with 4 GPUs (2 NVLink links between each pair) at a power limit of 250 W per GPU made
-1% to 2% fewer prompt tokens per second, and decoded about 5% to 15% slower with 4 and 8 streams in most tests. The
-numbers are in [bench/results/1.1.2.json](bench/results/1.1.2.json).
+3% to 6% fewer prompt tokens per second, and decoded about 2% to 13% slower with 4 and 8 streams. The numbers are in
+[bench/results/1.1.3.json](bench/results/1.1.3.json).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/speed-total-dark.svg">
@@ -65,33 +67,33 @@ numbers are in [bench/results/1.1.2.json](bench/results/1.1.2.json).
 
 | Context (tokens) | Streams | Tokens/s per stream | Tokens/s in total |
 |---:|---:|---:|---:|
-| 2,000 | 1 | 322 | 322 |
-| 2,000 | 4 | 200 | 809 |
-| 2,000 | 8 | 125 | 986 |
-| 32,000 | 1 | 194 | 194 |
-| 32,000 | 4 | 158 | 630 |
-| 32,000 | 8 | 85 | 667 |
-| 100,000 | 1 | 167 | 168 |
-| 100,000 | 4 | 106 | 423 |
-| 100,000 | 8 | 59 | 462 |
-| 128,000 | 1 | 205 | 205 |
-| 128,000 | 4 | 94 | 379 |
-| 128,000 | 8 | 54 | 436 |
-| 192,000 | 1 | 162 | 162 |
-| 192,000 | 4 | 97 | 400 |
-| 192,000 | 8 | 53 | 408 |
+| 2,000 | 1 | 308 | 308 |
+| 2,000 | 4 | 199 | 812 |
+| 2,000 | 8 | 150 | 1,189 |
+| 32,000 | 1 | 199 | 199 |
+| 32,000 | 4 | 156 | 619 |
+| 32,000 | 8 | 107 | 853 |
+| 100,000 | 1 | 169 | 169 |
+| 100,000 | 4 | 105 | 426 |
+| 100,000 | 8 | 67 | 541 |
+| 128,000 | 1 | 177 | 177 |
+| 128,000 | 4 | 95 | 384 |
+| 128,000 | 8 | 62 | 496 |
+| 192,000 | 1 | 174 | 175 |
+| 192,000 | 4 | 86 | 350 |
+| 192,000 | 8 | 49 | 388 |
 | 256,000 | 1 | 148 | 148 |
-| 256,000 | 4 | 71 | 287 |
-| 256,000 | 8 | 39 | 316 |
+| 256,000 | 4 | 73 | 293 |
+| 256,000 | 8 | 43 | 346 |
 
 | Prompt (tokens) | Prefill tokens/s | Time to the first token |
 |---:|---:|---:|
-| 2,000 | 3,832 | 0.5 s |
-| 32,000 | 4,124 | 7.8 s |
-| 100,000 | 3,160 | 31.6 s |
-| 128,000 | 2,880 | 44.4 s |
-| 192,000 | 2,414 | 79.5 s |
-| 256,000 | 2,079 | 123.1 s |
+| 2,000 | 3,984 | 0.5 s |
+| 32,000 | 4,279 | 7.5 s |
+| 100,000 | 3,273 | 30.5 s |
+| 128,000 | 2,987 | 42.8 s |
+| 192,000 | 2,505 | 76.6 s |
+| 256,000 | 2,159 | 118.6 s |
 
 </details>
 
