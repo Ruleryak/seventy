@@ -327,7 +327,7 @@ SEVENTY_API int seventy_moe_gemm(void *out, const void *x, int row_div, const vo
   const size_t smem = static_cast<size_t>(rows) * k * sizeof(half);
   if (smem > 48 * 1024) return SEVENTY_ERR_INVALID_ARGUMENT;
   const char *env = getenv("SEVENTY_MOE_COLS");
-  const int cols = env ? atoi(env) : kMoeWarpCols;
+  const int cols = env != nullptr && env[0] >= '1' && env[0] <= '9' && env[1] == 0 ? env[0] - '0' : kMoeWarpCols;
   const int per_block = (kMoeThreads / 32) * cols;
   const dim3 grid((n + per_block - 1) / per_block, max_slots);
   const auto *xh = static_cast<const half *>(x);
