@@ -1,4 +1,5 @@
-"""Tensor-parallel sharding on the CPU: 2 and 4 processes over gloo against one process, first 4 layers, FP32."""
+"""Tensor-parallel sharding on the CPU: 2, 3 and 4 processes over gloo against one process, first 4 layers, FP32. With 3
+processes the heads, the MLP and the vocabulary do not split evenly (seventy.split)."""
 
 import os
 
@@ -44,7 +45,7 @@ def logits_with(size, path):
     return out
 
 
-@pytest.mark.parametrize("size", [2, 4])
+@pytest.mark.parametrize("size", [2, 3, 4])
 def test_sharded_matches_single(model_path, size):
     single = logits_with(1, str(model_path))
     sharded = logits_with(size, str(model_path))

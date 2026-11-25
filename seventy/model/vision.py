@@ -69,7 +69,7 @@ class VisionBlock:
         d = cfg.hidden_size
         hd = d // cfg.num_heads
         h0, h1 = par.span(cfg.num_heads)
-        i0, i1 = par.span(cfg.intermediate_size)
+        i0, i1 = par.span(cfg.intermediate_size, 8 if cfg.intermediate_size % 8 == 0 else 1)
         rows = torch.cat([torch.arange(s * d + h0 * hd, s * d + h1 * hd) for s in range(3)])
         self.heads, self.head_dim = h1 - h0, hd
         self.norm1 = (_f32(ckpt.tensor(f"{p}.norm1.weight"), device), _f32(ckpt.tensor(f"{p}.norm1.bias"), device))

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .split import MLP_ALIGN, VOCAB_ALIGN, HeadSplit, balanced, head_split
+
 
 @dataclass(frozen=True)
 class Parallel:
@@ -13,12 +15,13 @@ class Parallel:
     size: int = 1
     custom: object = None
 
-    def span(self, total: int) -> tuple[int, int]:
-        """This rank's [start, stop) of `total` items split evenly over the ranks."""
-        if total % self.size:
-            raise ValueError(f"{total} does not split evenly over {self.size} GPUs")
-        part = total // self.size
-        return self.rank * part, (self.rank + 1) * part
+    def span(self, total: int, align: int = 1) -> tuple[int, int]:
+        """This rank's [start, stop) of total items: an even split when there is one, else parts of whole
+        align-sized units (see balanced)."""
+        return balanced(total, self.size, self.rank, align)
+
+    def heads(self, heads: int, kv: int) -> HeadSplit:
+        return head_split(heads, kv, self.rank, self.size)
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         if self.size == 1:

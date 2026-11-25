@@ -13,8 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import ModelConfig
+from .split import MLP_ALIGN, VOCAB_ALIGN, balanced, max_head_split
 
 KV_DTYPES = ("int8", "fp16")
+UNEVEN_MAX_GPUS = 4
+"""Uneven splits (split.balanced, split.HeadSplit) are tested on up to 4 GPUs; with more GPUs, every count must
+split evenly."""
 
 
 def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int = 1, extra_layers: int = 0) -> int:
@@ -23,7 +27,8 @@ def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int
     or FP16."""
     t = cfg.text
     per_vec = t.head_dim + 4 if kv_dtype == "int8" else 2 * t.head_dim
-    return (len(t.attention_layers) + extra_layers) * 2 * block_size * (t.num_kv_heads // tp) * per_vec
+    kv_heads = max_head_split(t.num_heads, t.num_kv_heads, tp)[0]
+    return (len(t.attention_layers) + extra_layers) * 2 * block_size * kv_heads * per_vec
 
 
 def prefix_entries(max_num_seqs: int, prefix_cache: bool, cache_entries: int = 0) -> int:
@@ -33,10 +38,10 @@ def prefix_entries(max_num_seqs: int, prefix_cache: bool, cache_entries: int = 0
 
 def state_bytes_per_slot(cfg: ModelConfig, tp: int = 1) -> int:
     """Bytes of one Gated DeltaNet state slot on one rank: the FP32 recurrent state and the FP16 convolution
-    state of every linear-attention layer."""
+    state of every linear-attention layer (of the fullest rank when the heads do not split evenly)."""
     t = cfg.text
-    hv = t.gdn_v_heads // tp
-    conv = (2 * t.gdn_k_heads * t.gdn_k_dim + t.gdn_v_heads * t.gdn_v_dim) // tp
+    hk, hv = max_head_split(t.gdn_v_heads, t.gdn_k_heads, tp)
+    conv = 2 * hk * t.gdn_k_dim + hv * t.gdn_v_dim
     return len(t.linear_layers) * (hv * t.gdn_k_dim * t.gdn_v_dim * 4 + conv * (t.conv_kernel - 1) * 2)
 
 
@@ -46,6 +51,8 @@ class DrafterShape:
     kv_heads: int
     head_dim: int
     ring: int
+    heads: int = 0
+    intermediate: int = 0
 
     @staticmethod
     def from_checkpoint(path: str | Path) -> "DrafterShape":
@@ -57,12 +64,38 @@ class DrafterShape:
             kv_heads=int(raw["num_key_value_heads"]),
             head_dim=int(raw.get("head_dim") or raw["hidden_size"] // raw["num_attention_heads"]),
             ring=-(-(window + block) // 16) * 16,
+            heads=int(raw["num_attention_heads"]),
+            intermediate=int(raw.get("intermediate_size") or 0),
         )
 
 
 def split_problems(cfg: ModelConfig, tp: int, drafter: DrafterShape | None = None) -> list[str]:
-    """Why the model (and its drafter) cannot be split over tp GPUs (empty when it can): tensor parallel splits
-    each of these counts into equal parts."""
+    """Why the model (and its drafter) cannot be split over tp GPUs (empty when it can). On up to UNEVEN_MAX_GPUS
+    GPUs, counts that do not split evenly split into parts of whole units (split.balanced): each GPU needs at least
+    one query head, and the MLP and the vocabulary need sizes that are multiples of their units."""
+    t = cfg.text
+    if tp > UNEVEN_MAX_GPUS:
+        return _even_split_problems(cfg, tp, drafter)
+    problems = []
+    heads = [("attention heads", t.num_heads), ("Gated DeltaNet value heads", t.gdn_v_heads)]
+    if cfg.vision is not None:
+        heads.append(("vision heads", cfg.vision.num_heads))
+    if drafter is not None and drafter.heads:
+        heads.append(("drafter attention heads", drafter.heads))
+    problems += [f"{total} {what} do not split over {tp} GPUs" for what, total in heads if total < tp]
+    sizes = [("MLP columns", t.intermediate_size, MLP_ALIGN), ("vocabulary rows", t.vocab_size, VOCAB_ALIGN)]
+    if drafter is not None and drafter.intermediate:
+        sizes.append(("drafter MLP columns", drafter.intermediate, MLP_ALIGN))
+    for what, total, align in sizes:
+        try:
+            balanced(total, tp, 0, align)
+        except ValueError:
+            problems.append(f"{total} {what} do not split over {tp} GPUs (not a multiple of {align})")
+    return problems
+
+
+def _even_split_problems(cfg: ModelConfig, tp: int, drafter: DrafterShape | None) -> list[str]:
+    """Why the model cannot be split evenly over tp GPUs: the rule for more than UNEVEN_MAX_GPUS GPUs."""
     t = cfg.text
     problems = [f"{total} {what} do not split over {tp} GPUs"
                 for what, total in (("attention KV heads", t.num_kv_heads), ("attention heads", t.num_heads),
@@ -78,8 +111,9 @@ def split_problems(cfg: ModelConfig, tp: int, drafter: DrafterShape | None = Non
 
 
 def drafter_bytes_per_slot(shape: DrafterShape, tp: int = 1) -> int:
-    """Bytes of one slot's drafter context ring on one rank (FP16 K and V of the rank's KV heads)."""
-    return 2 * shape.layers * shape.ring * (shape.kv_heads // tp) * shape.head_dim * 2
+    """Bytes of one slot's drafter context ring on one rank (FP16 K and V of the KV heads of the fullest rank)."""
+    kv = max_head_split(shape.heads, shape.kv_heads, tp)[0] if shape.heads else -(-shape.kv_heads // tp)
+    return 2 * shape.layers * shape.ring * kv * shape.head_dim * 2
 
 
 def checkpoint_bytes(path: str | Path) -> int:
@@ -92,7 +126,10 @@ def tied_head_bytes(cfg: ModelConfig, tp: int = 1) -> int:
     (tie_word_embeddings), the files store the embedding once, and the engine keeps the head as its own FP16 copy of
     the rank's vocab rows: about 1.2 GiB for a 2560-wide model with a 248K vocabulary on one GPU."""
     t = cfg.text
-    return t.vocab_size * t.hidden_size * 2 // tp if t.tie_word_embeddings else 0
+    if not t.tie_word_embeddings:
+        return 0
+    v0, v1 = balanced(t.vocab_size, tp, 0, VOCAB_ALIGN)
+    return (v1 - v0) * t.hidden_size * 2
 
 
 def kv_shortage(free: int, state: int, streams: int, entries: int) -> str:

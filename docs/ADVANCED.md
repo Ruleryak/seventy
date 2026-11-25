@@ -7,7 +7,7 @@ network access, and the panel as a service.
 ## Requirements
 
 - Linux x86_64 with glibc 2.28 or later, for example Ubuntu 20.04 or later, Debian 11 or later, or RHEL 8 or later. Version 1.1.4 has the same kernel library as version 1.1.1, which was tested on Ubuntu 20.04, 22.04 and 24.04, and on Rocky Linux 8.10 (glibc 2.28).
-- 1, 2 or 4 NVIDIA V100 or V100S GPUs (16 GB or 32 GB). On a machine with more GPUs, choose 1, 2 or 4 of them with `--gpus`. With more than one GPU, NVLink between the GPUs is recommended. Without NVLink or PCIe peer-to-peer access, tensor parallel uses NCCL for every all-reduce, which is slower. `seventy info` shows the peer access. GPUs with different memory sizes can work together. Each GPU then gets the KV cache size of the smallest GPU. GPUs other than the V100 are not supported: the engine and the panel stop with an error.
+- 1, 2, 3 or 4 NVIDIA V100 or V100S GPUs (16 GB or 32 GB). On a machine with more GPUs, choose 1, 2, 3 or 4 of them with `--gpus`. For three GPUs, see [Three GPUs](#three-gpus). With more than one GPU, NVLink between the GPUs is recommended. Without NVLink or PCIe peer-to-peer access, tensor parallel uses NCCL for every all-reduce, which is slower. `seventy info` shows the peer access. GPUs with different memory sizes can work together. Each GPU then gets the KV cache size of the smallest GPU. GPUs other than the V100 are not supported: the engine and the panel stop with an error.
 - A working NVIDIA driver. `nvidia-smi` must be able to list the GPUs. Tested with drivers 580.178.04 (branch 580, the last branch for Volta) and 570.133.20. The CUDA 12.9 libraries need driver 525.60.13 or later; drivers before branch 570 are not tested.
 - Enough GPU memory for your model and settings. The panel calculates a memory plan before startup.
 - Internet access for the installation and the model downloads, and enough disk space: approximately 8 GB for the seventy environment (PyTorch and the CUDA libraries), up to 8 GB more for the download cache of uv or pip, 20 GB for the NVFP4 27B model, and 4 GB for its DFlash2 drafter.
@@ -127,6 +127,15 @@ Start on four GPUs with a drafter:
   --gpus 0,1,2,3
 ```
 
+Start on three GPUs with a drafter (this needs a version later than 1.1.4, see [Three GPUs](#three-gpus)):
+
+```bash
+~/seventy-env/bin/seventy engine \
+  --model QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
+  --draft-model incoai/Qwen3.8-27B-DFlash2 \
+  --gpus 0,1,2
+```
+
 The API listens on port **8000**. Use `--port` to change it. The engine runs in the foreground; press **Ctrl+C** to stop it.
 
 See all engine options:
@@ -164,6 +173,26 @@ line. To see all options:
 The KV cache holds the context of all running requests together. A prompt that is larger than the KV cache gets
 an error. The engine prints the size of the KV cache at startup, for example `cache 188256 KV tokens on each GPU`.
 The panel shows it in its memory plan.
+
+### Three GPUs
+
+Three GPUs need a seventy version later than 1.1.4. Until that version is released, install seventy from the main
+branch (see [docs/DEVELOPING.md](DEVELOPING.md)). Version 1.1.4 stops with "tensor parallel needs 1, 2, 4 or 8 GPUs".
+
+The 27B model has 4 KV heads, and 3 GPUs cannot hold equal parts of them. Thus each of the 3 GPUs keeps 2 KV heads:
+GPU 0 keeps heads 0 and 1, GPU 1 keeps heads 1 and 2, and GPU 2 keeps heads 2 and 3. Each GPU computes the query
+heads of its KV heads, but adds only its own 8 of the 24 query heads to the output. The Gated DeltaNet heads, the
+MLP and the vocabulary split in the same way into parts that are almost equal.
+
+- The KV cache of each GPU holds the same bytes per token as with 2 GPUs, but the weights take less memory. On
+  three 32 GB GPUs with DFlash2 and the default settings, the KV cache holds about 938,000 tokens (about 665,000
+  on two GPUs).
+- Decoding is faster than on 2 GPUs and slower than on 4 GPUs. On 32 GB GPUs with NVLink at 250 W, 8 streams at
+  2,000 tokens of context made about 840 tokens per second in total (640 on 2 GPUs, 1,110 on 4 GPUs), and at
+  32,000 tokens about 570 (470 on 2 GPUs, 810 on 4 GPUs).
+- At long context, the gain over 2 GPUs is small: each GPU reads the keys and values of 2 KV heads, as with
+  2 GPUs. At 128,000 tokens, 1 stream made about 110 tokens per second on 3 GPUs and on 2 GPUs (150 on 4 GPUs), and
+  4 streams about 230 in total (210 on 2 GPUs, 360 on 4 GPUs).
 
 ### One GPU
 

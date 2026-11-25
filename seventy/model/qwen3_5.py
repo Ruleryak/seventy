@@ -1,11 +1,13 @@
 """The Qwen3.5-family text model: Gated DeltaNet layers and gated full-attention layers in one residual stream.
 
 Weights are loaded as this rank's tensor-parallel shard:
-- Attention: query heads, KV heads and the o_proj input columns split over the ranks.
+- Attention: query heads, KV heads and the o_proj input columns split over the ranks. When the heads do not split
+  evenly (3 GPUs), a rank computes all query heads of the KV heads it keeps and adds only its own query heads to
+  the output (parallel.HeadSplit); neighbouring ranks then keep some KV heads twice.
 - Gated DeltaNet: key heads, value heads (with their convolution channels, z, a and b rows) and the out_proj
-  input columns split over the ranks.
-- MLP: the intermediate size split over the ranks.
-- Embedding and LM head: the vocabulary split over the ranks.
+  input columns split over the ranks, in the same way (value heads share key heads as query heads share KV heads).
+- MLP: the intermediate size split over the ranks, in parts of whole 64-column units.
+- Embedding and LM head: the vocabulary split over the ranks, in parts of whole 64-row units.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from ..engine.cache import ModelCache
 from ..engine.spec import merge_top
 from ..engine.step import StepInput
 from ..ops import gdn_prefill, kernels
-from ..parallel import SINGLE, Parallel
+from ..parallel import MLP_ALIGN, SINGLE, VOCAB_ALIGN, Parallel
 from ..upload import to_device
 
 RECURRENT_MAX_TOKENS = 32
@@ -39,9 +41,10 @@ class AttentionLayer:
     def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense,
                  quantize: bool = False):
         d = cfg.head_dim
-        h0, h1 = par.span(cfg.num_heads)
-        k0, k1 = par.span(cfg.num_kv_heads)
+        split = par.heads(cfg.num_heads, cfg.num_kv_heads)
+        (h0, h1), (k0, k1), (o0, o1) = split.heads, split.kv, split.own
         self.heads, self.kv_heads, self.head_dim = h1 - h0, k1 - k0, d
+        self.own = split.local_own if split.partial else None
         self.qkv = Linear(
             ckpt,
             [
@@ -51,7 +54,7 @@ class AttentionLayer:
             ],
             dtype, device, keep_dense=keep_dense, quantize=quantize,
         )
-        self.o_proj = Linear(ckpt, [Source(f"{p}.o_proj")], dtype, device, cols=(d * h0, d * h1),
+        self.o_proj = Linear(ckpt, [Source(f"{p}.o_proj")], dtype, device, cols=(d * o0, d * o1),
                              keep_dense=keep_dense, quantize=quantize)
         self.q_norm = _norm_weight(ckpt, f"{p}.q_norm.weight", device, 1.0)
         self.k_norm = _norm_weight(ckpt, f"{p}.k_norm.weight", device, 1.0)
@@ -81,7 +84,7 @@ class AttentionLayer:
                 o = kernels.flash_attention(q, qkv, cache.k[layer], cache.v[layer], step.block_tables,
                                             step.query_start, step.query_start_t, step.context_lens_t, self.scale,
                                             ks, vs, step.context_lens)
-            return self.o_proj(o)
+            return self.o_proj(self._owned(o))
         qg = qkv[:, : 2 * d * self.heads].view(t, self.heads, 2, d)
         q = qg[:, :, 0].contiguous()
         gate = qg[:, :, 1].reshape(t, self.heads * d)
@@ -97,16 +100,24 @@ class AttentionLayer:
         o = ops.paged_attention(q, cache.k[layer], cache.v[layer], step.query_start, step.context_lens,
                                 step.block_tables, self.scale, ks, vs)
         o = ops.sigmoid_gate(o.reshape(t, self.heads * d), gate)
-        return self.o_proj(o)
+        return self.o_proj(self._owned(o))
+
+    def _owned(self, o: torch.Tensor) -> torch.Tensor:
+        """The output columns of this rank's own query heads (all computed heads when the heads split evenly)."""
+        if self.own is None:
+            return o
+        d = self.head_dim
+        return o.view(o.shape[0], -1)[:, self.own[0] * d : self.own[1] * d].contiguous()
 
 
 class GatedDeltaNetLayer:
     def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense):
         dk, dv = cfg.gdn_k_dim, cfg.gdn_v_dim
-        a0, a1 = par.span(cfg.gdn_k_heads)
-        b0, b1 = par.span(cfg.gdn_v_heads)
+        split = par.heads(cfg.gdn_v_heads, cfg.gdn_k_heads)
+        (a0, a1), (b0, b1), (o0, o1) = split.kv, split.heads, split.own
         ks, vs = cfg.gdn_key_size, cfg.gdn_value_size
         self.hk, self.hv, self.dk, self.dv = a1 - a0, b1 - b0, dk, dv
+        self.own = split.local_own if split.partial else None
         qkv_rows = ((a0 * dk, a1 * dk), (ks + a0 * dk, ks + a1 * dk), (2 * ks + b0 * dv, 2 * ks + b1 * dv))
         self.in_proj = Linear(
             ckpt,
@@ -118,7 +129,7 @@ class GatedDeltaNetLayer:
             ],
             dtype, device, keep_dense=keep_dense,
         )
-        self.out_proj = Linear(ckpt, [Source(f"{p}.out_proj")], dtype, device, cols=(b0 * dv, b1 * dv),
+        self.out_proj = Linear(ckpt, [Source(f"{p}.out_proj")], dtype, device, cols=(o0 * dv, o1 * dv),
                                keep_dense=keep_dense)
         conv = ckpt.tensor(f"{p}.conv1d.weight").squeeze(1)
         self.conv_weight = torch.cat([conv[r0:r1] for r0, r1 in qkv_rows]).float().to(device)
@@ -139,7 +150,7 @@ class GatedDeltaNetLayer:
                                       step.state_slots_t, self.hk, self.hv, self.eps, commit=stash is None)
             if stash is not None:
                 stash[layer] = y
-            return self.out_proj(o)
+            return self.out_proj(self._owned(o))
         conv_dim = 2 * key + val
         fast = y.is_cuda and y.dtype == torch.float16 and self.dv == 128
         if fast:
@@ -169,13 +180,20 @@ class GatedDeltaNetLayer:
         else:
             o = ops.gated_rms_norm(o.reshape(t * self.hv, self.dv), z.reshape(t * self.hv, self.dv), self.norm,
                                    self.eps)
-        return self.out_proj(o.view(t, val))
+        return self.out_proj(self._owned(o.view(t, val)))
+
+    def _owned(self, o: torch.Tensor) -> torch.Tensor:
+        """The output columns of this rank's own value heads (all computed heads when the heads split evenly)."""
+        if self.own is None:
+            return o
+        dv = self.dv
+        return o.view(o.shape[0], -1)[:, self.own[0] * dv : self.own[1] * dv].contiguous()
 
 
 class MLP:
     def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense,
                  quantize: bool = False):
-        i0, i1 = par.span(cfg.intermediate_size)
+        i0, i1 = par.span(cfg.intermediate_size, MLP_ALIGN)
         self.gate_up = Linear(ckpt, [Source(f"{p}.gate_proj", ((i0, i1),)), Source(f"{p}.up_proj", ((i0, i1),))],
                               dtype, device, keep_dense=keep_dense, quantize=quantize)
         self.down = Linear(ckpt, [Source(f"{p}.down_proj")], dtype, device, cols=(i0, i1), keep_dense=keep_dense,
@@ -213,8 +231,9 @@ class Qwen35TextModel:
         t = cfg.text
         self.cfg, self.par, self.dtype, self.device = t, par, dtype, torch.device(device)
         p = ckpt.text_prefix
-        v0, v1 = par.span(t.vocab_size)
+        v0, v1 = par.span(t.vocab_size, VOCAB_ALIGN)
         self.vocab_span = (v0, v1)
+        self.vocab_parts = [Parallel(r, par.size).span(t.vocab_size, VOCAB_ALIGN) for r in range(par.size)]
         self.embed = to_device(_to_dtype(ckpt.rows(f"{p}embed_tokens.weight", v0, v1), dtype), device)
         count = t.num_layers if layers is None else layers
         self.layers = [Layer(t, ckpt, i, par, dtype, device, keep_dense) for i in range(count)]
@@ -287,9 +306,12 @@ class Qwen35TextModel:
         out = self.local_logits(x)
         if self.par.size == 1:
             return out
+        widest = max(b - a for a, b in self.vocab_parts)
+        if out.shape[-1] < widest:
+            out = torch.nn.functional.pad(out, (0, widest - out.shape[-1]))
         parts = [torch.empty_like(out) for _ in range(self.par.size)]
         torch.distributed.all_gather(parts, out)
-        return torch.cat(parts, dim=-1)
+        return torch.cat([p[:, : b - a] for p, (a, b) in zip(parts, self.vocab_parts)], dim=-1)
 
     def head_top(self, x: torch.Tensor, k: int, weight=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(argmax, top k logits, their token ids) of final hidden states x, from each rank's vocabulary shard: only

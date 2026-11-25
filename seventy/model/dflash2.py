@@ -50,7 +50,7 @@ import torch.nn.functional as F
 from .. import ops
 from ..checkpoint import Checkpoint
 from ..ops import reference as R
-from ..parallel import SINGLE, Parallel
+from ..parallel import MLP_ALIGN, SINGLE, Parallel
 from ..upload import to_device
 from .layers import _to_dtype
 
@@ -108,17 +108,18 @@ class DraftLayer:
     def __init__(self, cfg: DrafterConfig, ckpt: Checkpoint, i: int, par: Parallel, dtype, device):
         p = f"layers.{i}"
         d = cfg.head_dim
-        h0, h1 = par.span(cfg.heads)
-        k0, k1 = par.span(cfg.kv_heads)
+        split = par.heads(cfg.heads, cfg.kv_heads)
+        (h0, h1), (k0, k1), (o0, o1) = split.heads, split.kv, split.own
         self.heads, self.kv = h1 - h0, k1 - k0
+        self.own = split.local_own if split.partial else None
 
         def w(name, rows=None, cols=None):
             return to_device(_to_dtype(ckpt.dense_part(f"{p}.{name}.weight", rows=rows, cols=cols), dtype), device)
 
         self.q = w("self_attn.q_proj", rows=(h0 * d, h1 * d))
         self.kv_w = torch.cat((w("self_attn.k_proj", rows=(k0 * d, k1 * d)), w("self_attn.v_proj", rows=(k0 * d, k1 * d))))
-        self.o = w("self_attn.o_proj", cols=(h0 * d, h1 * d))
-        i0, i1 = par.span(cfg.intermediate)
+        self.o = w("self_attn.o_proj", cols=(o0 * d, o1 * d))
+        i0, i1 = par.span(cfg.intermediate, MLP_ALIGN)
         self.gate_up = torch.cat((w("mlp.gate_proj", rows=(i0, i1)), w("mlp.up_proj", rows=(i0, i1))))
         self.down = w("mlp.down_proj", cols=(i0, i1))
         norm = lambda name: ckpt.tensor(f"{p}.{name}.weight").float().to(device)
@@ -139,7 +140,7 @@ class Drafter:
                     and os.environ.get("SEVENTY_DRAFTER_FP8", "1") != "0")
         with Checkpoint(path) as ckpt:
             fc = ckpt.tensor("fc.weight")
-            f0, f1 = par.span(fc.shape[1])
+            f0, f1 = par.span(fc.shape[1], 64) if fc.shape[1] % 64 == 0 else (0, fc.shape[1])
             if par.size == 1 or (f1 - f0) % 64 or os.environ.get("SEVENTY_DRAFTER_FC_SPLIT", "1") == "0":
                 f0, f1 = 0, fc.shape[1]
             self.fc_cols = (f0, f1)
@@ -301,7 +302,7 @@ class Drafter:
                                      self.v_ring[li], layer.heads, layer.kv, cfg.eps)
             o = kernels.drafter_attention(q16, self.k_ring[li], self.v_ring[li], slots, ends - blk, blk, cfg.window,
                                           1.0 / math.sqrt(d))
-            return self.par.all_reduce(self._mm(o, layer.o))
+            return self.par.all_reduce(self._mm(self._owned(layer, o), layer.o))
         q = self._mm(h, layer.q).view(-1, layer.heads, d)
         kv = self._mm(h, layer.kv_w).view(-1, 2, layer.kv, d)
         q = self._norm(q.reshape(-1, d), layer.q_norm)[0].view(-1, layer.heads, d)
@@ -324,7 +325,15 @@ class Drafter:
         scores = scores.masked_fill(~visible[:, None, None], float("-inf"))
         o = torch.einsum("bgrts,bsgd->btgrd", torch.softmax(scores, dim=-1), vals)
         o = o.reshape(b * blk, layer.heads * d)
-        return self.par.all_reduce(self._mm_scaled(o, layer.o))
+        return self.par.all_reduce(self._mm_scaled(self._owned(layer, o), layer.o))
+
+    def _owned(self, layer: DraftLayer, o: torch.Tensor) -> torch.Tensor:
+        """The output columns of the rank's own query heads (all computed heads when the heads split evenly)."""
+        own = getattr(layer, "own", None)
+        if own is None:
+            return o
+        d = self.cfg.head_dim
+        return o.view(o.shape[0], -1)[:, own[0] * d : own[1] * d].contiguous()
 
     def hidden(self, anchors: torch.Tensor, starts: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
         """Final hidden states [B * block, hidden] of the blocks [anchor, mask ...] at positions start .. start + block."""

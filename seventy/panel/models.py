@@ -39,7 +39,7 @@ class ModelInfo:
     details: dict = field(default_factory=dict)
 
 
-GPU_COUNTS = (1, 2, 4, 8)
+GPU_COUNTS = (1, 2, 3, 4, 8)
 MTP_TENSORS = ("mtp.fc.weight", "mtp.layers.0.mlp.down_proj.weight")
 
 

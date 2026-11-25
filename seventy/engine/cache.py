@@ -41,9 +41,9 @@ class ModelCache:
         self.scratch_block = num_blocks
         self.scratch_slot = num_slots
         self.kv_dtype = kv_dtype or (torch.int8 if device.type == "cuda" else dtype)
-        kv_heads = cfg.num_kv_heads // par.size
-        hk = cfg.gdn_k_heads // par.size
-        hv = cfg.gdn_v_heads // par.size
+        kv_heads = par.heads(cfg.num_heads, cfg.num_kv_heads).num_kv
+        gdn = par.heads(cfg.gdn_v_heads, cfg.gdn_k_heads)
+        hk, hv = gdn.num_kv, gdn.num_heads
         conv_dim = 2 * hk * cfg.gdn_k_dim + hv * cfg.gdn_v_dim
         attn = tuple(cfg.attention_layers) + tuple(extra_attention_layers)
         na, nl = len(attn), len(cfg.linear_layers)

@@ -51,7 +51,9 @@ def test_missing_gpu_ids_and_counts(gpus):
     gpus(inventory(), "0,1")
     assert any("only 2 are given" in p for p in cli._gpu_problems(4))
     gpus(inventory(), "0,1,2")
-    assert any("1, 2, 4 or 8" in p for p in cli._gpu_problems(3))
+    assert cli._gpu_problems(3) == []
+    gpus(inventory(8), "0,1,2,3,4,5")
+    assert any("1, 2, 3, 4 or 8" in p for p in cli._gpu_problems(6))
 
 
 def test_unknown_gpu_ids_and_no_nvml_are_left_to_the_engine(gpus):
@@ -68,7 +70,7 @@ def test_split_over_8_gpus_is_refused(model_path):
     cfg = load_config(model_path)
     assert memory.split_problems(cfg, 4) == []
     assert any("4 attention KV heads do not split over 8 GPUs" in p for p in memory.split_problems(cfg, 8))
-    assert memory.split_problems(cfg, 3)
+    assert memory.split_problems(cfg, 3) == []
 
 
 def test_engine_stops_on_other_gpus(monkeypatch):

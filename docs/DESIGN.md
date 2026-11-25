@@ -11,7 +11,7 @@ numerics, the memory model, and the milestones.
 | Architecture | `Qwen3_5ForConditionalGeneration` (`model_type: qwen3_5`): Qwen3.5, Qwen3.6, Qwen3.8. Gated DeltaNet layers plus gated full-attention layers, and the vision tower. |
 | Weights | NVFP4 (`compressed-tensors`, format `nvfp4-pack-quantized`, used weight-only) and BF16 (computed in FP16). |
 | Speculative decoding | DFlash2 drafters (`DFlash2DraftModel`), or the MTP layer of the model (`--draft-model mtp`). |
-| GPUs | V100 16 GB and 32 GB; 1, 2 or 4 GPUs in tensor parallel; any set of GPU ids; NVLink or PCIe. Without peer-to-peer access between all GPUs, every all-reduce uses NCCL (identical requests in one batch can then differ at a near-tie). |
+| GPUs | V100 16 GB and 32 GB; 1, 2, 3 or 4 GPUs in tensor parallel; any set of GPU ids; NVLink or PCIe. Without peer-to-peer access between all GPUs, every all-reduce uses NCCL (identical requests in one batch can then differ at a near-tie). |
 | API | OpenAI-compatible HTTP: chat completions (streaming, tools, thinking on or off, images), completions with logprobs and prompt logprobs, tokenize, models, Prometheus metrics. |
 | Control panel | Startup screen, GPU picker, memory plan, live dashboard with history, model downloads, engine log, crash reports, automatic restart, API key. |
 
@@ -46,6 +46,7 @@ added as new model modules. The engine core does not assume one architecture.
 | `csrc/` | CUDA kernels and the C ABI (`seventy.h`). |
 | `seventy/config.py` | Model configuration: parse, check, derive sizes. |
 | `seventy/checkpoint.py` | safetensors index, tensor lookup, slices for tensor parallel. |
+| `seventy/split.py` | How tensor parallel divides heads, the MLP and the vocabulary over the GPUs, also when they do not divide evenly. |
 | `seventy/nvfp4.py` | The NVFP4 format: unpack, dequantize, and the layout our GEMM kernels read. |
 | `seventy/ops/` | One Python function per operation. Each has a PyTorch reference implementation (`reference.py`) and a kernel path. CPU tensors always use the reference. |
 | `seventy/model/` | Model definitions: the Qwen3.5 text model, the vision tower, the DFlash2 drafter, the MTP drafter. |
@@ -67,6 +68,13 @@ API server process ──requests/tokens──────┘
   with the last good settings.
 - The engine runs one process per GPU. Rank 0 owns the scheduler and sends each step's plan to the other ranks.
   All ranks run the same model step on their weight shards.
+- Counts that divide evenly over the GPUs split evenly. On 3 GPUs (`seventy/split.py`), the MLP and the vocabulary
+  split into parts of whole 64-column units, and grouped heads split by query head: each GPU keeps the KV heads
+  that its query heads use and computes all query heads of those KV heads, but adds only its own query heads to the
+  output. For the 27B model, each of the 3 GPUs keeps 2 of the 4 KV heads, and the two middle KV heads are on two
+  GPUs. Gated DeltaNet value and key heads split in the same way (each GPU keeps 6 of the 16 key heads and computes
+  18 of the 48 value heads). The kernels see the usual uniform groups. Uneven splits are allowed on up to 4 GPUs;
+  on 8 GPUs every count must divide evenly.
 - The API server is a separate process, so tokenizing, detokenizing and parsing never delay a GPU step.
 
 ## Control panel
@@ -89,7 +97,7 @@ API server process ──requests/tokens──────┘
   the panel prints the URL with the token. The engine's API key goes to the engine in its environment, never
   on the command line.
 - Downloads use the endpoint in the panel settings, or `HF_ENDPOINT`, or the public Hub.
-- Before a download, the panel reads `config.json`, the file list and, for the MTP layer, the safetensors index of the repository, and applies the checks of a local folder (`seventy.config`, the kernel head sizes, the split over 1, 2, 4 and 8 GPUs). It estimates the GPU counts of the machine whose memory holds the weights with the memory model of the plan. A download of a checkpoint that fails the checks starts only on request (**Download anyway**). Compatible means that the checkpoint passes the checks; the README lists the tested models.
+- Before a download, the panel reads `config.json`, the file list and, for the MTP layer, the safetensors index of the repository, and applies the checks of a local folder (`seventy.config`, the kernel head sizes, the split over 1, 2, 3, 4 and 8 GPUs). It estimates the GPU counts of the machine whose memory holds the weights with the memory model of the plan. A download of a checkpoint that fails the checks starts only on request (**Download anyway**). Compatible means that the checkpoint passes the checks; the README lists the tested models.
 
 ## Numerics
 
@@ -129,7 +137,8 @@ The planner and the engine use one memory model. Per GPU:
   also keeps its own FP16 copy of the output head (the rank's vocab rows), which the files do not hold.
 - Per-request state: Gated DeltaNet state and convolution state for each linear-attention layer, plus the
   drafter state. This is independent of context length.
-- KV bytes per token: for each full-attention layer, K and V for the local KV heads, plus scales. The MTP drafter
+- KV bytes per token: for each full-attention layer, K and V for the local KV heads, plus scales. When KV heads
+  do not split evenly, the GPU with the most KV heads sets the size for all GPUs. The MTP drafter
   adds one more attention layer (its own keys and values) and has no per-request state.
 - The engine measures the real peak of each piece at startup and stores it, so the panel can show what fits
   before it starts the engine.

@@ -1,4 +1,4 @@
-"""Tensor parallel on 2 GPUs, first 4 layers, FP16. Without peer-to-peer access between the GPUs, the engine does
+"""Tensor parallel on 2 and 3 GPUs, first 4 layers, FP16. Without peer-to-peer access between the GPUs, the engine does
 every all-reduce with NCCL. The test fakes that case (torch reports no peer access) on any 2 GPUs and compares the
 logits with one GPU, and with the custom all-reduce where the GPUs have peer access."""
 
@@ -76,3 +76,16 @@ def test_nccl_all_reduce_without_peer_access(model_path):
         custom, fast = logits_with(2, str(model_path), True)
         assert custom
         assert close(fast, nccl), (fast - nccl).abs().max().item()
+
+
+def test_three_gpus_match_one(model_path):
+    """3 GPUs: the heads, the MLP and the vocabulary do not split evenly (seventy.split), and two ranks keep each of
+    the middle KV heads."""
+    from seventy.engine.distributed import peer_access
+
+    if torch.cuda.device_count() < 3 or not peer_access(3):
+        pytest.skip("needs 3 GPUs with peer access")
+    _, single = logits_with(1, str(model_path), True)
+    custom, three = logits_with(3, str(model_path), True)
+    assert custom
+    assert close(single, three), (single - three).abs().max().item()

@@ -95,10 +95,12 @@ def _peer_gpus() -> bool:
 
 
 @pytest.mark.skipif(not _peer_gpus(), reason="needs 2 GPUs with peer-to-peer access (NVLink or PCIe P2P)")
-def test_one_shot_and_two_shot_all_reduce():
+@pytest.mark.parametrize("world", [2, 3, 4])
+def test_one_shot_and_two_shot_all_reduce(world):
     from seventy.engine import distributed
 
-    world = 4 if torch.cuda.device_count() >= 4 else 2
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"needs {world} GPUs")
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
     port = distributed.free_port()

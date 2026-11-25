@@ -144,8 +144,8 @@ def gpu_set_problems(inv: Inventory, ids: list[int]) -> list[str]:
     if missing:
         problems.append(f"no GPU with id {', '.join(map(str, missing))}")
         return problems
-    if len(ids) not in (1, 2, 4, 8):
-        problems.append("tensor parallel needs 1, 2, 4 or 8 GPUs")
+    if len(ids) not in (1, 2, 3, 4, 8):
+        problems.append("tensor parallel needs 1, 2, 3, 4 or 8 GPUs")
     for i in ids:
         if known[i].compute_capability != (7, 0):
             problems.append(f"GPU {i} ({known[i].name}) is not a V100 (sm70)")

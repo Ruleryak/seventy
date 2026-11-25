@@ -179,7 +179,7 @@ curl --fail-with-body -sS http://127.0.0.1:8000/v1/chat/completions \
 ## Advanced installation, startup and tuning
 
 [docs/ADVANCED.md](docs/ADVANCED.md) gives the requirements, installation with pip, startup without the panel,
-16 GB GPUs, the engine options, model downloads, network access, and the panel as a service.
+16 GB GPUs, three GPUs, the engine options, model downloads, network access, and the panel as a service.
 
 ## Use the API
 

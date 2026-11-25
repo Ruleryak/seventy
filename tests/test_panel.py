@@ -74,8 +74,10 @@ def test_plan_for_the_real_checkpoint(model_path, tmp_path):
                                                  "graphs": 1 << 28, "overhead": 1 << 30})
     q = planner.plan(s, inv, planner.Profiles(tmp_path))
     assert q["measured"] and q["kv_tokens"] < p["kv_tokens"]
-    bad = planner.plan(Settings(model=str(model_path), gpus=[0, 1, 2]), inv)
-    assert any("1, 2, 4 or 8" in e for e in bad["errors"])
+    three = planner.plan(Settings(model=str(model_path), gpus=[0, 1, 2], max_model_len=262144), inv)
+    assert three["errors"] == [] and p["kv_tokens"] > three["kv_tokens"] > 600_000
+    bad = planner.plan(Settings(model=str(model_path), gpus=[0, 1, 2, 3, 4, 5]), fake_inventory(8))
+    assert any("1, 2, 3, 4 or 8" in e for e in bad["errors"])
     old = planner.plan(Settings(model=str(model_path), gpus=[0]), fake_inventory(cc=(8, 0)))
     assert any("not a V100" in e for e in old["errors"])
 
@@ -244,7 +246,7 @@ def test_classify_targets_and_drafters():
     from seventy.panel import models
 
     ok = models.classify(hub_config(), "r", "r", 10 << 30, True, True)
-    assert ok.ok and ok.kind == "target" and ok.details["mtp"] is True and ok.details["gpu_counts"] == [1, 2, 4]
+    assert ok.ok and ok.kind == "target" and ok.details["mtp"] is True and ok.details["gpu_counts"] == [1, 2, 3, 4]
     rope = {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25, "mrope_section": [6, 5, 5],
             "mrope_interleaved": True}
     small_heads = models.classify(hub_config(head_dim=128, rope_parameters=rope), "r", "r", 1, True)
@@ -257,11 +259,11 @@ def test_classify_targets_and_drafters():
     small = models.classify(hub_config(), "r", "r", 10 << 30, True, gpu_bytes=32 << 30, gpu_count=4)
     big = models.classify(hub_config(), "r", "r", 60 << 30, True, gpu_bytes=32 << 30, gpu_count=4)
     two = models.classify(hub_config(), "r", "r", 60 << 30, True, gpu_bytes=32 << 30, gpu_count=2)
-    assert (small.details["fits"], big.details["fits"], two.details["fits"]) == ([1, 2, 4], [4], [])
+    assert (small.details["fits"], big.details["fits"], two.details["fits"]) == ([1, 2, 3, 4], [3, 4], [])
     untied = models.classify(hub_config(vocab_size=1 << 20), "r", "r", 24 << 30, True, gpu_bytes=32 << 30, gpu_count=4)
     tied = models.classify(hub_config(vocab_size=1 << 20, tie_word_embeddings=True), "r", "r", 24 << 30, True,
                            gpu_bytes=32 << 30, gpu_count=4)
-    assert (untied.details["fits"], tied.details["fits"]) == ([1, 2, 4], [2, 4])
+    assert (untied.details["fits"], tied.details["fits"]) == ([1, 2, 3, 4], [2, 3, 4])
     drafter = models.classify({"architectures": ["DFlash2DraftModel"], "dflash_config": {"block_size": 8}}, "d", "d", 5, False)
     assert drafter.ok and drafter.kind == "drafter"
 
