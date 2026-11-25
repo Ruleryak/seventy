@@ -37,7 +37,9 @@ Other Flash-Next checkpoints that were compared:
 - The Qwen4-Exp text model (`seventy/model/qwen4_exp.py`): hyper-connections (with kernels, `csrc/hyper.cu`), the
   n-gram embeddings (PLE) from the memory-mapped table in host memory, the QSA indexer and sparse attention (the
   attention kernels while every sequence fits in the indexer budget, else PyTorch over the selected tokens), the
-  sigmoid gate of its Gated DeltaNet layers. It runs on the GPUs without CUDA graphs.
+  sigmoid gate of its Gated DeltaNet layers. On the GPUs, QSA (`csrc/qsa.cu`: pooled block keys, block scores,
+  top-k selection, sparse attention over the paged cache) and PLE (`csrc/ple.cu`: hashing, the table rows from
+  pinned host memory, the convolution and its state) run in kernels, and decode steps run in CUDA graphs.
 
 ## Results on 4 x V100-SXM2-32GB (local, 250 W), without speed sweeps
 
@@ -50,7 +52,11 @@ Other Flash-Next checkpoints that were compared:
 | `nvidia/Qwen3.6-35B-A3B-NVFP4` | 4 | MTP | 3,516,528 | pass | 168 tok/s |
 | `Qwen/Qwen3.6-35B-A3B` (BF16) | 3 | none | 408,816 | pass (lowercase image text) | 95 tok/s |
 | `Qwen/Qwen3.6-35B-A3B` (BF16) | 4 | none | 1,614,544 | pass (lowercase image text) | 102 tok/s |
-| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | none | 285,760 (max 65,536 per request) | pass, needles at 8K and 30K (lowercase image text) | 10 tok/s (PyTorch paths) |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | none | 408,048 | pass, needles at 8K and 30K (lowercase image text); a 250K-token needle passes | 47.7 tok/s |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | none | 47,904 (2 streams, `--gpu-memory-utilization 0.97`) | pass, needles at 8K and 30K (lowercase image text) | 45.5 tok/s |
+
+Flash-Next with 8 identical requests at the same time: 182 tok/s in total on 4 GPUs. With the default settings,
+the weights and the activation reserve do not fit on three 32 GB GPUs.
 
 The smoke checks: greedy and sampled answers, needles at 8K and 30K or 100K tokens, an image, 8 identical greedy
 requests at the same time, one stream of 512 tokens.
@@ -64,9 +70,8 @@ requests at the same time, one stream of 512 tokens.
 
 ## Not done
 
-- Flash-Next speed: QSA kernels (indexer scores, block top-k, sparse attention over the paged cache), the n-gram
-  hashing and table reads on the GPU (from pinned host memory), then CUDA graphs; its MTP layer and its DFlash2
-  drafter.
-- Flash-Next up to its full context (262,144 tokens): runs so far used at most 65,536 per request.
+- Flash-Next: its MTP layer and its DFlash2 drafter; MXFP8 GEMMs (the attention, Gated DeltaNet and shared-expert
+  weights are FP16 on the GPU now, twice their checkpoint size), which would also leave room for a larger KV cache
+  on 3 GPUs; faster prefill (the QSA scores run row by row).
 - Faster MoE decode: the shared expert in the grouped GEMM, fewer small kernels per layer, MXFP8 GEMMs.
 - The panel's checks for MoE checkpoints (sizes of the expert weights per GPU).
