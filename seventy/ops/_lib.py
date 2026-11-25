@@ -77,7 +77,7 @@ SIGNATURES = {
                                      _I32, _I32, _I32, _F32, _I32, _P]),
     "seventy_nvfp4_gemm": (_I32, [_P, _P, _P, _P, _P, _I32, _I32, _I32, _I32, _I32, _I32, _P, _I64, _P]),
     "seventy_moe_plan": (_I32, [_P, _I32, _I32, _I32, _I32, _I32, _P, _P, _P, _P, _P, _P]),
-    "seventy_moe_gemm": (_I32, [_P, _P, _I32, _P, _P, _P, _I32, _I32, _I32, _P, _P, _P, _P, _P, _I32, _P, _P]),
+    "seventy_moe_gemm": (_I32, [_P, _P, _I32, _P, _P, _P, _I32, _I32, _I32, _P, _P, _P, _P, _P, _I32, _I32, _P, _P]),
 }
 
 

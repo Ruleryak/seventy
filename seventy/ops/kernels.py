@@ -616,6 +616,14 @@ class DenseWeight:
 _LANES = [8 * ((l >> 2) & 3) + (l & 3) + 4 * (l >= 16) for l in range(32)]
 
 
+def dense_unpack(w: DenseWeight) -> torch.Tensor:
+    """The FP16 weight [n, k] of a packed DenseWeight."""
+    inv = torch.empty(32, dtype=torch.long)
+    inv[torch.tensor(_LANES)] = torch.arange(32)
+    rows = w.wpk.permute(0, 2, 1, 3)[:, inv.to(w.wpk.device)].reshape(w.n_padded, w.k)
+    return rows[: w.n]
+
+
 class DenseWeightFP8:
     """An FP16 weight [n, k] quantized to FP8 E4M3 with one scale per output row (the speculative drafter only:
     lossy), packed for seventy_dense_gemm_fp8 as [n_padded / 32, k / 64, 32 lanes, 64 bytes] (the DenseWeight
@@ -638,6 +646,26 @@ class DenseWeightFP8:
         self.wpk = q.view(n_padded // 32, 32, k // 64, 64)[:, lanes].permute(0, 2, 1, 3).contiguous()
         self.col_scale = scale * 256.0
         self.n, self.k, self.n_padded = n, k, n_padded
+
+    @classmethod
+    def from_fp8(cls, values: torch.Tensor, row_scale: torch.Tensor) -> "DenseWeightFP8":
+        """Pack FP8 E4M3 weights as stored ([n, k] bytes, uint8 or float8_e4m3fn) with one FP32 scale per row
+        (W = value * row_scale): no rounding, so FP8 checkpoints keep their exact weights."""
+        values = values.view(torch.uint8)
+        n, k = values.shape
+        if k % 64:
+            raise ValueError("dense GEMM weights must have k a multiple of 64")
+        n_padded = -(-n // 32) * 32
+        q = torch.zeros(n_padded, k, dtype=torch.uint8, device=values.device)
+        q[:n] = values
+        scale = torch.zeros(n_padded, dtype=torch.float32, device=values.device)
+        scale[:n] = row_scale.float().to(values.device)
+        lanes = torch.tensor(_LANES, device=values.device)
+        out = cls.__new__(cls)
+        out.wpk = q.view(n_padded // 32, 32, k // 64, 64)[:, lanes].permute(0, 2, 1, 3).contiguous()
+        out.col_scale = scale * 256.0
+        out.n, out.k, out.n_padded = n, k, n_padded
+        return out
 
     @classmethod
     def from_dense(cls, w: "DenseWeight", chunk_tiles: int = 256) -> "DenseWeightFP8":
@@ -845,7 +873,7 @@ def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
     return out
 
 
-MOE_ROWS_PER_SLOT = 8
+MOE_ROWS_PER_SLOT = int(os.environ.get("SEVENTY_MOE_ROWS", "2"))
 
 
 def moe_max_slots(pairs: int, experts: int) -> int:
@@ -887,7 +915,7 @@ def moe_gemm(x: torch.Tensor, row_div: int, weight: torch.Tensor, scales: torch.
     code = lib().seventy_moe_gemm(out.data_ptr(), x.data_ptr(), row_div, weight.data_ptr(),
                                   scales.data_ptr() if nvfp4 else None, alpha.data_ptr() if nvfp4 else None,
                                   int(nvfp4), n, k, order.data_ptr(), slot_expert.data_ptr(), slot_start.data_ptr(),
-                                  slot_count.data_ptr(), num.data_ptr(), max_slots,
+                                  slot_count.data_ptr(), num.data_ptr(), max_slots, MOE_ROWS_PER_SLOT,
                                   pair_weight.data_ptr() if pair_weight is not None else None, _stream(x))
     check("moe_gemm", code)
     return out

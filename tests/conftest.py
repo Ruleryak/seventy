@@ -69,6 +69,28 @@ def moe_model_path() -> Path:
     return path
 
 
+FLASH_NEXT_REPO = "nvidia/Qwen3.8-Flash-Next-FP4-Local"
+
+
+@pytest.fixture(scope="session")
+def flash_next_path() -> Path:
+    """A Qwen4-Exp checkpoint: SEVENTY_TEST_FLASH_NEXT, else FLASH_NEXT_REPO in the Hugging Face cache."""
+    override = os.environ.get("SEVENTY_TEST_FLASH_NEXT")
+    path = None
+    if override:
+        path = Path(override)
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+
+            path = Path(snapshot_download(FLASH_NEXT_REPO, local_files_only=True))
+        except Exception:
+            path = None
+    if path is None or not (path / "config.json").is_file():
+        pytest.skip(f"Flash-Next checkpoint not found (set SEVENTY_TEST_FLASH_NEXT or download {FLASH_NEXT_REPO})")
+    return path
+
+
 @pytest.fixture(scope="session")
 def model_path() -> Path:
     path = _find_model()

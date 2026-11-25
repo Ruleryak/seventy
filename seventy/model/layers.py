@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 
 import torch
@@ -14,6 +16,7 @@ from ..ops import kernels
 from ..upload import to_device
 
 SMALL_BATCH = 64
+FP8_LINEAR = os.environ.get("SEVENTY_FP8_LINEAR", "1") != "0"
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,11 @@ class Linear:
         quantized = [ckpt.is_nvfp4(s.module) for s in sources]
         if any(quantized) and not all(quantized):
             raise ValueError(f"cannot fuse quantized and dense modules: {[s.module for s in sources]}")
+        self.fp8 = self.fp8_tail = None
+        if (not quantized[0] and torch.device(device).type == "cuda" and dtype == torch.float16 and not keep_dense
+                and not quantize and FP8_LINEAR and self._fp8(ckpt, sources, device, cols)):
+            self.out_features = self.fp8.n + (self.fp8_tail.n if self.fp8_tail is not None else 0)
+            return
         pieces = []
         for s in sources:
             n = ckpt.out_rows(s.module)
@@ -72,6 +80,36 @@ class Linear:
         self.out_features = (self.dense.shape[0] if self.dense is not None else self.gemm.n if self.gemm is not None
                              else sum(p.shape[0] for p in self.parts))
 
+    def _fp8(self, ckpt: Checkpoint, sources: list[Source], device, cols) -> bool:
+        """Keep FP8 modules (one scale per tensor or per row) as FP8 for the FP8 GEMM: the leading sources that are
+        FP8 form one weight, and dense sources after them a small FP16 tail (in the Gated DeltaNet projection,
+        the gate rows b and a). False, and nothing kept, when no leading source is FP8 or k is not a multiple
+        of 64."""
+        kinds = [ckpt.kind(s.module) for s in sources]
+        lead = 0
+        while lead < len(kinds) and kinds[lead] == "fp8":
+            lead += 1
+        if not lead or any(k == "fp8" for k in kinds[lead:]):
+            return False
+        values, scales = [], []
+        for s in sources[:lead]:
+            n = ckpt.out_rows(s.module)
+            for r in s.rows or ((0, n),):
+                v, sc = ckpt.fp8_part(s.module, rows=r, cols=cols)
+                values.append(v)
+                scales.append(sc)
+        if values[0].shape[1] % 64:
+            return False
+        self.fp8 = kernels.DenseWeightFP8.from_fp8(to_device(torch.cat(values), device), torch.cat(scales))
+        tail = []
+        for s in sources[lead:]:
+            n = ckpt.out_rows(s.module)
+            for r in s.rows or ((0, n),):
+                tail.append(ckpt.linear_part(s.module, rows=r, cols=cols))
+        if tail:
+            self.fp8_tail = kernels.DenseWeight(to_device(_to_dtype(torch.cat(tail), torch.float16), device))
+        return True
+
     def _dequantize(self) -> torch.Tensor:
         if self.parts[0].packed.is_cuda and self.dtype == torch.float16:
             return torch.cat([ops.nvfp4_dequantize(p) for p in self.parts])
@@ -80,6 +118,11 @@ class Linear:
     def weight(self) -> torch.Tensor:
         if self.dense is not None:
             return self.dense
+        if self.fp8 is not None:
+            w = self.fp8.dequantize().to(torch.float16)
+            if self.fp8_tail is not None:
+                w = torch.cat((w, kernels.dense_unpack(self.fp8_tail)))
+            return w
         if self.gemm is not None:
             return kernels.nvfp4_gemm_dequantize(self.gemm)
         return self._dequantize()
@@ -88,6 +131,12 @@ class Linear:
         """x W^T, written to out when given (a contiguous [rows, out_features] tensor)."""
         if self.gemm is not None and 0 < x.shape[0] <= SMALL_BATCH and x.is_contiguous():
             return kernels.nvfp4_gemm(x, self.gemm, out=out)
+        if self.fp8 is not None and 0 < x.shape[0] <= SMALL_BATCH:
+            x = x.contiguous()
+            y = kernels.dense_gemm(x, self.fp8, out_fp32=False)
+            if self.fp8_tail is not None:
+                y = torch.cat((y, kernels.dense_gemm(x, self.fp8_tail, out_fp32=False)), dim=1)
+            return y if out is None else out.copy_(y)
         y = F.linear(x, self.weight())
         return y if out is None else out.copy_(y)
 

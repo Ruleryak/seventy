@@ -146,6 +146,16 @@ class Checkpoint:
         return Nvfp4Weight(packed=packed.contiguous(), scales=scales.contiguous().view(torch.uint8),
                            global_scale=global_scale)
 
+    def fp8_part(self, module: str, rows: tuple[int, int] | None = None,
+                 cols: tuple[int, int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """(E4M3 bytes uint8 [rows, cols], FP32 scale per row) of an "fp8" module, as stored."""
+        weight = self.dense_part(f"{module}.weight", rows=rows, cols=cols).view(torch.uint8)
+        scale = self.tensor(f"{module}.weight_scale").float().reshape(-1)
+        if scale.numel() == 1:
+            return weight, scale.expand(weight.shape[0]).clone()
+        r0, r1 = rows if rows is not None else (0, scale.numel())
+        return weight, scale[r0:r1].clone()
+
     def linear_part(self, module: str, rows: tuple[int, int] | None = None,
                     cols: tuple[int, int] | None = None) -> torch.Tensor:
         """Rows and columns [start, stop) of a linear module's weight that is not NVFP4: dense as stored, or FP8 and
