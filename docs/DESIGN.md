@@ -11,7 +11,7 @@ numerics, the memory model, and the milestones.
 | Architecture | `Qwen3_5ForConditionalGeneration` (`model_type: qwen3_5`): Qwen3.5, Qwen3.6, Qwen3.8. Gated DeltaNet layers plus gated full-attention layers, and the vision tower. |
 | Weights | NVFP4 (`compressed-tensors`, format `nvfp4-pack-quantized`, used weight-only) and BF16 (computed in FP16). |
 | Speculative decoding | DFlash2 drafters (`DFlash2DraftModel`), or the MTP layer of the model (`--draft-model mtp`). |
-| GPUs | V100 16 GB and 32 GB; 1, 2, 3 or 4 GPUs in tensor parallel; any set of GPU ids; NVLink or PCIe. Without peer-to-peer access between all GPUs, every all-reduce uses NCCL (identical requests in one batch can then differ at a near-tie). |
+| GPUs | V100 16 GB and 32 GB; 1, 2, 3 or 4 GPUs in tensor parallel; any set of GPU ids; NVLink or PCIe. Without peer-to-peer access between all GPUs, every all-reduce uses NCCL (identical requests in one batch can then differ at a near-tie). The engine also checks at start that peer writes arrive: if they do not on a host that reports peer access, every all-reduce uses NCCL without peer-to-peer transfers. The waits of the peer-to-peer all-reduce end after 30 s: the engine then stops with an error instead of a hang. |
 | API | OpenAI-compatible HTTP: chat completions (streaming, tools, thinking on or off, images), completions with logprobs and prompt logprobs, tokenize, models, Prometheus metrics. |
 | Control panel | Startup screen, GPU picker, memory plan, live dashboard with history, model downloads, engine log, crash reports, automatic restart, API key. |
 

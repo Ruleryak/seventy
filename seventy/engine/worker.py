@@ -24,6 +24,9 @@ from .runner import ModelRunner, build_step
 
 
 def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None):
+    """This rank's shard of the model, with the peer-to-peer all-reduce when the start check passes on every rank.
+    With tensor parallel, it ends with a first NCCL all-reduce: NCCL then makes its communicator (and its buffers
+    in GPU memory) before the caller measures the memory that is left for the KV cache."""
     cfg = load_config(Path(model_path))
     with Checkpoint(Path(model_path)) as ckpt:
         model = Qwen35TextModel(cfg, ckpt, device, dtype, par=Parallel(rank, size), layers=layers)
@@ -39,8 +42,15 @@ def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None
 
         from .allreduce import CustomAllReduce
 
-        model.par = dataclasses.replace(model.par, custom=CustomAllReduce(rank, size, torch.device(device),
-                                                                          dim=cfg.text.hidden_size))
+        custom = CustomAllReduce(rank, size, torch.device(device), dim=cfg.text.hidden_size)
+        if custom.usable:
+            model.par = dataclasses.replace(model.par, custom=custom)
+        elif rank == 0:
+            print(f"seventy: the GPUs report peer access, but the peer-to-peer all-reduce check failed "
+                  f"({custom.problem}); every all-reduce uses NCCL without peer-to-peer transfers "
+                  f"(NCCL_P2P_DISABLE={os.environ.get('NCCL_P2P_DISABLE')}), which is slower", flush=True)
+    if size > 1 and torch.device(device).type == "cuda":
+        torch.distributed.all_reduce(torch.zeros(1, device=device))
     return cfg, model
 
 

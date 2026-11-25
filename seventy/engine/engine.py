@@ -380,6 +380,7 @@ class Engine:
                 self._release_images(w.request)
             if self.drafter is not None:
                 self._draft_after_prefill(plan.prefill)
+        self._check_collectives()
         self.stats["steps"] += 1
         self.stats["cache_hits"] = self.scheduler.cache.hits
         self.stats["cache_hit_tokens"] = self.scheduler.cache.hit_tokens
@@ -396,6 +397,15 @@ class Engine:
                 self.requests.pop(rid, None)
             result.append(out)
         return result
+
+    def _check_collectives(self) -> None:
+        """Stop when a wait of the peer-to-peer all-reduce gave up on any rank (seventy.engine.allreduce): its sums
+        are wrong from then on."""
+        custom = self.model.par.custom
+        problem = custom.failure() if custom is not None else None
+        if problem:
+            raise RuntimeError(f"the peer-to-peer all-reduce stopped: {problem}. Peer writes between these GPUs do "
+                               "not arrive reliably. Start seventy again with SEVENTY_CUSTOM_ALLREDUCE=0 to use NCCL")
 
     def _draft_after_prefill(self, work: list[Work]) -> None:
         """First drafts of the sequences whose prompt this prefill step finished."""

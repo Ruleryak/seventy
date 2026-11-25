@@ -30,15 +30,30 @@ def master_store(size: int) -> dist.TCPStore:
     return dist.TCPStore("127.0.0.1", 0, size, is_master=True, timeout=TIMEOUT, wait_for_workers=False)
 
 
+_store: dist.Store | None = None
+
+
 def init(rank: int, size: int, port: int, backend: str, store: dist.TCPStore | None = None) -> None:
-    """Join the process group: with the store of rank 0 (master_store), else with a TCP store at port."""
+    """Join the process group: with the store of rank 0 (master_store), else with a TCP store at port. NCCL makes
+    its communicator at the first collective, so environment settings for NCCL still take effect until then."""
+    global _store
     if store is None:
         store = dist.TCPStore("127.0.0.1", port, size, is_master=rank == 0, timeout=TIMEOUT, wait_for_workers=False)
     dist.init_process_group(backend=backend, store=store, rank=rank, world_size=size, timeout=TIMEOUT)
+    _store = store
+
+
+def store() -> dist.Store:
+    """The key-value store of the process group (TCP, through rank 0): for exchanges that must not use NCCL."""
+    if _store is not None:
+        return _store
+    return dist.distributed_c10d._get_default_store()
 
 
 def shutdown() -> None:
     """Tear the process group down. Call it on every rank, after dropping CUDA graphs that contain collectives."""
+    global _store
+    _store = None
     if dist.is_initialized():
         import gc
 

@@ -298,6 +298,14 @@ SEVENTY_API int64_t seventy_ar_buffer_bytes(int world, int64_t slot_bytes);
 SEVENTY_API int seventy_ar_alloc(int world, int64_t slot_bytes, void **ptr, void *handle);
 SEVENTY_API int seventy_ar_open(const void *handle, void **ptr);
 SEVENTY_API int seventy_ar_context(int rank, int world, void *const *buffers, int64_t slot_bytes, void **ctx_out);
+/*
+ * Bounded waits of a context (csrc/allreduce.cu): every wait of its kernels gives up after timeout_ns (default 30 s)
+ * or when another rank gave up. The first rank that gives up writes site << 8 | (rank + 1) into the first word of
+ * host_page: 4096 bytes of page-aligned host memory that every rank maps (a shared file mapping), registered here.
+ * host_page NULL keeps the current word and changes only the timeout. The settings live in device memory: they take
+ * effect for every later launch and graph replay.
+ */
+SEVENTY_API int seventy_ar_guard(void *ctx, void *host_page, int64_t timeout_ns);
 SEVENTY_API int seventy_ar_norm(void *ctx, void *out, void *residual, const void *x, const float *weight, int rows,
                                 int dim, float eps, cudaStream_t stream);
 
