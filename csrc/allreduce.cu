@@ -42,6 +42,49 @@ struct ArContext {
 };
 
 /*
+ * Bounded waits. Every wait loop gives up when its data or flag has not arrived after the guard's time limit (for
+ * example on a host that reports peer access but drops peer writes), or when another rank gave up already. The
+ * first rank that gives up writes site << 8 | (rank + 1) into the guard's abort word, in host memory that all ranks
+ * map (seventy_ar_guard), and the host reads it after each step. A wait reads the clock and the guard only after
+ * every 1024 polls, so a wait whose data is already there costs nothing more. The guard sits in device memory after
+ * the counters, so the kernel parameters keep their size. Time counts in units of 1024 ns (32 bits: 73 minutes).
+ */
+struct Guard {
+  volatile uint32_t *abort;
+  uint32_t timeout_units;
+  uint32_t pad;
+};
+
+constexpr uint32_t kDefaultTimeoutUnits = static_cast<uint32_t>(30ull * 1000 * 1000 * 1000 >> 10);
+constexpr int64_t kCounterBytes = 2 * static_cast<int64_t>(kMaxBlocks) * sizeof(uint32_t);
+
+__device__ __forceinline__ uint32_t clock_units() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return static_cast<uint32_t>(t >> 10);
+}
+
+struct Spin {
+  uint32_t polls = 0;
+  uint32_t start = 0;
+
+  __device__ __forceinline__ bool more(const ArContext &ctx, uint32_t site) {
+    if ((++polls & 1023u) != 0) return true;
+    const Guard *g = reinterpret_cast<const Guard *>(ctx.counters + 2 * kMaxBlocks);
+    volatile uint32_t *abort = g->abort;
+    if (abort != nullptr && *abort != 0) return false;
+    const uint32_t now = clock_units();
+    if (start == 0) {
+      start = now;
+      return true;
+    }
+    if (now - start < g->timeout_units) return true;
+    if (abort != nullptr) *abort = (site << 8) | static_cast<uint32_t>(ctx.rank + 1);
+    return false;
+  }
+};
+
+/*
  * Push protocol (ar_norm_push_kernel). The data is its own flag: an empty slot holds the FP16 NaN 0x7f7f in every
  * half, a sender writes its 16-byte packs straight into the receiver's slot, and the receiver spins on its own
  * slots until no half is 0x7f7f, then writes 0x7f7f back. A payload half equal to 0x7f7f is sent as the NaN 0x7e00.
@@ -100,11 +143,12 @@ __device__ __forceinline__ uint4 escape(uint4 v) {
   return v;
 }
 
-__device__ __forceinline__ uint4 wait_full(const void *p) {
+__device__ __forceinline__ uint4 wait_full(const void *p, const ArContext &ctx) {
   uint4 v;
+  Spin spin;
   do {
     v = ld_vol(p);
-  } while (is_empty(v));
+  } while (is_empty(v) && spin.more(ctx, 1));
   return v;
 }
 
@@ -120,11 +164,12 @@ __device__ __forceinline__ uint4 escape32(uint4 v) {
   return v;
 }
 
-__device__ __forceinline__ uint4 wait_full32(const void *p) {
+__device__ __forceinline__ uint4 wait_full32(const void *p, const ArContext &ctx) {
   uint4 v;
+  Spin spin;
   do {
     v = ld_vol(p);
-  } while (is_empty32(v));
+  } while (is_empty32(v) && spin.more(ctx, 2));
   return v;
 }
 
@@ -192,7 +237,8 @@ __global__ void __launch_bounds__(kThreads) ar_norm_kernel(ArContext ctx, half *
     uint32_t *flag = reinterpret_cast<uint32_t *>(ctx.buffers[threadIdx.x]) + b * kMaxRanks + ctx.rank;
     store_release(flag, epoch);
     const uint32_t *mine = reinterpret_cast<const uint32_t *>(ctx.buffers[ctx.rank]) + b * kMaxRanks + threadIdx.x;
-    while (load_acquire(mine) != epoch) {
+    Spin spin;
+    while (load_acquire(mine) != epoch && spin.more(ctx, 3)) {
     }
   }
   __syncthreads();
@@ -303,7 +349,8 @@ __global__ void __launch_bounds__(kThreads) ar_norm_2shot_kernel(ArContext ctx, 
     store_release(reinterpret_cast<uint32_t *>(ctx.buffers[home]) + b * kMaxRanks + ctx.rank, epoch);
   if (mine && threadIdx.x < ctx.world) {
     const uint32_t *flag = reinterpret_cast<const uint32_t *>(ctx.buffers[ctx.rank]) + b * kMaxRanks + threadIdx.x;
-    while (load_acquire(flag) != epoch) {
+    Spin spin;
+    while (load_acquire(flag) != epoch && spin.more(ctx, 4)) {
     }
   }
   __syncthreads();
@@ -371,7 +418,8 @@ __global__ void __launch_bounds__(kThreads) ar_norm_2shot_kernel(ArContext ctx, 
   }
   if (threadIdx.x == 0) {
     const uint32_t *flag = reinterpret_cast<const uint32_t *>(ctx.buffers[ctx.rank]) + signal2 + b * kMaxRanks + home;
-    while (load_acquire(flag) != epoch) {
+    Spin spin;
+    while (load_acquire(flag) != epoch && spin.more(ctx, 5)) {
     }
   }
   __syncthreads();
@@ -436,7 +484,7 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_kernel(ArContext ctx, h
       float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
       for (int p = 0; p < ctx.world; ++p) {
         float f[8];
-        unpack8(wait_full(local + p * slot_vecs + i), f);
+        unpack8(wait_full(local + p * slot_vecs + i, ctx), f);
 #pragma unroll
         for (int k = 0; k < 8; ++k) acc[k] += f[k];
       }
@@ -484,10 +532,10 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_kernel(ArContext ctx, h
     for (int j = 0; j < kVecs; ++j) {
       const int i = threadIdx.x + j * kThreads;
       if (i >= vec_per_row) break;
-      dst[i] = wait_full(g + i);
+      dst[i] = wait_full(g + i, ctx);
       st_vol(g + i, empty);
       if (gather_residual) {
-        const uint4 rv = wait_full(g + slot_vecs + i);
+        const uint4 rv = wait_full(g + slot_vecs + i, ctx);
         st_vol(g + slot_vecs + i, empty);
         if (res != nullptr) res[i] = rv;
       }
@@ -542,7 +590,7 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_all_kernel(ArContext ct
       float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
       for (int p = 0; p < ctx.world; ++p) {
         float f[8];
-        unpack8(wait_full(local + p * slot_vecs + i), f);
+        unpack8(wait_full(local + p * slot_vecs + i, ctx), f);
 #pragma unroll
         for (int k = 0; k < 8; ++k) acc[k] += f[k];
       }
@@ -561,7 +609,7 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_all_kernel(ArContext ct
     for (int j = 0; j < kVecs; ++j) {
       const int i = threadIdx.x + j * nt;
       if (i >= vec_per_row) break;
-      unpack8(wait_full(g + i), r[j]);
+      unpack8(wait_full(g + i, ctx), r[j]);
       st_vol(g + i, empty);
     }
   }
@@ -656,7 +704,7 @@ __global__ void __launch_bounds__(kThreads) ar_norm_push_one_kernel(ArContext ct
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     for (int p = 0; p < ctx.world; ++p) {
       float f[8];
-      unpack8(wait_full(local + p * slot_vecs + i), f);
+      unpack8(wait_full(local + p * slot_vecs + i, ctx), f);
 #pragma unroll
       for (int k = 0; k < 8; ++k) acc[k] += f[k];
     }
@@ -740,7 +788,7 @@ __global__ void __launch_bounds__(kThreads) ar_sum_push_kernel(ArContext ctx, fl
     for (int i = threadIdx.x; i < vecs; i += kThreads) {
       float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
       for (int p = 0; p < ctx.world; ++p) {
-        const uint4 v = wait_full32(local + p * slot_vecs + i);
+        const uint4 v = wait_full32(local + p * slot_vecs + i, ctx);
         acc.x += __uint_as_float(v.x);
         acc.y += __uint_as_float(v.y);
         acc.z += __uint_as_float(v.z);
@@ -757,7 +805,7 @@ __global__ void __launch_bounds__(kThreads) ar_sum_push_kernel(ArContext ctx, fl
   } else {
     uint4 *g = reinterpret_cast<uint4 *>(ctx.buffers[ctx.rank] + p2) + off;
     for (int i = threadIdx.x; i < vecs; i += kThreads) {
-      dst[i] = wait_full32(g + i);
+      dst[i] = wait_full32(g + i, ctx);
       st_vol(g + i, empty);
     }
   }
@@ -798,7 +846,8 @@ __global__ void __launch_bounds__(kThreads) ar_sum_f32_kernel(ArContext ctx, flo
     uint32_t *flag = reinterpret_cast<uint32_t *>(ctx.buffers[threadIdx.x]) + b * kMaxRanks + ctx.rank;
     store_release(flag, epoch);
     const uint32_t *mine = reinterpret_cast<const uint32_t *>(ctx.buffers[ctx.rank]) + b * kMaxRanks + threadIdx.x;
-    while (load_acquire(mine) != epoch) {
+    Spin spin;
+    while (load_acquire(mine) != epoch && spin.more(ctx, 6)) {
     }
   }
   __syncthreads();
@@ -857,8 +906,12 @@ SEVENTY_API int seventy_ar_context(int rank, int world, void *const *buffers, in
   ctx->rank = rank;
   ctx->world = world;
   ctx->slot_bytes = slot_bytes;
-  cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&ctx->counters), 2 * kMaxBlocks * sizeof(uint32_t));
-  if (e == cudaSuccess) e = cudaMemset(ctx->counters, 0, 2 * kMaxBlocks * sizeof(uint32_t));
+  cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&ctx->counters), kCounterBytes + sizeof(Guard));
+  if (e == cudaSuccess) e = cudaMemset(ctx->counters, 0, kCounterBytes);
+  const Guard guard{nullptr, kDefaultTimeoutUnits, 0};
+  if (e == cudaSuccess)
+    e = cudaMemcpy(reinterpret_cast<char *>(ctx->counters) + kCounterBytes, &guard, sizeof(guard),
+                   cudaMemcpyHostToDevice);
   ctx->push_epochs = ctx->counters + kMaxBlocks;
   if (e != cudaSuccess) {
     delete ctx;
@@ -866,6 +919,31 @@ SEVENTY_API int seventy_ar_context(int rank, int world, void *const *buffers, in
   }
   *ctx_out = ctx;
   return SEVENTY_OK;
+}
+
+SEVENTY_API int seventy_ar_guard(void *ctx_ptr, void *host_page, int64_t timeout_ns) {
+  using namespace seventy;
+  auto *ctx = static_cast<ArContext *>(ctx_ptr);
+  const int64_t units = timeout_ns >> 10;
+  if (ctx == nullptr || units <= 0 || units > 0x7fffffff || reinterpret_cast<uintptr_t>(host_page) % 4096)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  char *at = reinterpret_cast<char *>(ctx->counters) + kCounterBytes;
+  Guard guard;
+  cudaError_t e = cudaMemcpy(&guard, at, sizeof(guard), cudaMemcpyDeviceToHost);
+  if (e != cudaSuccess) return static_cast<int>(e);
+  if (host_page != nullptr) {
+    e = cudaHostRegister(host_page, 4096, cudaHostRegisterMapped | cudaHostRegisterPortable);
+    if (e == cudaErrorHostMemoryAlreadyRegistered) {
+      cudaGetLastError();
+      e = cudaSuccess;
+    }
+    void *dev = nullptr;
+    if (e == cudaSuccess) e = cudaHostGetDevicePointer(&dev, host_page, 0);
+    if (e != cudaSuccess) return static_cast<int>(e);
+    guard.abort = static_cast<volatile uint32_t *>(dev);
+  }
+  guard.timeout_units = static_cast<uint32_t>(units);
+  return static_cast<int>(cudaMemcpy(at, &guard, sizeof(guard), cudaMemcpyHostToDevice));
 }
 
 SEVENTY_API int seventy_ar_norm(void *ctx_ptr, void *out, void *residual, const void *x, const float *weight, int rows,

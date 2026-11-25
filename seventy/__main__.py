@@ -40,7 +40,7 @@ def cmd_info(args: argparse.Namespace) -> int:
                 print(f"GPU peer access: none for {', '.join(missing)} (tensor parallel over these GPUs uses NCCL for "
                       f"every all-reduce, which is slower)")
             else:
-                print("GPU peer access: all pairs")
+                print("GPU peer access: all pairs (as the driver reports; the engine checks peer writes when it starts)")
     if _lib.available():
         print(f"kernels: {_lib.path()} (ABI {_lib.ABI_VERSION})")
     else:
