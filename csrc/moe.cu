@@ -18,7 +18,12 @@
  * (renorm), or over all logits. One warp per token.
  *
  * seventy_moe_finish: the MoE output of each token in FP16: sigmoid(gate) times the shared expert's output (none
- * when shared is NULL) plus the down outputs (FP32, already times the pair weights) of the token's local picks.
+ * when shared is NULL) plus the down outputs (FP32, already times the pair weights) of the token's local picks:
+ * row rows[pair] of y (rows NULL: row pair).
+ *
+ * compact (seventy_moe_gemm): bit 0, x row of a slot row = its position in the order (start + r) instead of
+ * pair / row_div; bit 1, the output row likewise instead of the pair. A prefill plan then needs rows only for this
+ * rank's pairs.
  *
  * seventy_moe_gemm: for each slot, the rows of its pairs times the weight of its expert. Row r of x for pair p is
  * x[p / row_div] (row_div k: x holds the tokens, for gate_up; row_div 1: x holds the pairs, for down). One block
@@ -109,7 +114,7 @@ template <bool kNvfp4, int kRows, int kCols>
 __global__ void __launch_bounds__(kMoeThreads) moe_gemm_kernel(
     void *out, const half *x, int row_div, const uint8_t *weight, const uint8_t *scales, const float *alpha, int n,
     int k, const int32_t *order, const int32_t *slot_expert, const int32_t *slot_start, const int32_t *slot_count,
-    const int32_t *num_slots, const float *pair_weight) {
+    const int32_t *num_slots, const float *pair_weight, int compact) {
   extern __shared__ __align__(16) half xs[];
   __shared__ int pair_of[kRows];
   const int s = blockIdx.y;
@@ -122,8 +127,8 @@ __global__ void __launch_bounds__(kMoeThreads) moe_gemm_kernel(
   const int words = k / 8;
   for (int i = threadIdx.x; i < count * words; i += blockDim.x) {
     const int r = i / words, w = i % words;
-    reinterpret_cast<uint4 *>(xs)[r * words + w] =
-        reinterpret_cast<const uint4 *>(x + static_cast<int64_t>(pair_of[r] / row_div) * k)[w];
+    const int64_t xrow = (compact & 1) ? start + r : pair_of[r] / row_div;
+    reinterpret_cast<uint4 *>(xs)[r * words + w] = reinterpret_cast<const uint4 *>(x + xrow * k)[w];
   }
   __syncthreads();
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -206,6 +211,7 @@ __global__ void __launch_bounds__(kMoeThreads) moe_gemm_kernel(
   for (int r = 0; r < kRows; ++r) {
     if (r >= count) break;
     const int p = pair_of[r];
+    const int64_t orow = (compact & 2) ? start + r : p;
 #pragma unroll
     for (int c = 0; c < kCols; ++c) {
       const float v = warp_sum(acc[r][c]);
@@ -213,9 +219,9 @@ __global__ void __launch_bounds__(kMoeThreads) moe_gemm_kernel(
       if (lane == c && col < n) {
         const float a = kNvfp4 ? alpha[row0 + c] : 1.0f;
         if (pair_weight != nullptr) {
-          static_cast<float *>(out)[static_cast<int64_t>(p) * n + col] = v * a * pair_weight[p];
+          static_cast<float *>(out)[orow * n + col] = v * a * pair_weight[p];
         } else {
-          static_cast<half *>(out)[static_cast<int64_t>(p) * n + col] = __float2half_rn(v * a);
+          static_cast<half *>(out)[orow * n + col] = __float2half_rn(v * a);
         }
       }
     }
@@ -303,10 +309,10 @@ __global__ void __launch_bounds__(32 * kRouteWarps) moe_route_kernel(const float
 
 /*
  * moe_finish_kernel: out[t] = fp16(sigmoid(gate[t]) * shared[t] + the sum, in pick order, of y over the token's
- * picks whose expert is local (e0 <= id < e1)); y rows of other picks are not read.
+ * picks whose expert is local (e0 <= id < e1), y row rows[pair] or pair); y rows of other picks are not read.
  */
-__global__ void moe_finish_kernel(half *out, const float *y, const int32_t *ids, int e0, int e1, int k,
-                                  const half *shared, const float *gate, int64_t gate_ld, int dim) {
+__global__ void moe_finish_kernel(half *out, const float *y, const int32_t *ids, const int32_t *rows, int e0, int e1,
+                                  int k, const half *shared, const float *gate, int64_t gate_ld, int dim) {
   const int t = blockIdx.y;
   const int j = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
   if (j >= dim) return;
@@ -321,7 +327,8 @@ __global__ void moe_finish_kernel(half *out, const float *y, const int32_t *ids,
     const int64_t pair = static_cast<int64_t>(t) * k + i;
     const int id = ids[pair];
     if (id < e0 || id >= e1) continue;
-    const float4 v = *reinterpret_cast<const float4 *>(y + pair * dim + j);
+    const int64_t row = rows != nullptr ? rows[pair] : pair;
+    const float4 v = *reinterpret_cast<const float4 *>(y + row * dim + j);
     acc.x += v.x;
     acc.y += v.y;
     acc.z += v.z;
@@ -352,7 +359,7 @@ SEVENTY_API int seventy_moe_gemm(void *out, const void *x, int row_div, const vo
                                  const float *alpha, int nvfp4, int n, int k, const int32_t *order,
                                  const int32_t *slot_expert, const int32_t *slot_start, const int32_t *slot_count,
                                  const int32_t *num_slots, int max_slots, int rows, const float *pair_weight,
-                                 cudaStream_t stream) {
+                                 int compact, cudaStream_t stream) {
   using namespace seventy;
   if (out == nullptr || x == nullptr || weight == nullptr || order == nullptr || n <= 0 || k <= 0 || k % 16 ||
       row_div < 1 || max_slots < 1 || (nvfp4 && (scales == nullptr || alpha == nullptr)))
@@ -370,7 +377,7 @@ SEVENTY_API int seventy_moe_gemm(void *out, const void *x, int row_div, const vo
 #define SEVENTY_MOE_LAUNCH(NV, R, C)                                                                              \
   moe_gemm_kernel<NV, R, C><<<grid, kMoeThreads, smem, stream>>>(out, xh, row_div, w, sc, alpha, n, k, order,      \
                                                                    slot_expert, slot_start, slot_count, num_slots, \
-                                                                   pair_weight)
+                                                                   pair_weight, compact)
   if (rows != 2 && rows != 4 && rows != 8) return SEVENTY_ERR_INVALID_ARGUMENT;
   if (cols != 2 && cols != 4 && cols != 8) return SEVENTY_ERR_INVALID_ARGUMENT;
 #define SEVENTY_MOE_COLS(NV, R)                 \
@@ -404,16 +411,16 @@ SEVENTY_API int seventy_moe_route(const float *logits, int64_t ld, int tokens, i
   return launch_status();
 }
 
-SEVENTY_API int seventy_moe_finish(void *out, const float *y, const int32_t *ids, int tokens, int k, int e0, int e1,
-                                   const void *shared, const float *gate, int64_t gate_ld, int dim,
-                                   cudaStream_t stream) {
+SEVENTY_API int seventy_moe_finish(void *out, const float *y, const int32_t *ids, const int32_t *rows, int tokens,
+                                   int k, int e0, int e1, const void *shared, const float *gate, int64_t gate_ld,
+                                   int dim, cudaStream_t stream) {
   using namespace seventy;
   if (out == nullptr || y == nullptr || ids == nullptr || tokens < 0 || k < 1 || dim % 4 ||
       (shared != nullptr && gate == nullptr))
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (tokens == 0) return SEVENTY_OK;
   const dim3 grid((dim / 4 + 127) / 128, tokens);
-  moe_finish_kernel<<<grid, 128, 0, stream>>>(static_cast<half *>(out), y, ids, e0, e1, k,
+  moe_finish_kernel<<<grid, 128, 0, stream>>>(static_cast<half *>(out), y, ids, rows, e0, e1, k,
                                               static_cast<const half *>(shared), gate, gate_ld, dim);
   return launch_status();
 }

@@ -127,15 +127,18 @@ def test_finish_adds_local_picks_and_the_gated_shared_expert(shared):
     torch.testing.assert_close(out.float().cpu(), want.half().float(), rtol=2e-3, atol=2e-3)
 
 
-def test_small_batch_moe_matches_the_unfused_path():
-    """MoE._small (one product for the router and the shared gate, warp route, moe_finish) against the earlier
-    GPU path on random FP16 experts of a small config, with BF16 router weights that need the power-of-two scale."""
+@pytest.mark.parametrize("fmt", ["fp16", "nvfp4"])
+def test_gpu_moe_matches_the_per_expert_loop(fmt):
+    """MoE._small (one product for the router and the shared gate, warp route, moe_finish) and MoE._large (the
+    prefill path: compact rows, the PyTorch plan) against the per-expert loop (MoE._loop) on random experts of a
+    small config, FP16 (seventy_moe_gemm) or NVFP4 repacked for the tensor cores (seventy_moe_mma), with BF16
+    router weights that need the power-of-two scale."""
     from types import SimpleNamespace
 
-    from seventy.model.moe import MoE
-    from seventy.ops import kernels
+    from seventy.model.moe import ExpertStack, MoE
+
     g = torch.Generator().manual_seed(3)
-    hidden, width, experts = 256, 64, 32
+    hidden, width, experts, local = 256, 64, 32, 16
     m = MoE.__new__(MoE)
     m.cfg = SimpleNamespace(num_experts=experts, experts_per_token=4, norm_topk_prob=True)
     m.top_k, m.e0, m.e1, m.dtype, m.device = 4, 8, 24, torch.float16, torch.device("cuda")
@@ -147,18 +150,47 @@ def test_small_batch_moe_matches_the_unfused_path():
     want_logits = torch.cat((m.router, m.shared_gate))
     assert m.use_fp16_gates() and m.gate_scale < 1.0
     assert torch.equal(torch.cat((m.router, m.shared_gate)).float() * m.gate_scale, want_logits)
-    from seventy.model.moe import ExpertStack
+    if fmt == "fp16":
+        m.gate_up = ExpertStack(weight=(torch.randn(local, 2 * width, hidden, generator=g) * 0.05).half().cuda())
+        m.down = ExpertStack(weight=(torch.randn(local, hidden, width, generator=g) * 0.05).half().cuda())
+    else:
+        def nv(n, k):
+            return ExpertStack(packed=torch.randint(0, 256, (local, n, k // 2), generator=g, dtype=torch.uint8).cuda(),
+                               scales=torch.randint(0x30, 0x40, (local, n, k // 16), generator=g,
+                                                    dtype=torch.uint8).cuda(),
+                               alpha=(torch.rand(local, n, generator=g) * 0.002 + 0.0005).cuda())
 
-    m.gate_up = ExpertStack(weight=(torch.randn(16, 2 * width, hidden, generator=g) * 0.05).half().cuda())
-    m.down = ExpertStack(weight=(torch.randn(16, hidden, width, generator=g) * 0.05).half().cuda())
+        m.gate_up, m.down = nv(2 * width, hidden), nv(hidden, width)
+        m.gate_up.to_gemm()
+        m.down.to_gemm()
     wgu = (torch.randn(2 * width, hidden, generator=g) * 0.05).half().cuda()
     wd = (torch.randn(hidden, width, generator=g) * 0.05).half().cuda()
     m.shared_gate_up = lambda x: x @ wgu.T
     m.shared_down = lambda x: x @ wd.T
-    x = torch.randn(7, hidden, generator=g).half().cuda()
-    got = m._small(x)
-    gates = m.gates
-    m.gates = None
-    want = m(x)
-    m.gates = gates
-    torch.testing.assert_close(got.float(), want.float(), rtol=2e-3, atol=2e-3)
+    for tokens in (1, 7, 64, 300):
+        x = torch.randn(tokens, hidden, generator=g).half().cuda()
+        got = m(x)
+        ids, weights = m.route(x)
+        want = m._loop(x, ids, weights, m._shared(x)).to(torch.float16)
+        torch.testing.assert_close(got.float(), want.float(), rtol=3e-3, atol=3e-3)
+
+
+@pytest.mark.parametrize("pairs,per", [(30, 8), (3000, 8), (40960, 8)])
+def test_large_plan_slots_cover_each_local_pair_once(pairs, per):
+    from seventy.ops import kernels
+
+    g = torch.Generator().manual_seed(pairs)
+    ids = torch.randint(0, 512, (pairs,), generator=g, dtype=torch.int32).cuda()
+    e0, e1 = 128, 256
+    (order, se, ss, sc, num, max_slots), rows, local = kernels.moe_plan_large(ids, e0, e1, per)
+    n = int(num.item())
+    assert n <= max_slots and int(local) == int(((ids >= e0) & (ids < e1)).sum())
+    seen = []
+    for s in range(n):
+        c = int(sc[s])
+        assert 1 <= c <= per
+        for r in range(int(ss[s]), int(ss[s]) + c):
+            p = int(order[r])
+            assert e0 + int(se[s]) == int(ids[p]) and int(rows[p]) == r
+            seen.append(p)
+    assert sorted(seen) == sorted(((ids >= e0) & (ids < e1)).nonzero().view(-1).tolist())

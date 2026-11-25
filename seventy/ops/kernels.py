@@ -899,36 +899,38 @@ def moe_route(logits: torch.Tensor, k: int, renorm: bool, experts: int | None = 
 
 
 def moe_finish(y: torch.Tensor, ids: torch.Tensor, k: int, e0: int, e1: int, shared: torch.Tensor | None,
-               gate: torch.Tensor | None) -> torch.Tensor:
+               gate: torch.Tensor | None, rows: torch.Tensor | None = None) -> torch.Tensor:
     """The MoE output FP16 [tokens, dim] (seventy_moe_finish): sigmoid(gate[t]) * shared[t] (FP16 [tokens, dim];
-    gate FP32 [tokens], may be strided) plus the rows of y (FP32 [tokens * k, dim]) of each token's picks of the
-    local experts [e0, e1) (ids int32 [tokens * k])."""
+    gate FP32 [tokens], may be strided) plus the rows of y (FP32 [tokens * k, dim], or with rows int32 [tokens * k]
+    the row rows[pair]) of each token's picks of the local experts [e0, e1) (ids int32 [tokens * k])."""
     _expect(y, "y", torch.float32)
     _expect(ids, "ids", torch.int32)
-    pairs, dim = y.shape
-    t = pairs // k
+    dim = y.shape[1]
+    t = ids.numel() // k
     out = torch.empty(t, dim, dtype=torch.float16, device=y.device)
     if shared is not None:
         _expect(shared, "shared", torch.float16)
         shared = shared.contiguous()
     check("moe_finish", lib().seventy_moe_finish(
-        out.data_ptr(), y.data_ptr(), ids.contiguous().data_ptr(), t, k, e0, e1,
+        out.data_ptr(), y.data_ptr(), ids.contiguous().data_ptr(), rows.data_ptr() if rows is not None else None, t,
+        k, e0, e1,
         shared.data_ptr() if shared is not None else None, gate.data_ptr() if gate is not None else None,
         gate.stride(0) if gate is not None else 0, dim, _stream(y)))
     return out
 
 
-def moe_plan(ids: torch.Tensor, e0: int, e1: int) -> tuple:
+def moe_plan(ids: torch.Tensor, e0: int, e1: int, per: int | None = None) -> tuple:
     """The pairs of the local experts [e0, e1) in ids (int32 [pairs] expert ids), sorted by expert, and their slots:
     (order, slot_expert, slot_start, slot_count, num_slots, max_slots), all on the GPU (csrc/moe.cu)."""
     _expect(ids, "ids", torch.int32)
     pairs = ids.numel()
-    max_slots = moe_max_slots(pairs, e1 - e0)
+    per = per or MOE_ROWS_PER_SLOT
+    max_slots = max(1, -(-pairs // per) + min(e1 - e0, pairs))
     dev = ids.device
     order = torch.empty(max(pairs, 1), dtype=torch.int32, device=dev)
     slots = torch.empty(3, max_slots, dtype=torch.int32, device=dev)
     num = torch.empty(1, dtype=torch.int32, device=dev)
-    check("moe_plan", lib().seventy_moe_plan(ids.contiguous().data_ptr(), pairs, e0, e1, MOE_ROWS_PER_SLOT, max_slots,
+    check("moe_plan", lib().seventy_moe_plan(ids.contiguous().data_ptr(), pairs, e0, e1, per, max_slots,
                                              order.data_ptr(), slots[0].data_ptr(), slots[1].data_ptr(),
                                              slots[2].data_ptr(), num.data_ptr(), _stream(ids)))
     return order, slots[0], slots[1], slots[2], num, max_slots
@@ -936,10 +938,12 @@ def moe_plan(ids: torch.Tensor, e0: int, e1: int) -> tuple:
 
 def moe_gemm(x: torch.Tensor, row_div: int, weight: torch.Tensor, scales: torch.Tensor | None,
              alpha: torch.Tensor | None, plan: tuple, pairs: int, pair_weight: torch.Tensor | None = None,
-             out: torch.Tensor | None = None) -> torch.Tensor:
+             out: torch.Tensor | None = None, rows: int | None = None, compact: int = 0) -> torch.Tensor:
     """For every pair of the plan: x[pair / row_div] times its expert's weight (NVFP4 packed [E, n, k / 2] with
     scales [E, n, k / 16] and alpha [E, n], or FP16 [E, n, k]). FP16 [pairs, n], or FP32 [pairs, n] scaled by
-    pair_weight. Rows of pairs outside the plan are left as they are in out (zeros when out is new)."""
+    pair_weight. Rows of pairs outside the plan are left as they are in out (zeros when out is new). rows: pairs
+    per slot of the plan (default MOE_ROWS_PER_SLOT). compact: bit 0, x rows in plan order; bit 1, out rows in plan
+    order (then out needs only the plan's pairs, [plan pairs, n])."""
     _expect(x, "x", torch.float16)
     x = x.contiguous()
     nvfp4 = weight.dtype == torch.uint8
@@ -951,10 +955,58 @@ def moe_gemm(x: torch.Tensor, row_div: int, weight: torch.Tensor, scales: torch.
     code = lib().seventy_moe_gemm(out.data_ptr(), x.data_ptr(), row_div, weight.data_ptr(),
                                   scales.data_ptr() if nvfp4 else None, alpha.data_ptr() if nvfp4 else None,
                                   int(nvfp4), n, k, order.data_ptr(), slot_expert.data_ptr(), slot_start.data_ptr(),
-                                  slot_count.data_ptr(), num.data_ptr(), max_slots, MOE_ROWS_PER_SLOT,
-                                  pair_weight.data_ptr() if pair_weight is not None else None, _stream(x))
+                                  slot_count.data_ptr(), num.data_ptr(), max_slots, rows or MOE_ROWS_PER_SLOT,
+                                  pair_weight.data_ptr() if pair_weight is not None else None, compact, _stream(x))
     check("moe_gemm", code)
     return out
+
+
+def moe_mma(x: torch.Tensor, row_div: int, stack, plan: tuple, out: torch.Tensor, rows: int, warps: int = 4,
+            pair_weight: torch.Tensor | None = None, compact: int = 0) -> torch.Tensor:
+    """moe_gemm on the tensor cores (seventy_moe_mma): the experts of stack (ExpertStack after to_gemm) for the
+    plan's slots of up to rows pairs (8, 16, 32 or 64), into out (FP16 [rows of out, n], or FP32 times pair_weight);
+    compact as in moe_gemm."""
+    _expect(x, "x", torch.float16)
+    x = x.contiguous()
+    g = stack.gemm
+    e = stack.gemm_experts
+    n_padded = g.alpha.numel() // e
+    order, slot_expert, slot_start, slot_count, num, max_slots = plan
+    check("moe_mma", lib().seventy_moe_mma(
+        out.data_ptr(), x.data_ptr(), row_div, g.wpk.data_ptr(), g.wsc.data_ptr(), g.alpha.data_ptr(),
+        g.wpk[0].numel() // 16, g.wsc[0].numel() // 4, g.n, n_padded, g.k, order.data_ptr(), slot_expert.data_ptr(),
+        slot_start.data_ptr(), slot_count.data_ptr(), num.data_ptr(), max_slots, rows, warps,
+        pair_weight.data_ptr() if pair_weight is not None else None, compact, _stream(x)))
+    return out
+
+
+def moe_plan_large(ids: torch.Tensor, e0: int, e1: int, per: int) -> tuple:
+    """moe_plan for any number of pairs, with PyTorch on the GPU (no host synchronization): the local pairs in
+    order of (local expert, pair), slots of at most per pairs, and rows int32 [pairs] (each local pair's position in
+    the order, -1 for other pairs). Returns (plan, rows, local pairs upper bound = pairs)."""
+    pairs = ids.numel()
+    dev = ids.device
+    experts = e1 - e0
+    ids = ids.long()
+    local = (ids >= e0) & (ids < e1)
+    le = torch.where(local, ids - e0, torch.full_like(ids, experts))
+    order = torch.argsort(le * pairs + torch.arange(pairs, device=dev)).int()
+    counts = torch.bincount(le, minlength=experts + 1)[:experts]
+    per_e = (counts + per - 1) // per
+    slot_end = torch.cumsum(per_e, 0)
+    off = torch.cumsum(counts, 0) - counts
+    max_slots = max(1, -(-pairs // per) + min(experts, pairs))
+    s = torch.arange(max_slots, device=dev)
+    e = torch.searchsorted(slot_end, s, right=True).clamp(max=max(experts - 1, 0))
+    j = s - (slot_end[e] - per_e[e])
+    start = off[e] + j * per
+    count = torch.clamp(counts[e] - j * per, 0, per)
+    num = slot_end[-1:].int() if experts else torch.zeros(1, dtype=torch.int32, device=dev)
+    rows = torch.full((pairs,), -1, dtype=torch.int32, device=dev)
+    rows[order.long()] = torch.arange(pairs, dtype=torch.int32, device=dev)
+    rows = torch.where(local, rows, torch.full_like(rows, -1))
+    plan = (order, e.int(), start.int(), count.int(), num, max_slots)
+    return plan, rows, counts.sum()
 
 
 def hc_norm(h: torch.Tensor, weight: torch.Tensor, hc: int, eps: float) -> torch.Tensor:

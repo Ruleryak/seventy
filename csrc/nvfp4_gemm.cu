@@ -467,6 +467,245 @@ __global__ void __launch_bounds__(256) nvfp4_gemm_dequantize_kernel(half *out, c
   }
 }
 
+/*
+ * moe_mma_kernel: the grouped expert product of csrc/moe.cu (seventy_moe_gemm's plan, slots and compact rows) on the
+ * tensor cores, with each expert's weight repacked like a GemmWeight (wpk, wsc, alpha of expert e at e * w_stride
+ * uint4, e * s_stride words, e * n_padded floats). blockIdx.y is a slot (at most MT * 8 pairs of one expert);
+ * blockIdx.x takes W adjacent 32-column tiles; the whole k range runs in one block, with the structure of
+ * nvfp4_gemm_kernel (the slot's activation rows, gathered through the order, staged per 64-k step in shared
+ * memory, double buffered). Output: FP16, or with pair_weight FP32 times pair_weight[pair].
+ */
+template <int MT, int W>
+__device__ __forceinline__ void load_rows(uint4 (&r)[Stage<MT, W>::kLoads], const half *x, const int *xrow, int m,
+                                          int k, int kbase) {
+#pragma unroll
+  for (int l = 0; l < Stage<MT, W>::kLoads; ++l) {
+    const int idx = threadIdx.x + l * W * 32;
+    const int row = idx >> 3;
+    const int part = idx & 7;
+    r[l] = make_uint4(0, 0, 0, 0);
+    if (row < m && idx < Stage<MT, W>::kRows * 8)
+      r[l] = __ldg(reinterpret_cast<const uint4 *>(x + static_cast<int64_t>(xrow[row]) * k + kbase + part * 8));
+  }
+}
+
+template <int MT, int W>
+__global__ void __launch_bounds__(W * 32) moe_mma_kernel(void *out, const half *x, int row_div, const uint4 *wpk_all,
+                                                         const uint32_t *wsc_all, const float *alpha_all,
+                                                         int64_t w_stride, int64_t s_stride, int n, int n_tiles,
+                                                         int k, const int32_t *order, const int32_t *slot_expert,
+                                                         const int32_t *slot_start, const int32_t *slot_count,
+                                                         const int32_t *num_slots, const float *pair_weight,
+                                                         int compact) {
+  constexpr int C = (MT >= 4) ? 1 : 4 / MT;
+  constexpr int kRows = MT * 8;
+  __shared__ uint4 smem[2][Stage<MT, W>::kUint4];
+  __shared__ int xrow[kRows];
+  __shared__ int pair_of[kRows];
+  const int slot = blockIdx.y;
+  if (slot >= *num_slots) return;
+  const int e = slot_expert[slot], start = slot_start[slot], m = min(slot_count[slot], kRows);
+  for (int r = threadIdx.x; r < kRows; r += blockDim.x) {
+    const int p = r < m ? order[start + r] : 0;
+    pair_of[r] = p;
+    xrow[r] = r < m ? ((compact & 1) ? start + r : p / row_div) : 0;
+  }
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  const int tile = blockIdx.x * W + (threadIdx.x >> 5);
+  const bool active = tile < n_tiles;
+  const int steps = k / kStepK;
+  const int quad = (lane >> 2) & 3;
+  const int idx = (lane & 3) + ((lane >> 4) << 2);
+  const int safe_tile = active ? tile : 0;
+  const uint4 *wp = wpk_all + e * w_stride + static_cast<int64_t>(safe_tile) * (k / 32) * 32 + lane;
+  const uint32_t *sp = wsc_all + e * s_stride + static_cast<int64_t>(safe_tile) * steps * 32 + lane;
+  const float *alpha = alpha_all + static_cast<int64_t>(e) * n_tiles * 32;
+
+  float acc[C][MT][8];
+#pragma unroll
+  for (int c = 0; c < C; ++c)
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[c][t][j] = 0.0f;
+
+  uint4 wb[kDepth][2];
+  uint32_t sb[kDepth];
+#pragma unroll
+  for (int d = 0; d < kDepth; ++d) {
+    const int s = min(d, steps - 1);
+    wb[d][0] = __ldg(wp + static_cast<int64_t>(2 * s) * 32);
+    wb[d][1] = __ldg(wp + static_cast<int64_t>(2 * s + 1) * 32);
+    sb[d] = __ldg(sp + static_cast<int64_t>(s) * 32);
+  }
+
+  uint4 ar[Stage<MT, W>::kLoads];
+  load_rows<MT, W>(ar, x, xrow, m, k, 0);
+  store_activations<MT, W>(smem[0], ar);
+  __syncthreads();
+
+  for (int base = 0; base < steps; base += kDepth) {
+#pragma unroll
+    for (int d = 0; d < kDepth; ++d) {
+      const int s = base + d;
+      if (s < steps) {
+        const bool more = s + 1 < steps;
+        if (more) load_rows<MT, W>(ar, x, xrow, m, k, (s + 1) * kStepK);
+        if (active) step_mma<MT>(acc[d % C], smem[s & 1], wb[d][0], wb[d][1], sb[d], idx);
+        const int nxt = min(s + kDepth, steps - 1);
+        wb[d][0] = __ldg(wp + static_cast<int64_t>(2 * nxt) * 32);
+        wb[d][1] = __ldg(wp + static_cast<int64_t>(2 * nxt + 1) * 32);
+        sb[d] = __ldg(sp + static_cast<int64_t>(nxt) * 32);
+        if (more) store_activations<MT, W>(smem[(s + 1) & 1], ar);
+        __syncthreads();
+      }
+    }
+  }
+  if (!active) return;
+#pragma unroll
+  for (int c = 1; c < C; ++c)
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[0][t][j] += acc[c][t][j];
+#pragma unroll
+  for (int t = 0; t < MT; ++t) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int row = t * 8 + (idx & 1) + 2 * ((j >> 1) & 1) + 4 * (idx >> 2);
+      const int col = tile * 32 + quad * 8 + (j & 1) + 2 * ((idx >> 1) & 1) + 4 * (j >> 2);
+      if (row >= m || col >= n) continue;
+      const int p = pair_of[row];
+      const int64_t orow = (compact & 2) ? start + row : p;
+      const float v = acc[0][t][j] * alpha[col];
+      if (pair_weight != nullptr)
+        static_cast<float *>(out)[orow * n + col] = v * pair_weight[p];
+      else
+        static_cast<half *>(out)[orow * n + col] = __float2half_rn(v);
+    }
+  }
+}
+
+/*
+ * moe_mma_wk_kernel: moe_mma_kernel for small slots (decode), with the structure of nvfp4_gemm_wk_kernel: one block
+ * of kW warps per (32-column tile, slot); the warps split k into contiguous ranges of 64-steps, each stages its own
+ * activation rows (gathered through the slot's rows), and the partial tiles are added in shared memory.
+ */
+template <int MT, int kW>
+__global__ void __launch_bounds__(kW * 32) moe_mma_wk_kernel(void *out, const half *x, int row_div,
+                                                             const uint4 *wpk_all, const uint32_t *wsc_all,
+                                                             const float *alpha_all, int64_t w_stride,
+                                                             int64_t s_stride, int n, int n_tiles, int k,
+                                                             const int32_t *order, const int32_t *slot_expert,
+                                                             const int32_t *slot_start, const int32_t *slot_count,
+                                                             const int32_t *num_slots, const float *pair_weight,
+                                                             int compact) {
+  constexpr int kRows = MT * 8;
+  constexpr int kLoads = kRows * 8 / 32;
+  extern __shared__ uint4 wk_smem[];
+  __shared__ int rowmap[kRows];
+  __shared__ int pair_of[kRows];
+  auto stage = reinterpret_cast<uint4 (*)[kRows * kRowStride]>(wk_smem);
+  float *red = reinterpret_cast<float *>(wk_smem);
+  const int slot = blockIdx.y;
+  if (slot >= *num_slots) return;
+  const int e = slot_expert[slot], start = slot_start[slot], m = min(slot_count[slot], kRows);
+  for (int r = threadIdx.x; r < kRows; r += blockDim.x) {
+    const int p = r < m ? order[start + r] : 0;
+    pair_of[r] = p;
+    rowmap[r] = r < m ? ((compact & 1) ? start + r : p / row_div) : 0;
+  }
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int ksteps = k / kStepK;
+  const int s0 = warp * ksteps / kW;
+  const int s1 = (warp + 1) * ksteps / kW;
+  const int steps = s1 - s0;
+  const int quad = (lane >> 2) & 3;
+  const int idx = (lane & 3) + ((lane >> 4) << 2);
+  const uint4 *wp = wpk_all + e * w_stride + (static_cast<int64_t>(tile) * (k / 32) + 2 * s0) * 32 + lane;
+  const uint32_t *sp = wsc_all + e * s_stride + (static_cast<int64_t>(tile) * ksteps + s0) * 32 + lane;
+  const float *alpha = alpha_all + static_cast<int64_t>(e) * n_tiles * 32;
+  const uint4 *xbase = reinterpret_cast<const uint4 *>(x) + s0 * 8 + (lane & 7);
+  int64_t xrow[kLoads];
+#pragma unroll
+  for (int l = 0; l < kLoads; ++l)
+    xrow[l] = static_cast<int64_t>(rowmap[min((lane >> 3) + 4 * l, m - 1)]) * (k / 8);
+  const int dst0 = (lane >> 3) * kRowStride + (lane & 7);
+
+  float acc[MT][8];
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[t][j] = 0.0f;
+
+  uint4 *mine = stage[warp];
+  uint4 ar[kLoads];
+  uint4 w0 = make_uint4(0, 0, 0, 0), w1 = w0;
+  uint32_t sw = 0;
+  if (steps > 0) {
+#pragma unroll
+    for (int l = 0; l < kLoads; ++l) mine[dst0 + 4 * kRowStride * l] = __ldg(xbase + xrow[l]);
+    w0 = __ldg(wp);
+    w1 = __ldg(wp + 32);
+    sw = __ldg(sp);
+  }
+  __syncwarp();
+  for (int i = 0; i < steps; ++i) {
+    const bool more = i + 1 < steps;
+    uint4 nw0 = w0, nw1 = w1;
+    uint32_t nsw = sw;
+    if (more) {
+#pragma unroll
+      for (int l = 0; l < kLoads; ++l) ar[l] = __ldg(xbase + xrow[l] + (i + 1) * 8);
+      nw0 = __ldg(wp + static_cast<int64_t>(2 * (i + 1)) * 32);
+      nw1 = __ldg(wp + static_cast<int64_t>(2 * (i + 1) + 1) * 32);
+      nsw = __ldg(sp + static_cast<int64_t>(i + 1) * 32);
+    }
+    step_mma<MT>(acc, mine, w0, w1, sw, idx);
+    __syncwarp();
+    if (more) {
+#pragma unroll
+      for (int l = 0; l < kLoads; ++l) mine[dst0 + 4 * kRowStride * l] = ar[l];
+    }
+    __syncwarp();
+    w0 = nw0;
+    w1 = nw1;
+    sw = nsw;
+  }
+
+  __syncthreads();
+  if (warp > 0) {
+#pragma unroll
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) red[((warp - 1) * kRows * 8 + t * 64 + j * 8) * 4 + lane] = acc[t][j];
+  }
+  __syncthreads();
+  if (warp > 0) return;
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float v = acc[t][j];
+#pragma unroll
+      for (int w = 0; w < kW - 1; ++w) v += red[(w * kRows * 8 + t * 64 + j * 8) * 4 + lane];
+      const int row = t * 8 + (idx & 1) + 2 * ((j >> 1) & 1) + 4 * (idx >> 2);
+      const int col = tile * 32 + quad * 8 + (j & 1) + 2 * ((idx >> 1) & 1) + 4 * (j >> 2);
+      if (row >= m || col >= n) continue;
+      const int p = pair_of[row];
+      const int64_t orow = (compact & 2) ? start + row : p;
+      const float y = v * alpha[col];
+      if (pair_weight != nullptr)
+        static_cast<float *>(out)[orow * n + col] = y * pair_weight[p];
+      else
+        static_cast<half *>(out)[orow * n + col] = __float2half_rn(y);
+    }
+}
+
 }  // namespace
 }  // namespace seventy
 
@@ -547,3 +786,50 @@ SEVENTY_API int seventy_nvfp4_gemm(void *out, const void *x, const void *wpk, co
   return launch_status();
 }
 
+
+SEVENTY_API int seventy_moe_mma(void *out, const void *x, int row_div, const void *wpk, const void *wsc,
+                                const float *alpha, int64_t w_stride, int64_t s_stride, int n, int n_padded, int k,
+                                const int32_t *order, const int32_t *slot_expert, const int32_t *slot_start,
+                                const int32_t *slot_count, const int32_t *num_slots, int max_slots, int rows,
+                                int warps, const float *pair_weight, int compact, cudaStream_t stream) {
+  using namespace seventy;
+  if (out == nullptr || x == nullptr || wpk == nullptr || wsc == nullptr || alpha == nullptr || order == nullptr ||
+      n <= 0 || n_padded < n || n_padded % 32 || k <= 0 || k % kStepK || max_slots < 1 || row_div < 1 ||
+      rows < 1 || rows > 64 || rows % 8 || (warps != 2 && warps != 4 && warps != 8))
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (!aligned(x, 16) || !aligned(wpk, 16) || !aligned(wsc, 4)) return SEVENTY_ERR_MISALIGNED;
+  const int n_tiles = n_padded / 32;
+  const auto *xh = static_cast<const half *>(x);
+  const auto *wp = static_cast<const uint4 *>(wpk);
+  const auto *sp = static_cast<const uint32_t *>(wsc);
+#define SEVENTY_MOE_MMA(MT, W)                                                                                    \
+  moe_mma_kernel<MT, W><<<dim3((n_tiles + W - 1) / W, max_slots), W * 32, 0, stream>>>(                           \
+      out, xh, row_div, wp, sp, alpha, w_stride, s_stride, n, n_tiles, k, order, slot_expert, slot_start, slot_count, \
+      num_slots, pair_weight, compact)
+#define SEVENTY_MOE_MMA_W(MT)          \
+  if (warps == 2) SEVENTY_MOE_MMA(MT, 2); \
+  else if (warps == 4) SEVENTY_MOE_MMA(MT, 4); \
+  else SEVENTY_MOE_MMA(MT, 8)
+  if (rows <= 16 && k / kStepK >= 8) {
+#define SEVENTY_MOE_WK(MT)                                                                                        \
+  moe_mma_wk_kernel<MT, 8><<<dim3(n_tiles, max_slots), 256, 8 * MT * 8 * kRowStride * sizeof(uint4), stream>>>( \
+      out, xh, row_div, wp, sp, alpha, w_stride, s_stride, n, n_tiles, k, order, slot_expert, slot_start, slot_count, \
+      num_slots, pair_weight, compact)
+    if (rows <= 8)
+      SEVENTY_MOE_WK(1);
+    else
+      SEVENTY_MOE_WK(2);
+#undef SEVENTY_MOE_WK
+    return launch_status();
+  }
+  switch (rows / 8) {
+    case 1: SEVENTY_MOE_MMA_W(1); break;
+    case 2: SEVENTY_MOE_MMA_W(2); break;
+    case 4: SEVENTY_MOE_MMA_W(4); break;
+    case 8: SEVENTY_MOE_MMA_W(8); break;
+    default: return SEVENTY_ERR_INVALID_ARGUMENT;
+  }
+#undef SEVENTY_MOE_MMA_W
+#undef SEVENTY_MOE_MMA
+  return launch_status();
+}

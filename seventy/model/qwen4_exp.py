@@ -75,7 +75,8 @@ class HyperConnection:
 
     def __call__(self, h: torch.Tensor):
         """(block input [T, hidden] (FP16 on the GPU, FP32 on the CPU), injection weights [T, hc] FP32 or None) of the
-        streams h [T, hc x hidden] FP32. On the GPU: seventy_hc_* kernels around two dense GEMMs."""
+        streams h [T, hc x hidden] FP32. On the GPU: seventy_hc_* kernels around two products with FP16 weights and
+        FP32 sums (the dense GEMM kernel up to 64 rows, else cuBLAS tensor cores)."""
         if self.packed is not None and 0 < h.shape[0] <= 64:
             from ..ops import kernels
 
@@ -86,16 +87,14 @@ class HyperConnection:
             u = kernels.dense_gemm(s, up)
             return kernels.hc_combine(u, n, self.hc), inject
         if self.packed is not None:
-            from ..ops.kernels import dense_unpack
+            from ..ops import kernels
 
             first, up = self.packed
-            n = grouped_rms_norm(h, self.norm, self.hidden, self.eps)
-            w_first = dense_unpack(first).float()
-            d = F.linear(n, w_first)
-            mix = torch.sigmoid(F.linear(F.silu(d[:, : self.rank] / self.hc), dense_unpack(up).float()))
-            x = (mix * n).view(-1, self.hc, self.hidden).mean(dim=1)
-            inject = 2.0 * torch.sigmoid(d[:, self.rank :] / self.hc) if self.inject is not None else None
-            return x, inject
+            n = kernels.hc_norm(h, self.norm, self.hc, self.eps)
+            d = torch.mm(n, kernels.dense_unpack(first).T, out_dtype=torch.float32)
+            s, inject = kernels.hc_act(d, self.rank, self.hc, self.inject is not None)
+            u = torch.mm(s, kernels.dense_unpack(up).T, out_dtype=torch.float32)
+            return kernels.hc_combine(u, n, self.hc), inject
         n = grouped_rms_norm(h, self.norm, self.hidden, self.eps)
         mix = torch.sigmoid(F.linear(F.silu(F.linear(n, self.down.dense) / self.hc), self.up.dense))
         x = (mix * n).view(-1, self.hc, self.hidden).mean(dim=1)
@@ -361,14 +360,18 @@ class Indexer:
             torch.cuda.empty_cache()
 
     def prep(self, x: torch.Tensor, cos, sin, idx_cache: torch.Tensor, kv_slots_t: torch.Tensor) -> torch.Tensor:
-        """The GPU path of queries_and_keys for up to 64 tokens of FP16 x: one FP16 product (the BF16 weights are
-        exact in FP16; FP32 sums), then seventy_qsa_index_prep writes the raw keys into idx_cache and returns the
-        queries in FP16. None when that path does not apply."""
-        if self.proj16 is None or x.dtype != torch.float16 or x.shape[0] > 64:
+        """The GPU path of queries_and_keys for FP16 x: one product with the FP16 weights (exact for the
+        checkpoint's weights; FP32 sums; the dense GEMM kernel up to 64 tokens, else cuBLAS tensor cores), then
+        seventy_qsa_index_prep writes the raw keys into idx_cache and returns the queries in FP16. None when that
+        path does not apply."""
+        if self.proj16 is None or x.dtype != torch.float16:
             return None
         from ..ops import kernels
 
-        qk = kernels.dense_gemm(x, self.proj16)
+        if x.shape[0] <= 64:
+            qk = kernels.dense_gemm(x, self.proj16)
+        else:
+            qk = torch.mm(x, self.proj.dense.T, out_dtype=torch.float32)
         return kernels.qsa_index_prep(qk, self.q_norm, idx_cache, kv_slots_t, cos, sin, self.heads, self.eps)
 
     def queries_and_keys(self, x: torch.Tensor, cos, sin) -> tuple[torch.Tensor, torch.Tensor]:
