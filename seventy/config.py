@@ -428,8 +428,6 @@ def kernel_problems(cfg: ModelConfig) -> list[str]:
     ATTENTION_HEAD_DIM, the Gated DeltaNet kernels for heads of GDN_HEAD_DIM. parse_config accepts other sizes, which
     the PyTorch path (tests on the CPU) runs."""
     t, out = cfg.text, []
-    if t.exp is not None:
-        out.append("Qwen4-Exp (Qwen3.8 Flash-Next) models are not supported yet in this build")
     if t.head_dim != ATTENTION_HEAD_DIM:
         out.append(f"attention head size {t.head_dim} is not supported (the attention kernels need {ATTENTION_HEAD_DIM})")
     if (t.gdn_k_dim, t.gdn_v_dim) != (GDN_HEAD_DIM, GDN_HEAD_DIM):

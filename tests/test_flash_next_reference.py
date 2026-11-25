@@ -46,6 +46,7 @@ class TableRows(torch.nn.Module):
     def __init__(self, table):
         super().__init__()
         self.table = table
+        self.weight = torch.empty(0)
 
     def forward(self, ids):
         return self.table.rows(ids.reshape(-1)).view(*ids.shape, self.table.dim)
@@ -68,7 +69,6 @@ def hf_reference(path, layers, tables):
     for i, layer in enumerate(model.model.layers):
         if layer.ple is not None:
             layer.ple.ple_embedding.ngram_embedding = TableRows(tables[i])
-    model.to_empty(device="cpu")
     model.model.rotary_emb = hf.Qwen4ExpTextRotaryEmbedding(cfg)
     state = {}
     with Checkpoint(path) as ckpt:
@@ -92,7 +92,8 @@ def hf_reference(path, layers, tables):
             else:
                 t = ckpt.tensor(src)
                 state[name] = t if t.dtype == torch.int64 else t.float()
-    model.load_state_dict(state, strict=True)
+    model.load_state_dict(state, strict=True, assign=True)
+    del state
     return model.eval()
 
 

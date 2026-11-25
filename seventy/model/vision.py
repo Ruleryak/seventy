@@ -64,6 +64,16 @@ def patchify(image: torch.Tensor, patch: int, merge: int, temporal: int) -> torc
     return x.reshape(hh * ww, 3 * temporal * patch * patch)
 
 
+def _weight(ckpt: Checkpoint, module: str) -> torch.Tensor:
+    """A linear module's weight [n, k] in FP32 or as stored: dense, or NVFP4, FP8 and MXFP8 (as in nvidia's ModelOpt
+    checkpoints, whose vision towers are partly quantized) dequantized."""
+    if ckpt.is_nvfp4(module):
+        from .. import nvfp4
+
+        return nvfp4.dequantize(ckpt.nvfp4(module), torch.float32)
+    return ckpt.linear_part(module)
+
+
 class VisionBlock:
     def __init__(self, ckpt: Checkpoint, p: str, cfg: VisionConfig, par: Parallel, device):
         d = cfg.hidden_size
@@ -74,13 +84,13 @@ class VisionBlock:
         self.heads, self.head_dim = h1 - h0, hd
         self.norm1 = (_f32(ckpt.tensor(f"{p}.norm1.weight"), device), _f32(ckpt.tensor(f"{p}.norm1.bias"), device))
         self.norm2 = (_f32(ckpt.tensor(f"{p}.norm2.weight"), device), _f32(ckpt.tensor(f"{p}.norm2.bias"), device))
-        self.qkv_w = _f16(ckpt.tensor(f"{p}.attn.qkv.weight")[rows], device)
+        self.qkv_w = _f16(_weight(ckpt, f"{p}.attn.qkv")[rows], device)
         self.qkv_b = _f16(ckpt.tensor(f"{p}.attn.qkv.bias")[rows], device)
-        self.proj_w = _f16(ckpt.tensor(f"{p}.attn.proj.weight")[:, h0 * hd : h1 * hd], device)
+        self.proj_w = _f16(_weight(ckpt, f"{p}.attn.proj")[:, h0 * hd : h1 * hd], device)
         self.proj_b = _f32(ckpt.tensor(f"{p}.attn.proj.bias"), device)
-        self.fc1_w = _f16(ckpt.rows(f"{p}.mlp.linear_fc1.weight", i0, i1), device)
+        self.fc1_w = _f16(_weight(ckpt, f"{p}.mlp.linear_fc1")[i0:i1], device)
         self.fc1_b = _f16(ckpt.tensor(f"{p}.mlp.linear_fc1.bias")[i0:i1], device)
-        self.fc2_w = _f16(ckpt.cols(f"{p}.mlp.linear_fc2.weight", i0, i1), device)
+        self.fc2_w = _f16(_weight(ckpt, f"{p}.mlp.linear_fc2")[:, i0:i1], device)
         self.fc2_b = _f32(ckpt.tensor(f"{p}.mlp.linear_fc2.bias"), device)
         self.dim = d
 
@@ -106,9 +116,9 @@ class VisionTower:
         j0, j1 = par.span(wide)
         self.merge_norm = (_f32(ckpt.tensor(f"{p}merger.norm.weight"), dev),
                            _f32(ckpt.tensor(f"{p}merger.norm.bias"), dev))
-        self.merge_fc1_w = _f16(ckpt.rows(f"{p}merger.linear_fc1.weight", j0, j1), dev)
+        self.merge_fc1_w = _f16(_weight(ckpt, f"{p}merger.linear_fc1")[j0:j1], dev)
         self.merge_fc1_b = _f16(ckpt.tensor(f"{p}merger.linear_fc1.bias")[j0:j1], dev)
-        self.merge_fc2_w = _f16(ckpt.cols(f"{p}merger.linear_fc2.weight", j0, j1), dev)
+        self.merge_fc2_w = _f16(_weight(ckpt, f"{p}merger.linear_fc2")[:, j0:j1], dev)
         self.merge_fc2_b = _f32(ckpt.tensor(f"{p}merger.linear_fc2.bias"), dev)
         axis_dim = cfg.hidden_size // cfg.num_heads // 2
         self.inv_freq = 1.0 / (10000.0 ** (torch.arange(0, axis_dim, 2, dtype=torch.float32, device=dev) / axis_dim))

@@ -251,37 +251,43 @@ class Indexer:
         q = ops.rms_norm(q.reshape(-1, self.dim), self.q_norm, self.eps)[0].view(-1, self.heads, self.dim)
         return ops.apply_rotary(q, cos, sin), k
 
-    def selected(self, q: torch.Tensor, keys: torch.Tensor, cos_all, sin_all, first: int) -> torch.Tensor | None:
-        """Mask [n_q, ctx] of the tokens that the queries q [n_q, heads, dim] at positions first .. first + n_q - 1
-        attend to, from the raw keys [ctx, dim] of the sequence and the rotary tables of every position; None when
-        every query attends to all its visible tokens."""
+    def selected(self, q: torch.Tensor, keys: torch.Tensor, cos_all, sin_all, first: int) -> torch.Tensor:
+        """Token indices [n_q, budget + compress - 1] (-1: none) that the queries q [n_q, heads, dim] at positions
+        first .. first + n_q - 1 attend to, from the raw keys [ctx, dim] of the sequence and the rotary tables of
+        every position: all visible tokens while they fit in whole blocks of the budget, else the tokens of the best
+        blocks and of the unfinished last block."""
         n_q, ctx = q.shape[0], keys.shape[0]
         c = self.compress
         top = self.budget // c
-        if ctx // c <= top:
-            return None
+        width = self.budget + c - 1
+        dev = keys.device
+        visible = first + torch.arange(n_q, device=dev) + 1
+        idx = torch.arange(width, device=dev)
+        out = torch.where(idx[None, :] < visible[:, None], idx[None, :], -1)
+        long = visible // c > top
+        if not bool(long.any()):
+            return out
         blocks = ctx // c
         pooled = keys[: blocks * c].float().view(blocks, c, self.dim).mean(1)
         pooled = ops.rms_norm(pooled, self.k_norm, self.eps)[0]
-        starts = torch.arange(blocks, device=keys.device) * c
+        starts = torch.arange(blocks, device=dev) * c
         pooled = ops.apply_rotary(pooled[:, None], cos_all[starts], sin_all[starts])[:, 0]
-        scores = torch.relu(torch.einsum("qhd,bd->qbh", q.float(), pooled.float())).sum(-1) / math.sqrt(self.dim)
-        mask = torch.zeros(n_q, ctx, dtype=torch.bool, device=keys.device)
-        for i in range(n_q):
-            visible = first + i + 1
-            nb = visible // c
-            if nb <= top:
-                mask[i, :visible] = True
-                continue
-            best = torch.topk(scores[i, :nb], top).indices
-            tok = (best[:, None] * c + torch.arange(c, device=keys.device)).reshape(-1)
-            mask[i, tok] = True
-            mask[i, nb * c : visible] = True
-        return mask
+        rows = torch.nonzero(long).reshape(-1)
+        scores = torch.relu(torch.einsum("qhd,bd->qbh", q[rows].float(), pooled.float())).sum(-1) / math.sqrt(self.dim)
+        nb = visible[rows] // c
+        scores = scores.masked_fill(torch.arange(blocks, device=dev)[None, :] >= nb[:, None], float("-inf"))
+        best = torch.topk(scores, top, dim=1).indices
+        tok = (best[:, :, None] * c + torch.arange(c, device=dev)).reshape(rows.numel(), -1)
+        tail = nb[:, None] * c + torch.arange(c - 1, device=dev)[None, :]
+        tail = torch.where(tail < visible[rows][:, None], tail, -1)
+        out[rows] = torch.cat((tok, tail), dim=1).to(out.dtype)
+        return out
 
 
 class ExpAttention:
-    """Gated full attention with the QSA indexer (CPU path: dense attention over the selected tokens)."""
+    """Gated full attention with the QSA indexer: each query attends to the tokens Indexer.selected gives (all
+    visible tokens up to the budget), in chunks of QUERY_CHUNK queries over the gathered keys and values. A PyTorch
+    path on the CPU and the GPU; the QSA kernels are not written yet."""
 
     def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense):
         self.attn = AttentionLayer(cfg, ckpt, p, par, dtype, device, keep_dense)
@@ -308,29 +314,35 @@ class ExpAttention:
         ops.write_kv(cache.k[layer], cache.v[layer], k, v, slots, ks, vs)
         out = torch.empty(t, a.heads, d, dtype=x.dtype, device=x.device)
         bs = step.block_size
+        group = a.heads // a.kv_heads
         for b in range(len(step.context_lens)):
             q0, q1 = step.query_start[b], step.query_start[b + 1]
             if q1 == q0:
                 continue
-            ctx = step.context_lens[b] + (q1 - q0)
+            before = step.context_lens[b]
+            ctx = before + (q1 - q0)
             table = step.block_tables[b]
             pos = torch.arange(ctx, device=x.device)
             flat = table[pos // bs].long() * bs + pos % bs
             keys_i = cache.idx_k[layer].view(-1, cache.idx_k[layer].shape[-1])[flat]
             cos_all, sin_all = model.position_rope(cache, step, b, ctx)
-            mask = self.indexer.selected(iq[q0:q1], keys_i, cos_all, sin_all, step.context_lens[b])
             kk = _read_cache(cache.k[layer], ks, flat).float()
             vv = _read_cache(cache.v[layer], vs, flat).float()
-            group = a.heads // a.kv_heads
-            kk = kk.repeat_interleave(group, dim=1)
-            vv = vv.repeat_interleave(group, dim=1)
-            scores = torch.einsum("qhd,khd->hqk", q[q0:q1].float(), kk) * a.scale
-            causal = pos[None, :] <= (step.context_lens[b] + torch.arange(q1 - q0, device=x.device))[:, None]
-            allowed = causal if mask is None else (causal & mask)
-            scores = scores.masked_fill(~allowed[None], float("-inf"))
-            out[q0:q1] = torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), vv).to(x.dtype)
+            for c0 in range(q0, q1, QUERY_CHUNK):
+                c1 = min(q1, c0 + QUERY_CHUNK)
+                sel = self.indexer.selected(iq[c0:c1], keys_i, cos_all, sin_all, before + (c0 - q0))
+                valid = sel >= 0
+                g = sel.clamp(min=0).long()
+                qg = q[c0:c1].float().view(c1 - c0, a.kv_heads, group, d)
+                scores = torch.einsum("qgrd,qkgd->qgrk", qg, kk[g]) * a.scale
+                scores = scores.masked_fill(~valid[:, None, None, :], float("-inf"))
+                o = torch.einsum("qgrk,qkgd->qgrd", torch.softmax(scores, dim=-1), vv[g])
+                out[c0:c1] = o.reshape(c1 - c0, a.heads, d).to(x.dtype)
         o = ops.sigmoid_gate(out.reshape(t, a.heads * d), gate)
         return a.o_proj(a._owned(o))
+
+
+QUERY_CHUNK = 64
 
 
 def _read_cache(c: torch.Tensor, scale: torch.Tensor | None, flat: torch.Tensor) -> torch.Tensor:
