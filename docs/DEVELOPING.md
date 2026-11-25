@@ -68,7 +68,7 @@ The wheel and the tests must come from the same release.
    ```
    uv venv --python 3.12 ~/seventy-test-env &&
    uv pip install --python ~/seventy-test-env --torch-backend=cu129 \
-     "seventy[test,reference] @ https://github.com/Ruleryak/seventy/releases/download/v1.1.4/seventy-1.1.4-py3-none-manylinux_2_28_x86_64.whl"
+     "seventy[test,reference] @ https://github.com/Ruleryak/seventy/releases/download/v1.1.5/seventy-1.1.5-py3-none-manylinux_2_28_x86_64.whl"
    ```
 
    From a wheel file:
@@ -76,13 +76,13 @@ The wheel and the tests must come from the same release.
    ```
    uv venv --python 3.12 ~/seventy-test-env &&
    uv pip install --python ~/seventy-test-env --torch-backend=cu129 \
-     "seventy[test,reference] @ file:///path/to/seventy-1.1.4-py3-none-manylinux_2_28_x86_64.whl"
+     "seventy[test,reference] @ file:///path/to/seventy-1.1.5-py3-none-manylinux_2_28_x86_64.whl"
    ```
 
 2. Get the tests of the same release:
 
    ```
-   git clone --depth 1 --branch v1.1.4 https://github.com/Ruleryak/seventy.git seventy-src
+   git clone --depth 1 --branch v1.1.5 https://github.com/Ruleryak/seventy.git seventy-src
    ```
 
 3. Install `objdump` for the tests of the kernel library. It is in the binutils package. On Ubuntu or Debian:
@@ -190,7 +190,7 @@ engine or for the tests. Without the variable, the default path runs.
 | `SEVENTY_VERIFY_ATTN` | `wmma` | Verify attention on the WMMA kernel |
 | `SEVENTY_AR` | `home` | All-reduce and norm where the home rank of a row also takes the norm |
 | `SEVENTY_AR` | `flags` | All-reduce on the flag protocol |
-| `SEVENTY_CUSTOM_ALLREDUCE` | `0` | NCCL for all all-reduces (the engine does this itself when the GPUs have no peer-to-peer access) |
+| `SEVENTY_CUSTOM_ALLREDUCE` | `0` | NCCL for all all-reduces (the engine does this itself when the GPUs have no peer-to-peer access, or when its start check finds that peer writes do not arrive) |
 | `SEVENTY_GEMM_WK` | `0` | NVFP4 GEMM without the warp split over k |
 | `SEVENTY_GDN_SCAN` | `single` | Gated DeltaNet prefill state scan in one kernel |
 | `SEVENTY_GDN_PREPARE` | `torch` | Gated DeltaNet prefill preparation in PyTorch |

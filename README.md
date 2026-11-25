@@ -3,7 +3,7 @@
 seventy is an inference engine for Qwen3.5-family models (Qwen3.5, Qwen3.6, Qwen3.8) on NVIDIA V100 (sm70) GPUs.
 It serves an OpenAI-compatible API and has a control panel in the browser.
 
-**Status:** version 1.1.4. The tests ran on 4 Tesla V100-SXM2-32GB GPUs with NVLink. The release notes give the other systems that the release was tested on.
+**Status:** version 1.1.5. The tests ran on 4 Tesla V100-SXM2-32GB GPUs with NVLink. The release notes give the other systems that the release was tested on.
 
 - The design and the plan for version 1 are in [docs/DESIGN.md](docs/DESIGN.md).
 - To build and test the code, see [docs/DEVELOPING.md](docs/DEVELOPING.md).
@@ -33,8 +33,8 @@ seventy check-model /path/to/checkpoint
 These charts show the speed of seventy 1.1.3 on 4 Tesla V100-SXM2-32GB GPUs with NVLink (tensor parallel 4), at the
 default power limit of 300 W per GPU. The GPUs are GPUs 0 to 3 of a rented machine with 8 GPUs: each pair of the 4 GPUs
 has 1 or 2 NVLink links. The engine uses the NVFP4 27B model, the DFlash2 drafter and the INT8 KV cache. Thinking is on.
-Each request makes 512 tokens. The lighter lines show 1.1.2 on the same kind of machine. Version 1.1.4 changes only the
-memory checks; its speed is the same as the speed of 1.1.3.
+Each request makes 512 tokens. The lighter lines show 1.1.2 on the same kind of machine. Versions 1.1.4 and 1.1.5 do not
+change the speed on 1, 2 or 4 GPUs.
 
 The same release on a machine with 4 GPUs (2 NVLink links between each pair) at a power limit of 250 W per GPU made
 3% to 6% fewer prompt tokens per second, and decoded about 2% to 13% slower with 4 and 8 streams. The numbers are in
@@ -119,7 +119,7 @@ Run as your normal user:
 ```bash
 uv venv --python 3.12 ~/seventy-env &&
 uv pip install --python ~/seventy-env --torch-backend=cu129 \
-  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.4/seventy-1.1.4-py3-none-manylinux_2_28_x86_64.whl" &&
+  "seventy @ https://github.com/Ruleryak/seventy/releases/download/v1.1.5/seventy-1.1.5-py3-none-manylinux_2_28_x86_64.whl" &&
 ~/seventy-env/bin/seventy info
 ```
 
