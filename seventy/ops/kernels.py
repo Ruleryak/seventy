@@ -882,17 +882,40 @@ def moe_max_slots(pairs: int, experts: int) -> int:
     return max(1, -(-pairs // MOE_ROWS_PER_SLOT) + min(experts, pairs))
 
 
-def moe_route(logits: torch.Tensor, k: int, renorm: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    """(expert ids int32 [tokens, k], weights FP32 [tokens, k]) of router logits FP32 [tokens, experts]: the top k
-    (ties: the lower id), weighted by the softmax over the k picked logits (renorm) or over all logits."""
+def moe_route(logits: torch.Tensor, k: int, renorm: bool, experts: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """(expert ids int32 [tokens, k], weights FP32 [tokens, k]) of router logits FP32 [tokens, >= experts] (the first
+    experts columns, default all; rows may be strided): the top k (ties: the lower id), weighted by the softmax over
+    the k picked logits (renorm) or over all logits."""
     _expect(logits, "logits", torch.float32)
-    logits = logits.contiguous()
-    t, e = logits.shape
+    if logits.stride(1) != 1:
+        logits = logits.contiguous()
+    t = logits.shape[0]
+    e = logits.shape[1] if experts is None else experts
     ids = torch.empty(t, k, dtype=torch.int32, device=logits.device)
     weights = torch.empty(t, k, dtype=torch.float32, device=logits.device)
-    check("moe_route", lib().seventy_moe_route(logits.data_ptr(), t, e, k, int(renorm), ids.data_ptr(),
-                                               weights.data_ptr(), _stream(logits)))
+    check("moe_route", lib().seventy_moe_route(logits.data_ptr(), logits.stride(0), t, e, k, int(renorm),
+                                               ids.data_ptr(), weights.data_ptr(), _stream(logits)))
     return ids, weights
+
+
+def moe_finish(y: torch.Tensor, ids: torch.Tensor, k: int, e0: int, e1: int, shared: torch.Tensor | None,
+               gate: torch.Tensor | None) -> torch.Tensor:
+    """The MoE output FP16 [tokens, dim] (seventy_moe_finish): sigmoid(gate[t]) * shared[t] (FP16 [tokens, dim];
+    gate FP32 [tokens], may be strided) plus the rows of y (FP32 [tokens * k, dim]) of each token's picks of the
+    local experts [e0, e1) (ids int32 [tokens * k])."""
+    _expect(y, "y", torch.float32)
+    _expect(ids, "ids", torch.int32)
+    pairs, dim = y.shape
+    t = pairs // k
+    out = torch.empty(t, dim, dtype=torch.float16, device=y.device)
+    if shared is not None:
+        _expect(shared, "shared", torch.float16)
+        shared = shared.contiguous()
+    check("moe_finish", lib().seventy_moe_finish(
+        out.data_ptr(), y.data_ptr(), ids.contiguous().data_ptr(), t, k, e0, e1,
+        shared.data_ptr() if shared is not None else None, gate.data_ptr() if gate is not None else None,
+        gate.stride(0) if gate is not None else 0, dim, _stream(y)))
+    return out
 
 
 def moe_plan(ids: torch.Tensor, e0: int, e1: int) -> tuple:
@@ -991,6 +1014,23 @@ def qsa_pool(pooled: torch.Tensor, idx_keys: torch.Tensor, positions: torch.Tens
         _stream(idx_keys)))
 
 
+def qsa_index_prep(qk: torch.Tensor, q_norm: torch.Tensor, idx_cache: torch.Tensor, kv_slots_t: torch.Tensor,
+                   cos: torch.Tensor, sin: torch.Tensor, heads: int, eps: float) -> torch.Tensor:
+    """Indexer queries FP16 [tokens, heads, 128] (RMS norm times q_norm, rotated with cos/sin [tokens, half]) from
+    the projection qk FP32 [tokens, (heads + 1) * 128]; writes the raw keys (the last 128 values) as FP16 into
+    idx_cache at kv_slots_t (seventy_qsa_index_prep)."""
+    _expect(qk, "qk", torch.float32)
+    t = qk.shape[0]
+    dim = idx_cache.shape[-1]
+    out = torch.empty(t, heads, dim, dtype=torch.float16, device=qk.device)
+    half = cos.shape[-1]
+    cos, sin = cos.float().contiguous(), sin.float().contiguous()
+    check("qsa_index_prep", lib().seventy_qsa_index_prep(
+        out.data_ptr(), idx_cache.data_ptr(), qk.data_ptr(), qk.stride(0), q_norm.data_ptr(), kv_slots_t.data_ptr(),
+        cos.data_ptr(), sin.data_ptr(), t, heads, dim, half, eps, _stream(qk)))
+    return out
+
+
 def qsa_select(q: torch.Tensor, pooled: torch.Tensor, block_tables: torch.Tensor, query_start_t: torch.Tensor,
                context_lens_t: torch.Tensor, compress: int, top: int, max_blocks: int,
                block_size: int, row0: int = 0) -> torch.Tensor:
@@ -1012,14 +1052,21 @@ def qsa_select(q: torch.Tensor, pooled: torch.Tensor, block_tables: torch.Tensor
     return sel
 
 
+QSA_SPLIT_POSITIONS = 32
+QSA_BLOCKS = 160
+
+
 def qsa_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache, v_cache, k_scale, v_scale, sel: torch.Tensor,
                   block_tables: torch.Tensor, query_start_t: torch.Tensor, scale: float,
-                  splits: int = 8, row0: int = 0) -> torch.Tensor:
+                  splits: int | None = None, row0: int = 0) -> torch.Tensor:
     """Attention of each query row of q FP16 [rows, hq, 256] over its selected positions sel, times sigmoid of the
-    gate in qkv: FP16 [rows, hq * 256] (seventy_qsa_attention, then seventy_attention_combine)."""
+    gate in qkv: FP16 [rows, hq * 256] (seventy_qsa_attention, then seventy_attention_combine). By default a row's
+    selection splits into parts of QSA_SPLIT_POSITIONS entries while the launch has fewer than QSA_BLOCKS blocks."""
     _expect(q, "q", torch.float16)
     rows, hq, d = q.shape
     hkv = k_cache.shape[2]
+    if splits is None:
+        splits = max(1, min(-(-sel.shape[1] // QSA_SPLIT_POSITIONS), -(-QSA_BLOCKS // (rows * hkv))))
     ws = torch.empty(rows * hq * splits * (d + 2), dtype=torch.float32, device=q.device)
     po = ws[: rows * hq * splits * d]
     pml = ws[rows * hq * splits * d :]

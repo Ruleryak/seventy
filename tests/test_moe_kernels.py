@@ -89,3 +89,73 @@ def test_route_matches_softmax_topk(tokens, experts, k, renorm):
         want_w = want_w / want_w.sum(-1, keepdim=True)
     assert torch.equal(ids.long(), want_ids)
     torch.testing.assert_close(w, want_w, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("tokens", [1, 5, 64])
+def test_route_reads_strided_logits_and_breaks_ties_low(tokens):
+    """Logits that are the first columns of a wider product (row stride > experts), with exact ties."""
+    from seventy.ops import kernels
+
+    g = torch.Generator().manual_seed(tokens)
+    wide = (torch.randint(-3, 4, (tokens, 513), generator=g).float()).cuda()
+    ids, w = kernels.moe_route(wide, 10, True, experts=512)
+    logits = wide[:, :512].cpu()
+    for t in range(tokens):
+        order = sorted(range(512), key=lambda e: (-logits[t, e].item(), e))[:10]
+        assert ids[t].tolist() == order
+        picked = logits[t, order]
+        torch.testing.assert_close(w[t].cpu(), torch.softmax(picked, -1), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_finish_adds_local_picks_and_the_gated_shared_expert(shared):
+    from seventy.ops import kernels
+
+    g = torch.Generator().manual_seed(int(shared))
+    t, k, dim, e0, e1 = 6, 10, 256, 128, 256
+    ids = torch.randint(0, 512, (t * k,), generator=g, dtype=torch.int32)
+    y = torch.randn(t * k, dim, generator=g)
+    y[(ids < e0) | (ids >= e1)] = float("nan")
+    sh = torch.randn(t, dim, generator=g).half()
+    gate = torch.randn(t, 3, generator=g)
+    out = kernels.moe_finish(y.cuda(), ids.cuda(), k, e0, e1, sh.cuda() if shared else None,
+                             gate.cuda()[:, 1] if shared else None)
+    local = ((ids >= e0) & (ids < e1)).view(t, k, 1)
+    want = torch.where(local, y.view(t, k, dim), torch.zeros(())).sum(1)
+    if shared:
+        want = want + sh.float() * torch.sigmoid(gate[:, 1:2])
+    torch.testing.assert_close(out.float().cpu(), want.half().float(), rtol=2e-3, atol=2e-3)
+
+
+def test_small_batch_moe_matches_the_unfused_path():
+    """MoE._small (one product for the router and the shared gate, warp route, moe_finish) against the earlier
+    GPU path on random FP16 experts of a small config."""
+    from types import SimpleNamespace
+
+    from seventy.model.moe import MoE
+    from seventy.ops import kernels
+    from seventy.ops.kernels import DenseWeight
+
+    g = torch.Generator().manual_seed(3)
+    hidden, width, experts = 256, 64, 32
+    m = MoE.__new__(MoE)
+    m.cfg = SimpleNamespace(num_experts=experts, experts_per_token=4, norm_topk_prob=True)
+    m.top_k, m.e0, m.e1, m.dtype, m.device = 4, 8, 24, torch.float16, torch.device("cuda")
+    m.router = (torch.randn(experts, hidden, generator=g) * 0.05).half().float().cuda()
+    m.shared_gate = (torch.randn(1, hidden, generator=g) * 0.05).half().float().cuda()
+    m.gates = DenseWeight(torch.cat((m.router, m.shared_gate)).half())
+    from seventy.model.moe import ExpertStack
+
+    m.gate_up = ExpertStack(weight=(torch.randn(16, 2 * width, hidden, generator=g) * 0.05).half().cuda())
+    m.down = ExpertStack(weight=(torch.randn(16, hidden, width, generator=g) * 0.05).half().cuda())
+    wgu = (torch.randn(2 * width, hidden, generator=g) * 0.05).half().cuda()
+    wd = (torch.randn(hidden, width, generator=g) * 0.05).half().cuda()
+    m.shared_gate_up = lambda x: x @ wgu.T
+    m.shared_down = lambda x: x @ wd.T
+    x = torch.randn(7, hidden, generator=g).half().cuda()
+    got = m._small(x)
+    gates = m.gates
+    m.gates = None
+    want = m(x)
+    m.gates = gates
+    torch.testing.assert_close(got.float(), want.float(), rtol=2e-3, atol=2e-3)

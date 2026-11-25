@@ -237,19 +237,21 @@ class PLE:
         self.table = None
         torch.cuda.empty_cache()
 
-    def _gpu_call(self, h: torch.Tensor, step: StepInput, cache: ModelCache, index: int) -> torch.Tensor:
+    def _gpu_call(self, h: torch.Tensor, step: StepInput, cache: ModelCache, index: int,
+                  par: Parallel | None) -> torch.Tensor:
         from ..ops import kernels
 
         g = self.gpu
+        par = par or self.par
         ids = kernels.ple_ids(step.token_ids, cache.ple_tokens, step.state_slots_t, step.query_start_t,
                               step.context_lens_t, self.n, self.heads_per_ngram, g["mult"], g["sizes"], g["offsets"],
                               self.eos)
         part = kernels.ple_gather(ids, g["h0"], g["h1"], g["packed"], g["scales"], g["row_base"], g["head_dim"],
                                   self._global_scale)
-        if self.par.size > 1:
+        if par.size > 1:
             emb = torch.zeros(part.shape[0], ids.shape[1] * g["head_dim"], dtype=part.dtype, device=part.device)
             emb[:, g["h0"] * g["head_dim"] : g["h1"] * g["head_dim"]] = part
-            emb = self.par.all_reduce(emb)
+            emb = par.all_reduce(emb)
         else:
             emb = part
         key = grouped_rms_norm(g["key"](emb).float(), self.norm_key, self.hidden, self.eps)
@@ -291,10 +293,12 @@ class PLE:
             blocks.append(torch.remainder(mixed[:, None], sizes[None, :]) + self.offsets[a:b].to(tokens.device))
         return torch.cat(blocks, dim=1)
 
-    def __call__(self, h: torch.Tensor, step: StepInput, cache: ModelCache, index: int) -> torch.Tensor:
-        """What this layer adds to the streams h [T, hc x hidden] FP32; updates the sequences' PLE state."""
+    def __call__(self, h: torch.Tensor, step: StepInput, cache: ModelCache, index: int,
+                 par: Parallel | None = None) -> torch.Tensor:
+        """What this layer adds to the streams h [T, hc x hidden] FP32; updates the sequences' PLE state. par: the
+        model's current layout (with the peer-to-peer all-reduce once the engine has set it up)."""
         if self.gpu is not None:
-            return self._gpu_call(h, step, cache, index)
+            return self._gpu_call(h, step, cache, index, par)
         out = torch.empty_like(h)
         tokens = step.token_ids
         for b in range(len(step.context_lens)):
@@ -347,10 +351,29 @@ class Indexer:
         self.proj = Linear(ckpt, [Source(f"{p}.index_qk_proj")], torch.float32, device, keep_dense=True)
         self.q_norm = (ckpt.tensor(f"{p}.q_layernorm.weight").float() + 1.0).to(device)
         self.k_norm = (ckpt.tensor(f"{p}.k_layernorm.weight").float() + 1.0).to(device)
+        self.proj16 = None
+        w = self.proj.dense
+        if w.is_cuda and torch.equal(w.half().float(), w):
+            from ..ops.kernels import DenseWeight
+
+            self.proj16 = DenseWeight(w.half())
+            self.proj.dense = w.half()
+            torch.cuda.empty_cache()
+
+    def prep(self, x: torch.Tensor, cos, sin, idx_cache: torch.Tensor, kv_slots_t: torch.Tensor) -> torch.Tensor:
+        """The GPU path of queries_and_keys for up to 64 tokens of FP16 x: one FP16 product (the BF16 weights are
+        exact in FP16; FP32 sums), then seventy_qsa_index_prep writes the raw keys into idx_cache and returns the
+        queries in FP16. None when that path does not apply."""
+        if self.proj16 is None or x.dtype != torch.float16 or x.shape[0] > 64:
+            return None
+        from ..ops import kernels
+
+        qk = kernels.dense_gemm(x, self.proj16)
+        return kernels.qsa_index_prep(qk, self.q_norm, idx_cache, kv_slots_t, cos, sin, self.heads, self.eps)
 
     def queries_and_keys(self, x: torch.Tensor, cos, sin) -> tuple[torch.Tensor, torch.Tensor]:
         """(normed, rotated queries [T, heads, dim], raw keys [T, dim]) of the block input x [T, hidden]."""
-        qk = F.linear(x.float(), self.proj.dense)
+        qk = F.linear(x.float(), self.proj.dense.float())
         q = qk[:, : self.heads * self.dim].view(-1, self.heads, self.dim)
         k = qk[:, self.heads * self.dim :]
         q = _rms(q.reshape(-1, self.dim), self.q_norm, self.eps).view(-1, self.heads, self.dim)
@@ -412,15 +435,17 @@ class ExpAttention:
         ks, vs = cache.k_scale.get(layer), cache.v_scale.get(layer)
         q = kernels.attn_prep(qkv, a.q_norm, a.k_norm, step.positions, a.inv_freq, a.section, step.kv_slots_t,
                               cache.k[layer], cache.v[layer], a.heads, a.kv_heads, a.eps, ks, vs)
-        iq, ik = self.indexer.queries_and_keys(x, cos, sin)
         idx = cache.idx_k[layer]
-        idx.view(-1, idx.shape[-1])[step.kv_slots_t.long()] = ik.to(idx.dtype)
+        iq16 = self.indexer.prep(x, cos, sin, idx, step.kv_slots_t)
+        if iq16 is None:
+            iq, ik = self.indexer.queries_and_keys(x, cos, sin)
+            idx.view(-1, idx.shape[-1])[step.kv_slots_t.long()] = ik.to(idx.dtype)
+            iq16 = iq.to(torch.float16)
         kernels.qsa_pool(cache.pooled[layer], idx, cache.positions, step.block_tables, step.query_start_t,
                          step.context_lens_t, t, self.indexer.k_norm, a.inv_freq, a.section, self.cfg.rotary_dim,
                          e.indexer_compress, self.indexer.eps)
         top = e.indexer_budget // e.indexer_compress
         ld = cache.num_blocks * cache.block_size // e.indexer_compress
-        iq16 = iq.to(torch.float16)
         parts = []
         for r0 in range(0, t, SELECT_ROWS):
             r1 = min(t, r0 + SELECT_ROWS)
@@ -600,7 +625,7 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         captured = {}
         for i, layer in enumerate(self.layers):
             if layer.ple is not None:
-                h = h + layer.ple(h, step, cache, e.ple_layers.index(i))
+                h = h + layer.ple(h, step, cache, e.ple_layers.index(i), self.par)
             x, inject = layer.attn_hc(h)
             xin = x.to(self.dtype)
             if layer.kind == "full_attention":

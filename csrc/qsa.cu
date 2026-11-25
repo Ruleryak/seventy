@@ -11,6 +11,9 @@
  * to FP16, rotated (multimodal rotary on the first rotary_dim values) at the block's first position (cache
  * positions), into the pooled cache [blocks, block_size / c, kIdx] at that position's block and offset.
  *
+ * qsa_index_prep: from the indexer projection qk FP32 [tokens, (heads + 1) * kIdx], the normed, rotated queries (FP16
+ * [tokens, heads, kIdx]) and the raw keys (FP16, into the indexer cache at each token's slot).
+ *
  * qsa_score, qsa_select and qsa_attention take the rows row0 .. row0 + tokens - 1 of the step (their q, scores,
  * sel and outputs hold only those).
  * qsa_score: for every query row whose sequence has more than `top` complete blocks visible, the score of each
@@ -18,9 +21,10 @@
  * qsa_select: the positions [rows, width = top * c + c - 1] (-1: none) that a query attends to: all its visible
  * positions while they have no more than `top` complete blocks; else the positions of its `top` best blocks (ties:
  * the lower block) and of its unfinished last block.
- * qsa_attention: causal attention of each query row over its selected positions (one block per split, row and KV
- * head; the group's query heads share the row's positions), with partial outputs for attention_combine in
- * csrc/attention.cu (seventy_decode_attention's workspace layout with one token per row).
+ * qsa_attention: attention of each query row over its selected positions (one block per split, row and KV head; the
+ * group's query heads, at most 32, share the row's positions; split s takes the entries s * ceil(width / splits)
+ * onward of the row's sel), with partial outputs for attention_combine in csrc/attention.cu
+ * (seventy_decode_attention's workspace layout with one token per row).
  */
 
 namespace seventy {
@@ -28,8 +32,6 @@ namespace {
 
 constexpr int kIdx = 128;
 constexpr int kHeadD = 256;
-constexpr int kSelChunk = 16;
-constexpr int kAttnRows = 64;
 
 __device__ __forceinline__ int seq_of(const int *query_start, int num_seqs, int t) {
   int b = 0;
@@ -217,161 +219,255 @@ __global__ void __launch_bounds__(1024) qsa_select_kernel(int *sel, int width, c
   }
 }
 
+/*
+ * qsa_index_prep_kernel: one block of kIdx threads per (token, head); head `heads` is the raw key. Query heads: RMS
+ * norm in FP32 times q_norm (already 1 + w), rotation of the first 2 * half_rot values (value j with value
+ * j + half_rot), FP16 out. The raw key: FP16 into the indexer cache at the token's slot.
+ */
+__global__ void __launch_bounds__(kIdx) qsa_index_prep_kernel(half *q_out, half *idx_cache, const float *qk,
+                                                              int64_t qk_ld, const float *q_norm,
+                                                              const int *kv_slots, const float *cos,
+                                                              const float *sin, int heads, int half_rot, float eps) {
+  __shared__ float scratch[32];
+  __shared__ float vals[kIdx];
+  const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+  const float v = qk[static_cast<int64_t>(t) * qk_ld + h * kIdx + d];
+  if (h == heads) {
+    idx_cache[static_cast<int64_t>(kv_slots[t]) * kIdx + d] = __float2half_rn(v);
+    return;
+  }
+  const float ss = block_sum(v * v, scratch);
+  const float n = v * rsqrtf(ss / kIdx + eps) * q_norm[d];
+  vals[d] = n;
+  __syncthreads();
+  float o = n;
+  if (d < 2 * half_rot) {
+    const int j = d < half_rot ? d : d - half_rot;
+    const float c = cos[static_cast<int64_t>(t) * half_rot + j], s = sin[static_cast<int64_t>(t) * half_rot + j];
+    o = d < half_rot ? n * c - vals[d + half_rot] * s : n * c + vals[j] * s;
+  }
+  q_out[(static_cast<int64_t>(t) * heads + h) * kIdx + d] = __float2half_rn(o);
+}
+
+/*
+ * qsa_attention_kernel: one block of kAttnThreads threads per (split, query row, KV head). A split takes a fixed
+ * range of the row's sel entries (entries < 0 are skipped), in chunks of kChunk positions: the cache slots of the
+ * chunk's positions are looked up once, then each thread issues all its key, value and scale loads before it uses
+ * one, and the keys and values (dequantized to FP16) go to shared memory with a row stride of kHeadD + 2 halves, so that the 32 lanes of a
+ * warp, one position each, read different banks. Scores: lane = position, warp w takes the rows w, w + 4, ...;
+ * online softmax per row with warp shuffles; the outputs: each thread keeps 2 of the 256 values of every row.
+ */
+constexpr int kAttnThreads = 128;
+constexpr int kKStride = kHeadD + 2;
+
 template <typename T>
-__device__ __forceinline__ void load_sel(half (*dst)[kHeadD + 8], const T *cache, const float *scales,
-                                         const int *table, const int *pos_list, int n, int block_size, int hkv,
-                                         int kh);
+struct ChunkLoad;
 
 template <>
-__device__ __forceinline__ void load_sel<int8_t>(half (*dst)[kHeadD + 8], const int8_t *cache, const float *scales,
-                                                 const int *table, const int *pos_list, int n, int block_size,
-                                                 int hkv, int kh) {
-  for (int e = threadIdx.x; e < n * (kHeadD / 16); e += blockDim.x) {
-    const int j = e / (kHeadD / 16);
-    const int part = e % (kHeadD / 16);
-    const int pos = pos_list[j];
-    const int64_t slot = static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
-    const int64_t vec = slot * hkv + kh;
-    const float s = scales[vec];
-    const uint4 raw = *reinterpret_cast<const uint4 *>(cache + vec * kHeadD + part * 16);
+struct ChunkLoad<int8_t> {
+  static constexpr int kParts = kHeadD / 16;
+
+  template <int kChunk>
+  static __device__ __forceinline__ void run(half (*kd)[kKStride], half (*vd)[kKStride], const int8_t *k_cache,
+                                             const int8_t *v_cache, const float *k_scale, const float *v_scale,
+                                             const int64_t *slots, int hkv, int kh) {
+    constexpr int kIter = kChunk * kParts / kAttnThreads;
+    uint4 kr[kIter], vr[kIter];
+    float kscl[kIter], vscl[kIter];
+#pragma unroll
+    for (int i = 0; i < kIter; ++i) {
+      const int e = threadIdx.x + i * kAttnThreads;
+      const int64_t slot = slots[e / kParts];
+      kr[i] = vr[i] = make_uint4(0, 0, 0, 0);
+      kscl[i] = vscl[i] = 0.0f;
+      if (slot >= 0) {
+        const int64_t vec = slot * hkv + kh;
+        kr[i] = *reinterpret_cast<const uint4 *>(k_cache + vec * kHeadD + (e % kParts) * 16);
+        vr[i] = *reinterpret_cast<const uint4 *>(v_cache + vec * kHeadD + (e % kParts) * 16);
+        kscl[i] = k_scale[vec];
+        vscl[i] = v_scale[vec];
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < kIter; ++i) {
+      const int e = threadIdx.x + i * kAttnThreads;
+      store16(&kd[e / kParts][(e % kParts) * 16], kr[i], kscl[i]);
+      store16(&vd[e / kParts][(e % kParts) * 16], vr[i], vscl[i]);
+    }
+  }
+
+  static __device__ __forceinline__ void store16(half *dst, const uint4 raw, float sc) {
+    half2 *row = reinterpret_cast<half2 *>(dst);
     const uint32_t w[4] = {raw.x, raw.y, raw.z, raw.w};
-    uint32_t h[8];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      const half2 lo = __floats2half2_rn(static_cast<float>(static_cast<int8_t>(w[i] & 0xff)) * s,
-                                         static_cast<float>(static_cast<int8_t>((w[i] >> 8) & 0xff)) * s);
-      const half2 hi = __floats2half2_rn(static_cast<float>(static_cast<int8_t>((w[i] >> 16) & 0xff)) * s,
-                                         static_cast<float>(static_cast<int8_t>(w[i] >> 24)) * s);
-      h[2 * i] = *reinterpret_cast<const uint32_t *>(&lo);
-      h[2 * i + 1] = *reinterpret_cast<const uint32_t *>(&hi);
+      row[2 * i] = __floats2half2_rn(static_cast<float>(static_cast<int8_t>(w[i] & 0xff)) * sc,
+                                     static_cast<float>(static_cast<int8_t>((w[i] >> 8) & 0xff)) * sc);
+      row[2 * i + 1] = __floats2half2_rn(static_cast<float>(static_cast<int8_t>((w[i] >> 16) & 0xff)) * sc,
+                                         static_cast<float>(static_cast<int8_t>(w[i] >> 24)) * sc);
     }
-    *reinterpret_cast<uint4 *>(&dst[j][part * 16]) = make_uint4(h[0], h[1], h[2], h[3]);
-    *reinterpret_cast<uint4 *>(&dst[j][part * 16 + 8]) = make_uint4(h[4], h[5], h[6], h[7]);
   }
-}
+};
 
 template <>
-__device__ __forceinline__ void load_sel<half>(half (*dst)[kHeadD + 8], const half *cache, const float *,
-                                               const int *table, const int *pos_list, int n, int block_size, int hkv,
-                                               int kh) {
-  for (int e = threadIdx.x; e < n * (kHeadD / 8); e += blockDim.x) {
-    const int j = e / (kHeadD / 8);
-    const int part = e % (kHeadD / 8);
-    const int pos = pos_list[j];
-    const int64_t slot = static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
-    *reinterpret_cast<uint4 *>(&dst[j][part * 8]) =
-        *reinterpret_cast<const uint4 *>(cache + (slot * hkv + kh) * kHeadD + part * 8);
-  }
-}
+struct ChunkLoad<half> {
+  static constexpr int kParts = kHeadD / 8;
 
-template <typename T>
-__global__ void __launch_bounds__(kHeadD) qsa_attention_kernel(
+  template <int kChunk>
+  static __device__ __forceinline__ void run(half (*kd)[kKStride], half (*vd)[kKStride], const half *k_cache,
+                                             const half *v_cache, const float *, const float *,
+                                             const int64_t *slots, int hkv, int kh) {
+    constexpr int kIter = kChunk * kParts / kAttnThreads;
+    uint4 kr[kIter], vr[kIter];
+#pragma unroll
+    for (int i = 0; i < kIter; ++i) {
+      const int e = threadIdx.x + i * kAttnThreads;
+      const int64_t slot = slots[e / kParts];
+      kr[i] = vr[i] = make_uint4(0, 0, 0, 0);
+      if (slot >= 0) {
+        const int64_t at = (slot * hkv + kh) * kHeadD + (e % kParts) * 8;
+        kr[i] = *reinterpret_cast<const uint4 *>(k_cache + at);
+        vr[i] = *reinterpret_cast<const uint4 *>(v_cache + at);
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < kIter; ++i) {
+      const int e = threadIdx.x + i * kAttnThreads;
+      half2 *kw = reinterpret_cast<half2 *>(&kd[e / kParts][(e % kParts) * 8]);
+      half2 *vw = reinterpret_cast<half2 *>(&vd[e / kParts][(e % kParts) * 8]);
+      const half2 *kh2 = reinterpret_cast<const half2 *>(&kr[i]);
+      const half2 *vh2 = reinterpret_cast<const half2 *>(&vr[i]);
+#pragma unroll
+      for (int x = 0; x < 4; ++x) {
+        kw[x] = kh2[x];
+        vw[x] = vh2[x];
+      }
+    }
+  }
+};
+
+template <typename T, int kRows, int kChunk>
+__global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
     float *partial_o, float *partial_ml, const half *q, const T *k_cache, const T *v_cache, const float *k_scale,
     const float *v_scale, const int *sel, int width, const int *block_tables, int table_width,
     const int *query_start, int num_seqs, int block_size, int hq, int hkv, int splits, float scale, int row0) {
-  __shared__ half qs[kAttnRows][kHeadD];
-  __shared__ half kvs[kSelChunk][kHeadD + 8];
-  __shared__ float p[kAttnRows][kSelChunk];
-  __shared__ float row_m[kAttnRows], row_l[kAttnRows], row_scale[kAttnRows];
-  __shared__ int count_s;
+  __shared__ __align__(16) half qs[kRows][kHeadD];
+  __shared__ half ks[kChunk][kKStride];
+  __shared__ half vs[kChunk][kKStride];
+  __shared__ float p[kRows][kChunk + 1];
+  __shared__ float row_m[kRows], row_l[kRows], row_scale[kRows];
+  __shared__ int pos_list[kChunk];
+  __shared__ int64_t slot_list[kChunk];
   const int split = blockIdx.x, t = blockIdx.y, kh = blockIdx.z, tid = threadIdx.x;
-  const int group = hq / hkv;
-  const int rows = group;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int rows = hq / hkv;
   const int b = seq_of(query_start, num_seqs, row0 + t);
   const int *row_sel = sel + static_cast<int64_t>(t) * width;
-  if (tid == 0) {
-    int n = 0;
-    while (n < width && row_sel[n] >= 0) ++n;
-    for (int i = n; i < width; ++i)
-      if (row_sel[i] >= 0) n = i + 1;
-    count_s = n;
+  const int per = (width + splits - 1) / splits;
+  const int first = split * per, last = min(width, first + per);
+  auto pidx = [&](int r) { return (static_cast<int64_t>(t) * hq + kh * rows + r) * splits + split; };
+  for (int e = tid; e < rows * (kHeadD / 8); e += kAttnThreads) {
+    const int r = e / (kHeadD / 8), part = e % (kHeadD / 8);
+    *reinterpret_cast<uint4 *>(&qs[r][part * 8]) = *reinterpret_cast<const uint4 *>(
+        q + (static_cast<int64_t>(t) * hq + kh * rows + r) * kHeadD + part * 8);
   }
-  __syncthreads();
-  const int total = count_s;
-  const int per = (total + splits - 1) / splits;
-  const int first = split * per, last = min(total, first + per);
-  auto pidx = [&](int r) { return (static_cast<int64_t>(t) * hq + kh * group + r) * splits + split; };
-  if (rows > kAttnRows) return;
-  if (first >= last) {
-    for (int r = tid; r < rows; r += kHeadD) {
-      partial_ml[pidx(r) * 2] = -FLT_MAX;
-      partial_ml[pidx(r) * 2 + 1] = 0.0f;
-    }
-    return;
+  if (tid < kRows) {
+    row_m[tid] = -FLT_MAX;
+    row_l[tid] = 0.0f;
   }
-  for (int e = tid; e < rows * kHeadD; e += kHeadD) {
-    const int r = e / kHeadD;
-    qs[r][e % kHeadD] = q[(static_cast<int64_t>(t) * hq + kh * group + r) * kHeadD + e % kHeadD];
-  }
-  for (int r = tid; r < rows; r += kHeadD) {
-    row_m[r] = -FLT_MAX;
-    row_l[r] = 0.0f;
-  }
-  float acc[kAttnRows];
+  float acc[kRows][2];
 #pragma unroll
-  for (int r = 0; r < kAttnRows; ++r) acc[r] = 0.0f;
+  for (int r = 0; r < kRows; ++r) acc[r][0] = acc[r][1] = 0.0f;
   const int *table = block_tables + static_cast<int64_t>(b) * table_width;
-  __syncthreads();
-  for (int c0 = first; c0 < last; c0 += kSelChunk) {
-    const int n = min(kSelChunk, last - c0);
-    __shared__ int pos_list[kSelChunk];
-    __shared__ bool ok[kSelChunk];
-    if (tid < kSelChunk) {
-      const int v = tid < n ? row_sel[c0 + tid] : -1;
-      ok[tid] = v >= 0;
-      pos_list[tid] = v >= 0 ? v : 0;
+  for (int c0 = first; c0 < last; c0 += kChunk) {
+    const int n = min(kChunk, last - c0);
+    __syncthreads();
+    if (tid < kChunk) {
+      const int pos = tid < n ? row_sel[c0 + tid] : -1;
+      pos_list[tid] = pos;
+      slot_list[tid] = pos < 0 ? -1 : static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
     }
     __syncthreads();
-    load_sel<T>(kvs, k_cache, k_scale, table, pos_list, n, block_size, hkv, kh);
+    ChunkLoad<T>::template run<kChunk>(ks, vs, k_cache, v_cache, k_scale, v_scale, slot_list, hkv, kh);
     __syncthreads();
-    for (int e = tid; e < rows * kSelChunk; e += kHeadD) {
-      const int r = e / kSelChunk, j = e % kSelChunk;
-      float s = -FLT_MAX;
-      if (j < n && ok[j]) {
-        float dot = 0.0f;
-#pragma unroll 8
-        for (int x = 0; x < kHeadD; x += 2) {
-          const float2 a = __half22float2(*reinterpret_cast<const half2 *>(&qs[r][x]));
-          const float2 k2 = __half22float2(*reinterpret_cast<const half2 *>(&kvs[j][x]));
-          dot += a.x * k2.x + a.y * k2.y;
+    for (int j = lane; j < kChunk; j += 32) {
+      float dot[kRows / 4 > 0 ? kRows / 4 : 1];
+#pragma unroll
+      for (int i = 0; i < (kRows / 4 > 0 ? kRows / 4 : 1); ++i) dot[i] = 0.0f;
+      const half2 *kr = reinterpret_cast<const half2 *>(&ks[j][0]);
+#pragma unroll 4
+      for (int x = 0; x < kHeadD / 2; ++x) {
+        const float2 k2 = __half22float2(kr[x]);
+#pragma unroll
+        for (int i = 0; i < (kRows / 4 > 0 ? kRows / 4 : 1); ++i) {
+          const int r = warp + 4 * i;
+          if (r < kRows) {
+            const float2 a = __half22float2(reinterpret_cast<const half2 *>(&qs[r][0])[x]);
+            dot[i] = fmaf(a.x, k2.x, fmaf(a.y, k2.y, dot[i]));
+          }
         }
-        s = dot * scale;
       }
-      p[r][j] = s;
+      const bool ok = pos_list[j] >= 0;
+#pragma unroll
+      for (int i = 0; i < (kRows / 4 > 0 ? kRows / 4 : 1); ++i) {
+        const int r = warp + 4 * i;
+        if (r < kRows) p[r][j] = ok ? dot[i] * scale : -FLT_MAX;
+      }
     }
     __syncthreads();
-    for (int r = tid; r < rows; r += kHeadD) {
-      float m = row_m[r];
-      for (int j = 0; j < n; ++j) m = fmaxf(m, p[r][j]);
-      const float corr = (row_m[r] == -FLT_MAX) ? 0.0f : expf(row_m[r] - m);
-      float l = row_l[r] * corr;
-      for (int j = 0; j < n; ++j) {
-        const float e = (p[r][j] == -FLT_MAX) ? 0.0f : expf(p[r][j] - m);
+    for (int r = warp; r < rows; r += 4) {
+      float m = -FLT_MAX;
+      for (int j = lane; j < kChunk; j += 32) m = fmaxf(m, p[r][j]);
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+      const float m_old = row_m[r];
+      const float m_new = fmaxf(m_old, m);
+      float l = 0.0f;
+      for (int j = lane; j < kChunk; j += 32) {
+        const float s = p[r][j];
+        const float e = s == -FLT_MAX ? 0.0f : expf(s - m_new);
         p[r][j] = e;
         l += e;
       }
-      row_m[r] = m;
-      row_l[r] = l;
-      row_scale[r] = corr;
-    }
-    load_sel<T>(kvs, v_cache, v_scale, table, pos_list, n, block_size, hkv, kh);
-    __syncthreads();
 #pragma unroll
-    for (int r = 0; r < kAttnRows; ++r) {
-      if (r < rows) {
-        float a = acc[r] * row_scale[r];
-        for (int j = 0; j < n; ++j) a += p[r][j] * __half2float(kvs[j][tid]);
-        acc[r] = a;
+      for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+      if (lane == 0) {
+        const float corr = m_old == -FLT_MAX ? 0.0f : expf(m_old - m_new);
+        row_scale[r] = corr;
+        row_l[r] = row_l[r] * corr + l;
+        row_m[r] = m_new;
       }
     }
     __syncthreads();
-  }
 #pragma unroll
-  for (int r = 0; r < kAttnRows; ++r)
-    if (r < rows) partial_o[pidx(r) * kHeadD + tid] = acc[r];
-  for (int r = tid; r < rows; r += kHeadD) {
-    partial_ml[pidx(r) * 2] = row_m[r];
-    partial_ml[pidx(r) * 2 + 1] = row_l[r];
+    for (int r = 0; r < kRows; ++r) {
+      if (r < rows) {
+        const float c = row_scale[r];
+        float a0 = acc[r][0] * c, a1 = acc[r][1] * c;
+        for (int j = 0; j < n; ++j) {
+          const float2 v2 = __half22float2(reinterpret_cast<const half2 *>(&vs[j][0])[tid]);
+          const float pj = p[r][j];
+          a0 = fmaf(pj, v2.x, a0);
+          a1 = fmaf(pj, v2.y, a1);
+        }
+        acc[r][0] = a0;
+        acc[r][1] = a1;
+      }
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int r = 0; r < kRows; ++r) {
+    if (r < rows) {
+      float2 out;
+      out.x = acc[r][0];
+      out.y = acc[r][1];
+      reinterpret_cast<float2 *>(partial_o + pidx(r) * kHeadD)[tid] = out;
+    }
+  }
+  if (tid < rows) {
+    partial_ml[pidx(tid) * 2] = row_m[tid];
+    partial_ml[pidx(tid) * 2 + 1] = row_l[tid];
   }
 }
 
@@ -391,6 +487,22 @@ SEVENTY_API int seventy_qsa_pool(void *pooled, const void *idx_keys, const int *
                                                positions, block_tables, table_width, query_start, context_lens,
                                                num_seqs, k_norm, inv_freq, s1, s2, rotary_dim, compress, block_size,
                                                eps);
+  return launch_status();
+}
+
+SEVENTY_API int seventy_qsa_index_prep(void *q_out, void *idx_cache, const float *qk, int64_t qk_ld,
+                                       const float *q_norm, const int *kv_slots, const float *cos, const float *sin,
+                                       int tokens, int heads, int dim, int half_rot, float eps,
+                                       cudaStream_t stream) {
+  using namespace seventy;
+  if (q_out == nullptr || idx_cache == nullptr || qk == nullptr || q_norm == nullptr || kv_slots == nullptr ||
+      tokens < 0 || heads < 1 || dim != kIdx || half_rot < 0 || 2 * half_rot > kIdx || qk_ld < (heads + 1) * kIdx ||
+      (half_rot > 0 && (cos == nullptr || sin == nullptr)))
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (tokens == 0) return SEVENTY_OK;
+  qsa_index_prep_kernel<<<dim3(tokens, heads + 1), kIdx, 0, stream>>>(
+      static_cast<half *>(q_out), static_cast<half *>(idx_cache), qk, qk_ld, q_norm, kv_slots, cos, sin, heads,
+      half_rot, eps);
   return launch_status();
 }
 
@@ -418,20 +530,30 @@ SEVENTY_API int seventy_qsa_attention(float *partial_o, float *partial_ml, const
                                       int hq, int hkv, int splits, float scale, cudaStream_t stream) {
   using namespace seventy;
   if (partial_o == nullptr || partial_ml == nullptr || q == nullptr || sel == nullptr || tokens < 0 || hkv < 1 ||
-      hq % hkv || hq / hkv > kAttnRows || splits < 1)
+      hq % hkv || hq / hkv > 32 || splits < 1)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (tokens == 0) return SEVENTY_OK;
   const dim3 grid(splits, tokens, hkv);
+  const int rows = hq / hkv;
+#define SEVENTY_QSA_ATTN(T, R, C, K, V, KS, VS)                                                                    \
+  qsa_attention_kernel<T, R, C><<<grid, kAttnThreads, 0, stream>>>(                                                \
+      partial_o, partial_ml, static_cast<const half *>(q), static_cast<const T *>(K), static_cast<const T *>(V), KS, \
+      VS, sel, width, block_tables, table_width, query_start, num_seqs, block_size, hq, hkv, splits, scale, row0)
   if (k_scale != nullptr) {
-    qsa_attention_kernel<int8_t><<<grid, kHeadD, 0, stream>>>(
-        partial_o, partial_ml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
-        static_cast<const int8_t *>(v_cache), k_scale, v_scale, sel, width, block_tables, table_width, query_start,
-        num_seqs, block_size, hq, hkv, splits, scale, row0);
+    if (rows <= 8)
+      SEVENTY_QSA_ATTN(int8_t, 8, 32, k_cache, v_cache, k_scale, v_scale);
+    else if (rows <= 16)
+      SEVENTY_QSA_ATTN(int8_t, 16, 32, k_cache, v_cache, k_scale, v_scale);
+    else
+      SEVENTY_QSA_ATTN(int8_t, 32, 16, k_cache, v_cache, k_scale, v_scale);
   } else {
-    qsa_attention_kernel<half><<<grid, kHeadD, 0, stream>>>(
-        partial_o, partial_ml, static_cast<const half *>(q), static_cast<const half *>(k_cache),
-        static_cast<const half *>(v_cache), nullptr, nullptr, sel, width, block_tables, table_width, query_start,
-        num_seqs, block_size, hq, hkv, splits, scale, row0);
+    if (rows <= 8)
+      SEVENTY_QSA_ATTN(half, 8, 32, k_cache, v_cache, nullptr, nullptr);
+    else if (rows <= 16)
+      SEVENTY_QSA_ATTN(half, 16, 32, k_cache, v_cache, nullptr, nullptr);
+    else
+      SEVENTY_QSA_ATTN(half, 32, 16, k_cache, v_cache, nullptr, nullptr);
   }
+#undef SEVENTY_QSA_ATTN
   return launch_status();
 }

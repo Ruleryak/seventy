@@ -113,10 +113,20 @@ class MoE:
             self.gate_up = ExpertStack(weight=torch.stack([self.gate_up.dense(e, dtype) for e in range(n)]))
             self.down = ExpertStack(weight=torch.stack([self.down.dense(e, dtype) for e in range(n)]))
         self.width = cfg.moe_intermediate_size
+        self.gates = None
+        if self.device.type == "cuda" and dtype == torch.float16:
+            both = torch.cat((self.router, self.shared_gate))
+            if torch.equal(both.half().float(), both):
+                from ..ops.kernels import DenseWeight
+
+                self.gates = DenseWeight(both.half())
+                self.router, self.shared_gate = self.router.half(), self.shared_gate.half()
+                torch.cuda.empty_cache()
 
     def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(expert ids [tokens, k] int64, or int32 from the kernel, weights [tokens, k] FP32) of each token."""
-        logits = x.float() @ self.router.T
+        """(expert ids [tokens, k] int64, or int32 from the kernel, weights [tokens, k] FP32) of each token. The router
+        weights are FP32, or FP16 when that is exact (with self.gates); the logits are FP32 either way."""
+        logits = x.float() @ self.router.float().T
         if logits.is_cuda:
             from ..ops import kernels
 
@@ -129,13 +139,15 @@ class MoE:
 
     def _shared(self, x: torch.Tensor) -> torch.Tensor:
         shared = self.shared_down(ops.silu_mul(self.shared_gate_up(x)))
-        return shared.float() * torch.sigmoid(x.float() @ self.shared_gate.T)
+        return shared.float() * torch.sigmoid(x.float() @ self.shared_gate.float().T)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's partial sum of the MoE output (the all-reduce after the MLP completes it)."""
         t = x.shape[0]
         if not t:
             return x.new_zeros(0, x.shape[1])
+        if x.is_cuda and x.dtype == torch.float16 and t <= SMALL_TOKENS and self.gates is not None:
+            return self._small(x)
         out = self._shared(x)
         ids, weights = self.route(x)
         if x.is_cuda and x.dtype == torch.float16 and t <= SMALL_TOKENS:
@@ -150,6 +162,27 @@ class MoE:
                                  pair_weight=weights.reshape(-1).float().contiguous())
             return (out + y.view(t, self.top_k, -1).sum(dim=1)).to(x.dtype)
         return self._loop(x, ids, weights, out).to(x.dtype)
+
+    def _small(self, x: torch.Tensor) -> torch.Tensor:
+        """Up to SMALL_TOKENS tokens on the GPU, without host synchronization: one FP16 product gives the router
+        logits and the shared expert's gate logit (the BF16 weights are exact in FP16; FP32 sums), then the route,
+        the plan and the two grouped expert products, and moe_finish adds the gated shared expert."""
+        from ..ops import kernels
+
+        t, k, n = x.shape[0], self.top_k, self.cfg.num_experts
+        logits = kernels.dense_gemm(x, self.gates)
+        ids, weights = kernels.moe_route(logits, k, self.cfg.norm_topk_prob, experts=n)
+        shared = self.shared_down(ops.silu_mul(self.shared_gate_up(x)))
+        ids = ids.reshape(-1)
+        pairs = t * k
+        plan = kernels.moe_plan(ids, self.e0, self.e1)
+        h = torch.empty(pairs, self._w(self.gate_up).shape[1], dtype=torch.float16, device=x.device)
+        kernels.moe_gemm(x, k, self._w(self.gate_up), self.gate_up.scales, self.gate_up.alpha, plan, pairs, out=h)
+        a = ops.silu_mul(h)
+        y = torch.empty(pairs, x.shape[1], dtype=torch.float32, device=x.device)
+        kernels.moe_gemm(a, 1, self._w(self.down), self.down.scales, self.down.alpha, plan, pairs,
+                         pair_weight=weights.reshape(-1), out=y)
+        return kernels.moe_finish(y, ids, k, self.e0, self.e1, shared, logits[:, n])
 
     @staticmethod
     def _w(stack: ExpertStack) -> torch.Tensor:

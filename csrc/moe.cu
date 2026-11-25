@@ -13,8 +13,12 @@
  * `per` pairs of one expert: slot s covers order[start[s] .. start[s] + count[s]) of expert slot_expert[s]. The
  * order is stable, so results do not depend on timing.
  *
- * seventy_moe_route: for each token, the top k of its router logits (ties: the lower expert id) and their weights:
- * the softmax over the k picked logits (renorm), or over all logits. One block per token.
+ * seventy_moe_route: for each token, the top k of its router logits (row stride ld, so that the logits can be
+ * columns of a wider product; ties: the lower expert id) and their weights: the softmax over the k picked logits
+ * (renorm), or over all logits. One warp per token.
+ *
+ * seventy_moe_finish: the MoE output of each token in FP16: sigmoid(gate) times the shared expert's output (none
+ * when shared is NULL) plus the down outputs (FP32, already times the pair weights) of the token's local picks.
  *
  * seventy_moe_gemm: for each slot, the rows of its pairs times the weight of its expert. Row r of x for pair p is
  * x[p / row_div] (row_div k: x holds the tokens, for gate_up; row_div 1: x holds the pairs, for down). One block
@@ -218,46 +222,48 @@ __global__ void __launch_bounds__(kMoeThreads) moe_gemm_kernel(
   }
 }
 
-__global__ void __launch_bounds__(256) moe_route_kernel(const float *logits, int experts, int k, int renorm,
-                                                       int32_t *ids, float *weights) {
-  __shared__ float vals[kMoeMaxExperts];
-  __shared__ float red_v[8];
-  __shared__ int red_i[8];
-  __shared__ int picked[16];
-  const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const float *row = logits + static_cast<int64_t>(t) * experts;
+/*
+ * moe_route_kernel: one warp per token. Each lane keeps the logits of the experts lane, lane + 32, ... in registers;
+ * k rounds of a warp argmax (ties: the lower id) pick the experts, and lane j keeps pick j.
+ */
+constexpr int kRoutePer = kMoeMaxExperts / 32;
+constexpr int kRouteWarps = 4;
+
+__global__ void __launch_bounds__(32 * kRouteWarps) moe_route_kernel(const float *logits, int64_t ld, int tokens,
+                                                                     int experts, int k, int renorm, int32_t *ids,
+                                                                     float *weights) {
+  const int lane = threadIdx.x & 31;
+  const int t = blockIdx.x * kRouteWarps + (threadIdx.x >> 5);
+  if (t >= tokens) return;
+  const float *row = logits + static_cast<int64_t>(t) * ld;
+  float v[kRoutePer];
   float mx = -INFINITY;
-  for (int e = tid; e < experts; e += blockDim.x) {
-    vals[e] = row[e];
-    mx = fmaxf(mx, vals[e]);
+#pragma unroll
+  for (int i = 0; i < kRoutePer; ++i) {
+    const int e = lane + 32 * i;
+    v[i] = e < experts ? row[e] : -INFINITY;
+    mx = fmaxf(mx, v[i]);
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-  if (lane == 0) red_v[warp] = mx;
-  __syncthreads();
-  mx = red_v[0];
-  for (int w = 1; w < 8; ++w) mx = fmaxf(mx, red_v[w]);
-  __syncthreads();
   float sum = 0.0f;
   if (!renorm) {
-    for (int e = tid; e < experts; e += blockDim.x) sum += expf(vals[e] - mx);
+#pragma unroll
+    for (int i = 0; i < kRoutePer; ++i)
+      if (lane + 32 * i < experts) sum += expf(v[i] - mx);
     sum = warp_sum(sum);
-    if (lane == 0) red_v[warp] = sum;
-    __syncthreads();
-    sum = 0.0f;
-    for (int w = 0; w < 8; ++w) sum += red_v[w];
-    __syncthreads();
   }
+  float mine_v = -INFINITY;
+  int mine_i = 0;
   for (int j = 0; j < k; ++j) {
     float best = -INFINITY;
     int bi = experts;
-    for (int e = tid; e < experts; e += blockDim.x) {
-      const float v = vals[e];
-      if (v > best || (v == best && e < bi)) {
-        best = v;
-        bi = e;
+#pragma unroll
+    for (int i = 0; i < kRoutePer; ++i)
+      if (v[i] > best) {
+        best = v[i];
+        bi = lane + 32 * i;
       }
-    }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
       const float ov = __shfl_xor_sync(0xffffffffu, best, o);
@@ -267,35 +273,51 @@ __global__ void __launch_bounds__(256) moe_route_kernel(const float *logits, int
         bi = oi;
       }
     }
-    if (lane == 0) {
-      red_v[warp] = best;
-      red_i[warp] = bi;
-    }
-    __syncthreads();
-    if (tid == 0) {
-      float bv = red_v[0];
-      int bx = red_i[0];
-      for (int w = 1; w < 8; ++w)
-        if (red_v[w] > bv || (red_v[w] == bv && red_i[w] < bx)) {
-          bv = red_v[w];
-          bx = red_i[w];
-        }
-      picked[j] = bx;
-      vals[bx] = -INFINITY;
-      ids[static_cast<int64_t>(t) * k + j] = bx;
-      weights[static_cast<int64_t>(t) * k + j] = bv;
-    }
-    __syncthreads();
-  }
-  if (tid == 0) {
-    float total = 0.0f;
-    for (int j = 0; j < k; ++j) total += expf(weights[static_cast<int64_t>(t) * k + j] - mx);
-    const float denom = renorm ? total : sum;
-    for (int j = 0; j < k; ++j) {
-      float *w = weights + static_cast<int64_t>(t) * k + j;
-      *w = expf(*w - mx) / denom;
+#pragma unroll
+    for (int i = 0; i < kRoutePer; ++i)
+      if (lane + 32 * i == bi) v[i] = -INFINITY;
+    if (lane == j) {
+      mine_v = best;
+      mine_i = bi;
     }
   }
+  const float w = lane < k ? expf(mine_v - mx) : 0.0f;
+  const float total = warp_sum(w);
+  if (lane < k) {
+    ids[static_cast<int64_t>(t) * k + lane] = mine_i;
+    weights[static_cast<int64_t>(t) * k + lane] = w / (renorm ? total : sum);
+  }
+}
+
+/*
+ * moe_finish_kernel: out[t] = fp16(sigmoid(gate[t]) * shared[t] + the sum, in pick order, of y over the token's
+ * picks whose expert is local (e0 <= id < e1)); y rows of other picks are not read.
+ */
+__global__ void moe_finish_kernel(half *out, const float *y, const int32_t *ids, int e0, int e1, int k,
+                                  const half *shared, const float *gate, int64_t gate_ld, int dim) {
+  const int t = blockIdx.y;
+  const int j = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (j >= dim) return;
+  float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  if (shared != nullptr) {
+    const float g = 1.0f / (1.0f + expf(-gate[static_cast<int64_t>(t) * gate_ld]));
+    const half2 *sh = reinterpret_cast<const half2 *>(shared + static_cast<int64_t>(t) * dim + j);
+    const float2 a = __half22float2(sh[0]), b = __half22float2(sh[1]);
+    acc = make_float4(a.x * g, a.y * g, b.x * g, b.y * g);
+  }
+  for (int i = 0; i < k; ++i) {
+    const int64_t pair = static_cast<int64_t>(t) * k + i;
+    const int id = ids[pair];
+    if (id < e0 || id >= e1) continue;
+    const float4 v = *reinterpret_cast<const float4 *>(y + pair * dim + j);
+    acc.x += v.x;
+    acc.y += v.y;
+    acc.z += v.z;
+    acc.w += v.w;
+  }
+  half2 *o = reinterpret_cast<half2 *>(out + static_cast<int64_t>(t) * dim + j);
+  o[0] = __floats2half2_rn(acc.x, acc.y);
+  o[1] = __floats2half2_rn(acc.z, acc.w);
 }
 
 }  // namespace
@@ -353,13 +375,28 @@ SEVENTY_API int seventy_moe_gemm(void *out, const void *x, int row_div, const vo
   return launch_status();
 }
 
-SEVENTY_API int seventy_moe_route(const float *logits, int tokens, int experts, int k, int renorm, int32_t *ids,
-                                  float *weights, cudaStream_t stream) {
+SEVENTY_API int seventy_moe_route(const float *logits, int64_t ld, int tokens, int experts, int k, int renorm,
+                                  int32_t *ids, float *weights, cudaStream_t stream) {
   using namespace seventy;
   if (logits == nullptr || ids == nullptr || weights == nullptr || tokens < 0 || experts < 1 ||
-      experts > kMoeMaxExperts || k < 1 || k > 16 || k > experts)
+      experts > kMoeMaxExperts || k < 1 || k > 16 || k > experts || ld < experts)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (tokens == 0) return SEVENTY_OK;
-  moe_route_kernel<<<tokens, 256, 0, stream>>>(logits, experts, k, renorm, ids, weights);
+  moe_route_kernel<<<(tokens + kRouteWarps - 1) / kRouteWarps, 32 * kRouteWarps, 0, stream>>>(
+      logits, ld, tokens, experts, k, renorm, ids, weights);
+  return launch_status();
+}
+
+SEVENTY_API int seventy_moe_finish(void *out, const float *y, const int32_t *ids, int tokens, int k, int e0, int e1,
+                                   const void *shared, const float *gate, int64_t gate_ld, int dim,
+                                   cudaStream_t stream) {
+  using namespace seventy;
+  if (out == nullptr || y == nullptr || ids == nullptr || tokens < 0 || k < 1 || dim % 4 ||
+      (shared != nullptr && gate == nullptr))
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (tokens == 0) return SEVENTY_OK;
+  const dim3 grid((dim / 4 + 127) / 128, tokens);
+  moe_finish_kernel<<<grid, 128, 0, stream>>>(static_cast<half *>(out), y, ids, e0, e1, k,
+                                              static_cast<const half *>(shared), gate, gate_ld, dim);
   return launch_status();
 }

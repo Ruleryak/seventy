@@ -84,3 +84,73 @@ def test_qsa_kernels_match_reference(ctx, new):
         gate = qkv[i].view(HQ, 2, D)[:, 1].float()
         want = (o * torch.sigmoid(gate)).reshape(-1)
         torch.testing.assert_close(out[i].float(), want, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("int8", [False, True])
+@pytest.mark.parametrize("hq,hkv", [(4, 1), (6, 1), (12, 1), (24, 2), (24, 1)])
+@pytest.mark.parametrize("splits", [None, 1, 5])
+def test_qsa_attention_over_any_selection(int8, hq, hkv, splits):
+    """seventy_qsa_attention for any group size up to 32, split count and selection with holes (-1), on FP16 and
+    INT8 caches (per token and KV head scales), against PyTorch."""
+    from seventy.ops import kernels
+
+    g = torch.Generator().manual_seed(hq * 7 + hkv + (splits or 0) + int8)
+    dev = "cuda"
+    rows, width, total = 3, 2051, 2400
+    blocks = -(-total // BS)
+    table = torch.randperm(blocks + 5, generator=g)[:blocks].int().to(dev)
+    nblk = blocks + 6
+    sel = torch.full((rows, width), -1, dtype=torch.int32)
+    for i in range(rows):
+        n = (1700, width, 900)[i]
+        pick = torch.randperm(total, generator=g)[:n].sort().values.int()
+        at = torch.randperm(width, generator=g)[:n].sort().values
+        sel[i, at] = pick
+    sel = sel.to(dev)
+    if int8:
+        k_cache = torch.randint(-127, 128, (nblk, BS, hkv, D), generator=g, dtype=torch.int8).to(dev)
+        v_cache = torch.randint(-127, 128, (nblk, BS, hkv, D), generator=g, dtype=torch.int8).to(dev)
+        k_scale = (torch.rand(nblk, BS, hkv, generator=g) * 0.02 + 0.005).to(dev)
+        v_scale = (torch.rand(nblk, BS, hkv, generator=g) * 0.02 + 0.005).to(dev)
+        kf = k_cache.float() * k_scale[..., None]
+        vf = v_cache.float() * v_scale[..., None]
+    else:
+        k_cache = torch.randn(nblk, BS, hkv, D, generator=g).half().to(dev)
+        v_cache = torch.randn(nblk, BS, hkv, D, generator=g).half().to(dev)
+        k_scale = v_scale = None
+        kf, vf = k_cache.float(), v_cache.float()
+    qa = torch.randn(rows, hq, D, generator=g).half().to(dev)
+    qkv = torch.randn(rows, hq * 2 * D, generator=g).half().to(dev)
+    qs_t = torch.tensor([0, rows], dtype=torch.int32, device=dev)
+    out = kernels.qsa_attention(qa, qkv, k_cache, v_cache, k_scale, v_scale, sel, table[None], qs_t, 1 / 16,
+                                splits=splits)
+    for i in range(rows):
+        p = sel[i][sel[i] >= 0].long()
+        s = table[p // BS].long() * BS + p % BS
+        kk = kf.view(-1, hkv, D)[s].half().float().repeat_interleave(hq // hkv, dim=1)
+        vv = vf.view(-1, hkv, D)[s].half().float().repeat_interleave(hq // hkv, dim=1)
+        att = torch.softmax(torch.einsum("hd,khd->hk", qa[i].float(), kk) / 16, dim=-1)
+        o = torch.einsum("hk,khd->hd", att, vv).half().float()
+        gate = qkv[i].view(hq, 2, D)[:, 1].float()
+        want = (o * torch.sigmoid(gate)).reshape(-1)
+        torch.testing.assert_close(out[i].float(), want, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("tokens", [1, 5, 64])
+def test_index_prep_matches_norm_rotary_and_key_write(tokens):
+    from seventy.ops import kernels
+
+    g = torch.Generator().manual_seed(tokens)
+    heads, dim, half = 4, 128, 32
+    qk = torch.randn(tokens, (heads + 1) * dim, generator=g).cuda()
+    q_norm = (1 + torch.randn(dim, generator=g) * 0.1).cuda()
+    ang = torch.rand(tokens, half, generator=g).cuda() * 6
+    cos, sin = torch.cos(ang), torch.sin(ang)
+    cache = torch.zeros(50, BS, dim, dtype=torch.float16, device="cuda")
+    slots = torch.randperm(50 * BS, generator=g)[:tokens].int().cuda()
+    q = kernels.qsa_index_prep(qk, q_norm, cache, slots, cos, sin, heads, 1e-6)
+    f = qk[:, : heads * dim].view(tokens, heads, dim)
+    f = f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + 1e-6) * q_norm
+    want = ops.apply_rotary(f, cos, sin).half()
+    torch.testing.assert_close(q.float(), want.float(), rtol=1e-3, atol=1e-3)
+    assert torch.equal(cache.view(-1, dim)[slots.long()], qk[:, heads * dim :].half())

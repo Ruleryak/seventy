@@ -80,6 +80,7 @@ SIGNATURES = {
     "seventy_attention_combine": (_I32, [_P, _P, _P, _I32, _I32, _I32, _I32, _P]),
     "seventy_qsa_pool": (_I32, [_P, _P, _P, _P, _I32, _P, _P, _I32, _I32, _P, _P, _I32, _I32, _I32, _I32, _I32, _F32,
                                 _P]),
+    "seventy_qsa_index_prep": (_I32, [_P, _P, _P, _I64, _P, _P, _P, _P, _I32, _I32, _I32, _I32, _F32, _P]),
     "seventy_qsa_select": (_I32, [_P, _I32, _P, _I32, _P, _I32, _P, _P, _I32, _P, _P, _I32, _I32, _I32, _I32, _I32,
                                   _I32, _P]),
     "seventy_qsa_attention": (_I32, [_P, _P, _P, _P, _P, _P, _P, _P, _I32, _P, _I32, _P, _I32, _I32, _I32, _I32,
@@ -92,7 +93,8 @@ SIGNATURES = {
     "seventy_hc_act": (_I32, [_P, _P, _P, _I32, _I32, _I32, _I32, _P]),
     "seventy_hc_combine": (_I32, [_P, _P, _P, _I32, _I32, _I32, _P]),
     "seventy_hc_inject": (_I32, [_P, _P, _P, _I32, _I32, _I32, _P]),
-    "seventy_moe_route": (_I32, [_P, _I32, _I32, _I32, _I32, _P, _P, _P]),
+    "seventy_moe_route": (_I32, [_P, _I64, _I32, _I32, _I32, _I32, _P, _P, _P]),
+    "seventy_moe_finish": (_I32, [_P, _P, _P, _I32, _I32, _I32, _I32, _P, _P, _I64, _I32, _P]),
     "seventy_moe_plan": (_I32, [_P, _I32, _I32, _I32, _I32, _I32, _P, _P, _P, _P, _P, _P]),
     "seventy_moe_gemm": (_I32, [_P, _P, _I32, _P, _P, _P, _I32, _I32, _I32, _P, _P, _P, _P, _P, _I32, _I32, _P, _P]),
 }
