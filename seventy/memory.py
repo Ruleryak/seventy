@@ -30,7 +30,10 @@ def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int
     kv_heads = max_head_split(t.num_heads, t.num_kv_heads, tp)[0]
     kv = (len(t.attention_layers) + extra_layers) * 2 * block_size * kv_heads * per_vec
     if t.exp is not None:
-        kv += block_size * (len(t.attention_layers) * t.exp.indexer_head_dim * 2 + 3 * 4)
+        e = t.exp
+        per_layer = e.indexer_head_dim * 2
+        kv += block_size * (len(t.attention_layers) * per_layer + 3 * 4) + len(t.attention_layers) * per_layer * (
+            block_size // e.indexer_compress)
     return kv
 
 
@@ -48,7 +51,7 @@ def state_bytes_per_slot(cfg: ModelConfig, tp: int = 1) -> int:
     state = len(t.linear_layers) * (hv * t.gdn_k_dim * t.gdn_v_dim * 4 + conv * (t.conv_kernel - 1) * 2)
     if t.exp is not None:
         e = t.exp
-        state += (e.ngram_size - 1) * 8 + len(e.ple_layers) * (e.ple_conv_kernel - 1) * e.ngram_size * e.hc_count * t.hidden_size * 2
+        state += (e.ngram_size - 1) * 8 + len(e.ple_layers) * (e.ple_conv_kernel - 1) * e.ngram_size * e.hc_count * t.hidden_size * 4
     return state
 
 

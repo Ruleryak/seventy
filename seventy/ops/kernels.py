@@ -977,3 +977,107 @@ def hc_inject(h: torch.Tensor, y: torch.Tensor, w: torch.Tensor, hc: int) -> tor
                                                hc, h.shape[1] // hc, _stream(h)))
     return h
 
+
+def qsa_pool(pooled: torch.Tensor, idx_keys: torch.Tensor, positions: torch.Tensor, block_tables: torch.Tensor,
+             query_start_t: torch.Tensor, context_lens_t: torch.Tensor, tokens: int, k_norm: torch.Tensor,
+             inv_freq: torch.Tensor, section: tuple[int, int, int], rotary_dim: int, compress: int,
+             eps: float) -> None:
+    """The pooled keys of the blocks that the step's new tokens complete (seventy_qsa_pool)."""
+    bt = block_tables.contiguous()
+    check("qsa_pool", lib().seventy_qsa_pool(
+        pooled.data_ptr(), idx_keys.data_ptr(), positions.data_ptr(), bt.data_ptr(), bt.shape[1],
+        query_start_t.data_ptr(), context_lens_t.data_ptr(), context_lens_t.numel(), tokens, k_norm.data_ptr(),
+        inv_freq.data_ptr(), section[1], section[2], rotary_dim, compress, idx_keys.shape[1], eps,
+        _stream(idx_keys)))
+
+
+def qsa_select(q: torch.Tensor, pooled: torch.Tensor, block_tables: torch.Tensor, query_start_t: torch.Tensor,
+               context_lens_t: torch.Tensor, compress: int, top: int, max_blocks: int,
+               block_size: int, row0: int = 0) -> torch.Tensor:
+    """Positions int32 [rows, top * compress + compress - 1] (-1: none) that each query row attends to
+    (seventy_qsa_select), from the indexer queries q FP16 [rows, heads, dim] of the step's rows row0 ..
+    row0 + rows - 1."""
+    _expect(q, "q", torch.float16)
+    q = q.contiguous()
+    rows, heads, _ = q.shape
+    width = top * compress + compress - 1
+    sel = torch.empty(rows, width, dtype=torch.int32, device=q.device)
+    ld = max(1, max_blocks)
+    scores = torch.empty(rows, ld, dtype=torch.float32, device=q.device)
+    bt = block_tables.contiguous()
+    check("qsa_select", lib().seventy_qsa_select(
+        sel.data_ptr(), width, scores.data_ptr(), ld, q.data_ptr(), heads, pooled.data_ptr(), bt.data_ptr(),
+        bt.shape[1], query_start_t.data_ptr(), context_lens_t.data_ptr(), context_lens_t.numel(), row0, rows, compress,
+        top, block_size, _stream(q)))
+    return sel
+
+
+def qsa_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache, v_cache, k_scale, v_scale, sel: torch.Tensor,
+                  block_tables: torch.Tensor, query_start_t: torch.Tensor, scale: float,
+                  splits: int = 8, row0: int = 0) -> torch.Tensor:
+    """Attention of each query row of q FP16 [rows, hq, 256] over its selected positions sel, times sigmoid of the
+    gate in qkv: FP16 [rows, hq * 256] (seventy_qsa_attention, then seventy_attention_combine)."""
+    _expect(q, "q", torch.float16)
+    rows, hq, d = q.shape
+    hkv = k_cache.shape[2]
+    ws = torch.empty(rows * hq * splits * (d + 2), dtype=torch.float32, device=q.device)
+    po = ws[: rows * hq * splits * d]
+    pml = ws[rows * hq * splits * d :]
+    bt = block_tables.contiguous()
+    int8 = k_cache.dtype == torch.int8
+    check("qsa_attention", lib().seventy_qsa_attention(
+        po.data_ptr(), pml.data_ptr(), q.contiguous().data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
+        k_scale.data_ptr() if int8 else None, v_scale.data_ptr() if int8 else None, sel.data_ptr(), sel.shape[1],
+        bt.data_ptr(), bt.shape[1], query_start_t.data_ptr(), query_start_t.numel() - 1, row0, rows, k_cache.shape[1],
+        hq, hkv, splits, scale, _stream(q)))
+    out = torch.empty(rows, hq * d, dtype=torch.float16, device=q.device)
+    check("attention_combine", lib().seventy_attention_combine(out.data_ptr(), ws.data_ptr(), qkv.data_ptr(),
+                                                               qkv.stride(0), rows, hq, splits, _stream(q)))
+    return out
+
+
+def ple_ids(tokens: torch.Tensor, state: torch.Tensor, slots_t: torch.Tensor, query_start_t: torch.Tensor,
+            context_lens_t: torch.Tensor, n: int, heads_per: int, mult: torch.Tensor, sizes: torch.Tensor,
+            offsets: torch.Tensor, eos: int) -> torch.Tensor:
+    """Table rows int64 [tokens, (n - 1) * heads_per] of the step's tokens (seventy_ple_ids)."""
+    t = tokens.numel()
+    ids = torch.empty(t, (n - 1) * heads_per, dtype=torch.int64, device=tokens.device)
+    check("ple_ids", lib().seventy_ple_ids(ids.data_ptr(), tokens.contiguous().data_ptr(), state.data_ptr(),
+                                           slots_t.data_ptr(), query_start_t.data_ptr(), context_lens_t.data_ptr(),
+                                           context_lens_t.numel(), t, n, heads_per, mult.data_ptr(), sizes.data_ptr(),
+                                           offsets.data_ptr(), eos, _stream(tokens)))
+    return ids
+
+
+def ple_gather(ids: torch.Tensor, h0: int, h1: int, packed: torch.Tensor, scales: torch.Tensor, row_base: int,
+               dim: int, global_scale: float) -> torch.Tensor:
+    """FP16 [tokens, (h1 - h0) * dim] rows of heads h0 .. h1 - 1 from NVFP4 tables in pinned host memory."""
+    t = ids.shape[0]
+    out = torch.empty(t, (h1 - h0) * dim, dtype=torch.float16, device=ids.device)
+    check("ple_gather", lib().seventy_ple_gather(out.data_ptr(), ids.data_ptr(), ids.shape[1], h0, h1, t,
+                                                 packed.data_ptr(), scales.data_ptr(), row_base, dim, global_scale,
+                                                 _stream(ids)))
+    return out
+
+
+def ple_conv(x: torch.Tensor, xn: torch.Tensor, state: torch.Tensor, w: torch.Tensor, slots_t: torch.Tensor,
+             query_start_t: torch.Tensor, context_lens_t: torch.Tensor, taps: int, dil: int) -> torch.Tensor:
+    """x + silu(dilated causal convolution of xn) per sequence (seventy_ple_conv), FP32."""
+    out = torch.empty_like(x)
+    check("ple_conv", lib().seventy_ple_conv(out.data_ptr(), x.contiguous().data_ptr(), xn.contiguous().data_ptr(),
+                                             state.data_ptr(), w.data_ptr(), slots_t.data_ptr(),
+                                             query_start_t.data_ptr(), context_lens_t.data_ptr(),
+                                             context_lens_t.numel(), x.shape[0], x.shape[1], taps, dil, _stream(x)))
+    return out
+
+
+def ple_state(tok_state: torch.Tensor, conv_state: torch.Tensor, tokens: torch.Tensor, xn: torch.Tensor,
+              slots_t: torch.Tensor, query_start_t: torch.Tensor, context_lens_t: torch.Tensor, eos: int) -> None:
+    """The token and convolution states of the sequences after the step (seventy_ple_state)."""
+    n1 = tok_state.shape[1]
+    hist, channels = conv_state.shape[1], conv_state.shape[2]
+    check("ple_state", lib().seventy_ple_state(tok_state.data_ptr(), conv_state.data_ptr(),
+                                               tokens.contiguous().data_ptr(), xn.contiguous().data_ptr(),
+                                               slots_t.data_ptr(), query_start_t.data_ptr(), context_lens_t.data_ptr(),
+                                               context_lens_t.numel(), n1, channels, hist, eos, _stream(xn)))
+

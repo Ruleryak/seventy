@@ -36,6 +36,7 @@ from ..engine.step import StepInput
 from ..parallel import SINGLE, VOCAB_ALIGN, Parallel
 from ..upload import to_device
 from .layers import Linear, Source, _to_dtype
+from ..split import balanced
 from .moe import MoE
 from .qwen3_5 import FINAL, AttentionLayer, GatedDeltaNetLayer, Qwen35TextModel
 
@@ -182,7 +183,8 @@ class PLE:
     causal convolution (dilation ngram_size, with SiLU) of their norm, add to the streams. The state of a sequence
     is its last ngram_size - 1 tokens and the last (kernel - 1) x dilation convolution inputs."""
 
-    def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, device, dtype, eos: int):
+    def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, device, dtype, eos: int, par: Parallel = SINGLE,
+                 last: bool = True):
         e = cfg.exp
         self.hc, self.hidden, self.eps, self.eos = e.hc_count, cfg.hidden_size, cfg.rms_norm_eps, eos
         self.n = e.ngram_size
@@ -192,6 +194,7 @@ class PLE:
         self.vocab_sizes = ckpt.tensor(f"{pe}.ngram_heads_vocab_sizes").long()
         self.offsets = ckpt.tensor(f"{pe}.ngram_heads_offsets").long()
         self.table = NGramTable(ckpt, f"{pe}.ngram_embedding")
+        self._global_scale = 1.0 / self.table.global_scale if self.table.nvfp4 else 1.0
         self.key_proj = Linear(ckpt, [Source(f"{p}.key_proj")], torch.float32, device, keep_dense=True)
         self.value_proj = Linear(ckpt, [Source(f"{p}.value_proj")], torch.float32, device, keep_dense=True)
         self.norm_key = _grouped_norm_weight(ckpt, f"{p}.norm_key.weight", device)
@@ -201,6 +204,68 @@ class PLE:
         self.taps = self.conv.shape[1]
         self.dilation = self.n
         self.history = (self.taps - 1) * self.dilation
+        self.par, self.last = par, last
+        self.gpu = None
+        if torch.device(device).type == "cuda" and self.table.nvfp4:
+            self._to_gpu(ckpt, p, device, dtype)
+
+    def _to_gpu(self, ckpt: Checkpoint, p: str, device, dtype) -> None:
+        """The GPU path: this rank's heads (split.balanced) of the table in pinned host memory, which the gather
+        kernel reads directly. The ranks sum their heads' columns of the embedding (an all-gather through the
+        all-reduce) and each computes the key and value projections in full."""
+        heads = self.vocab_sizes.numel()
+        h0, h1 = balanced(heads, self.par.size, self.par.rank)
+        dim = self.table.dim // 1
+        head_dim = self.key_proj.dense.shape[1] // heads
+        r0 = int(self.offsets[h0])
+        r1 = int(self.offsets[h1 - 1] + self.vocab_sizes[h1 - 1])
+        packed = torch.empty(r1 - r0, dim // 2, dtype=torch.uint8, pin_memory=True)
+        scales = torch.empty(r1 - r0, dim // 16, dtype=torch.uint8, pin_memory=True)
+        t = self.table
+        for s, (values, sc) in enumerate(t.shards):
+            a, b = max(r0, t.starts[s]), min(r1, t.starts[s + 1])
+            if a >= b:
+                continue
+            packed[a - r0 : b - r0] = torch.from_numpy(np.ascontiguousarray(values[a - t.starts[s] : b - t.starts[s]]))
+            scales[a - r0 : b - r0] = torch.from_numpy(np.ascontiguousarray(sc[a - t.starts[s] : b - t.starts[s]]))
+        key = Linear(ckpt, [Source(f"{p}.key_proj")], torch.float16, device)
+        value = Linear(ckpt, [Source(f"{p}.value_proj")], torch.float16, device)
+        self.gpu = dict(h0=h0, h1=h1, row_base=r0, packed=packed, scales=scales, key=key, value=value,
+                        mult=self.multipliers.to(device), sizes=self.vocab_sizes.to(device),
+                        offsets=self.offsets.to(device), head_dim=head_dim)
+        self.key_proj = self.value_proj = None
+        self.table = None
+        torch.cuda.empty_cache()
+
+    def _gpu_call(self, h: torch.Tensor, step: StepInput, cache: ModelCache, index: int) -> torch.Tensor:
+        from ..ops import kernels
+
+        g = self.gpu
+        ids = kernels.ple_ids(step.token_ids, cache.ple_tokens, step.state_slots_t, step.query_start_t,
+                              step.context_lens_t, self.n, self.heads_per_ngram, g["mult"], g["sizes"], g["offsets"],
+                              self.eos)
+        part = kernels.ple_gather(ids, g["h0"], g["h1"], g["packed"], g["scales"], g["row_base"], g["head_dim"],
+                                  self._global_scale)
+        if self.par.size > 1:
+            emb = torch.zeros(part.shape[0], ids.shape[1] * g["head_dim"], dtype=part.dtype, device=part.device)
+            emb[:, g["h0"] * g["head_dim"] : g["h1"] * g["head_dim"]] = part
+            emb = self.par.all_reduce(emb)
+        else:
+            emb = part
+        key = grouped_rms_norm(g["key"](emb).float(), self.norm_key, self.hidden, self.eps)
+        value = g["value"](emb).float()
+        query = grouped_rms_norm(h, self.norm_query, self.hidden, self.eps)
+        gate = (key.view(-1, self.hc, self.hidden) * query.view(-1, self.hc, self.hidden)).sum(-1, keepdim=True)
+        gate = gate / math.sqrt(self.hidden)
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        gated = (torch.sigmoid(gate) * value[:, None, :]).reshape(h.shape[0], -1).contiguous()
+        normed = grouped_rms_norm(gated, self.norm_conv, self.hidden, self.eps).contiguous()
+        out = kernels.ple_conv(gated, normed, cache.ple_conv[index], self.conv, step.state_slots_t,
+                               step.query_start_t, step.context_lens_t, self.taps, self.dilation)
+        tok = cache.ple_tokens if self.last else cache.ple_tokens.clone()
+        kernels.ple_state(tok, cache.ple_conv[index], step.token_ids, normed, step.state_slots_t,
+                          step.query_start_t, step.context_lens_t, self.eos)
+        return out
 
     def ngram_ids(self, tokens: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
         """Table rows [T, heads] of one sequence's new tokens [T] after its previous n - 1 tokens [n - 1]."""
@@ -228,6 +293,8 @@ class PLE:
 
     def __call__(self, h: torch.Tensor, step: StepInput, cache: ModelCache, index: int) -> torch.Tensor:
         """What this layer adds to the streams h [T, hc x hidden] FP32; updates the sequences' PLE state."""
+        if self.gpu is not None:
+            return self._gpu_call(h, step, cache, index)
         out = torch.empty_like(h)
         tokens = step.token_ids
         for b in range(len(step.context_lens)):
@@ -333,6 +400,37 @@ class ExpAttention:
         self.indexer = Indexer(cfg, ckpt, f"{p}.indexer", device)
         self.cfg = cfg
 
+    def _kernels(self, x, step: StepInput, cache: ModelCache, layer: int, cos, sin) -> torch.Tensor:
+        """The GPU path: attn_prep (queries, keys and values into the cache), the indexer keys into the cache,
+        then csrc/qsa.cu (pooled block keys, selected positions in chunks of SELECT_ROWS rows, sparse attention
+        with the output gate)."""
+        from ..ops import kernels
+
+        a, e = self.attn, self.cfg.exp
+        t = x.shape[0]
+        qkv = a.qkv(x)
+        ks, vs = cache.k_scale.get(layer), cache.v_scale.get(layer)
+        q = kernels.attn_prep(qkv, a.q_norm, a.k_norm, step.positions, a.inv_freq, a.section, step.kv_slots_t,
+                              cache.k[layer], cache.v[layer], a.heads, a.kv_heads, a.eps, ks, vs)
+        iq, ik = self.indexer.queries_and_keys(x, cos, sin)
+        idx = cache.idx_k[layer]
+        idx.view(-1, idx.shape[-1])[step.kv_slots_t.long()] = ik.to(idx.dtype)
+        kernels.qsa_pool(cache.pooled[layer], idx, cache.positions, step.block_tables, step.query_start_t,
+                         step.context_lens_t, t, self.indexer.k_norm, a.inv_freq, a.section, self.cfg.rotary_dim,
+                         e.indexer_compress, self.indexer.eps)
+        top = e.indexer_budget // e.indexer_compress
+        ld = cache.num_blocks * cache.block_size // e.indexer_compress
+        iq16 = iq.to(torch.float16)
+        parts = []
+        for r0 in range(0, t, SELECT_ROWS):
+            r1 = min(t, r0 + SELECT_ROWS)
+            sel = kernels.qsa_select(iq16[r0:r1], cache.pooled[layer], step.block_tables, step.query_start_t,
+                                     step.context_lens_t, e.indexer_compress, top, ld, cache.block_size, row0=r0)
+            parts.append(kernels.qsa_attention(q[r0:r1], qkv[r0:r1], cache.k[layer], cache.v[layer], ks, vs, sel,
+                                               step.block_tables, step.query_start_t, a.scale, row0=r0))
+        o = parts[0] if len(parts) == 1 else torch.cat(parts)
+        return a.o_proj(a._owned(o))
+
     def dense(self, step: StepInput) -> bool:
         """Whether every query of the step attends to all its visible tokens (each sequence has no more than
         indexer_budget tokens in whole blocks), so that QSA is plain causal attention."""
@@ -345,10 +443,10 @@ class ExpAttention:
         a = self.attn
         t, d = x.shape[0], a.head_dim
         cos, sin = rope
+        if x.is_cuda and d == 256:
+            return self._kernels(x, step, cache, layer, cos, sin)
         iq, ik = self.indexer.queries_and_keys(x, cos, sin)
         cache.idx_k[layer].view(-1, cache.idx_k[layer].shape[-1])[slots] = ik.to(cache.idx_k[layer].dtype)
-        if x.is_cuda and d == 256 and self.dense(step):
-            return a(x, step, cache, layer, None, None)
         qkv = a.qkv(x)
         qg = qkv[:, : 2 * d * a.heads].view(t, a.heads, 2, d)
         q = qg[:, :, 0].contiguous()
@@ -392,6 +490,7 @@ class ExpAttention:
 
 
 QUERY_CHUNK = 64
+SELECT_ROWS = 256
 
 
 def _read_cache(c: torch.Tensor, scale: torch.Tensor | None, flat: torch.Tensor) -> torch.Tensor:
@@ -413,7 +512,8 @@ class ExpLayer:
         self.mlp = MoE(cfg, ckpt, f"{p}.mlp", par, dtype, device, keep_dense)
         self.attn_hc = HyperConnection(cfg, ckpt, f"{p}.attn_hyper_connection", dtype, device)
         self.mlp_hc = HyperConnection(cfg, ckpt, f"{p}.mlp_hyper_connection", dtype, device)
-        self.ple = PLE(cfg, ckpt, f"{p}.ple", device, dtype, eos) if index in cfg.exp.ple_layers else None
+        self.ple = (PLE(cfg, ckpt, f"{p}.ple", device, dtype, eos, par, last=index == cfg.exp.ple_layers[-1])
+                    if index in cfg.exp.ple_layers else None)
 
 
 class Qwen4ExpTextModel(Qwen35TextModel):
@@ -432,6 +532,11 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         half = t.rotary_dim // 2
         self.inv_freq = (1.0 / (t.rope_theta ** (torch.arange(0, half, dtype=torch.float64) * 2 / t.rotary_dim))
                          ).float().to(device)
+        idx = torch.arange(half)
+        axis = torch.zeros(half, dtype=torch.long)
+        axis[(idx % 3 == 1) & (idx < 3 * t.mrope_section[1])] = 1
+        axis[(idx % 3 == 2) & (idx < 3 * t.mrope_section[2])] = 2
+        self.rope_axis = axis.to(device)
         for layer in self.layers:
             if layer.kind == "full_attention":
                 layer.mixer.attn.inv_freq = self.inv_freq
@@ -481,9 +586,17 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         for start, rows in step.embeds.items():
             x0[start : start + rows.shape[0]] = rows.float()
         h = x0.repeat(1, e.hc_count)
-        rope = ops.rotary_cos_sin(step.positions, self.inv_freq, t.mrope_section)
-        slots = ops.kv_slots(step.query_start, step.context_lens, step.block_tables, step.block_size)
-        cache.positions.view(-1, 3)[slots] = step.positions.T.to(cache.positions.dtype).to(cache.positions.device)
+        if h.is_cuda:
+            pos = step.positions.to(torch.float32)[self.rope_axis].T
+            angles = pos * self.inv_freq
+            rope = (torch.cos(angles), torch.sin(angles))
+        else:
+            rope = ops.rotary_cos_sin(step.positions, self.inv_freq, t.mrope_section)
+        if h.is_cuda:
+            slots = step.kv_slots_t.long()
+        else:
+            slots = ops.kv_slots(step.query_start, step.context_lens, step.block_tables, step.block_size)
+        cache.positions.view(-1, 3)[slots] = step.positions.T.to(cache.positions.dtype)
         captured = {}
         for i, layer in enumerate(self.layers):
             if layer.ple is not None:

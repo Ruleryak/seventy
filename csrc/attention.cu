@@ -342,3 +342,16 @@ SEVENTY_API int seventy_decode_attention(void *out, const void *q, const void *k
                                                                    static_cast<const half *>(qkv), ld, hq, splits);
   return launch_status();
 }
+
+SEVENTY_API int seventy_attention_combine(void *out, const float *workspace, const void *qkv, int ld, int tokens,
+                                          int hq, int splits, cudaStream_t stream) {
+  using namespace seventy;
+  if (out == nullptr || workspace == nullptr || qkv == nullptr || tokens < 0 || hq < 1 || splits < 1)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (tokens == 0) return SEVENTY_OK;
+  const float *po = workspace;
+  const float *pml = po + static_cast<int64_t>(tokens) * hq * splits * kHead;
+  attention_combine_kernel<<<dim3(tokens, hq), kHead, 0, stream>>>(static_cast<half *>(out), po, pml,
+                                                                   static_cast<const half *>(qkv), ld, hq, splits);
+  return launch_status();
+}

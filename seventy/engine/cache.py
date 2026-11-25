@@ -69,19 +69,23 @@ class ModelCache:
         self.conv = {layer: self.conv_all[i] for i, layer in enumerate(cfg.linear_layers)}
         self.state = {layer: self.state_all[i] for i, layer in enumerate(cfg.linear_layers)}
         self.slot_peers: list = []
-        self.idx_all = self.positions = self.ple_tokens = self.ple_conv = None
+        self.idx_all = self.pooled_all = self.positions = self.ple_tokens = self.ple_conv = None
         self.idx_k: dict[int, torch.Tensor] = {}
+        self.pooled: dict[int, torch.Tensor] = {}
         e = cfg.exp
         if e is not None:
             na_model = len(cfg.attention_layers)
             self.idx_all = torch.zeros(na_model, num_blocks + 1, block_size, e.indexer_head_dim,
                                        dtype=torch.float16 if device.type == "cuda" else dtype, device=device)
             self.idx_k = {layer: self.idx_all[i] for i, layer in enumerate(cfg.attention_layers)}
+            self.pooled_all = torch.zeros(na_model, num_blocks + 1, block_size // e.indexer_compress,
+                                          e.indexer_head_dim, dtype=self.idx_all.dtype, device=device)
+            self.pooled = {layer: self.pooled_all[i] for i, layer in enumerate(cfg.attention_layers)}
             self.positions = torch.zeros(num_blocks + 1, block_size, 3, dtype=torch.int32, device=device)
             self.ple_tokens = torch.zeros(num_slots + 1, e.ngram_size - 1, dtype=torch.long, device=device)
             history = (e.ple_conv_kernel - 1) * e.ngram_size
             self.ple_conv = torch.zeros(len(e.ple_layers), num_slots + 1, history, e.hc_count * cfg.hidden_size,
-                                        dtype=dtype, device=device)
+                                        dtype=torch.float32, device=device)
 
     def copy_slot(self, src: int, dst: int) -> None:
         """Copy the Gated DeltaNet state and convolution history of every layer from one slot to another."""
@@ -102,6 +106,7 @@ class ModelCache:
             self.v_scale_all[:, dst].copy_(self.v_scale_all[:, src])
         if self.idx_all is not None:
             self.idx_all[:, dst].copy_(self.idx_all[:, src])
+            self.pooled_all[:, dst].copy_(self.pooled_all[:, src])
             self.positions[dst].copy_(self.positions[src])
 
     def apply(self, copies: list[tuple[str, int, int]]) -> None:
@@ -115,5 +120,6 @@ class ModelCache:
         tensors = [self.k_all, self.v_all, self.conv_all, self.state_all]
         if self.k_scale_all is not None:
             tensors += [self.k_scale_all, self.v_scale_all]
-        tensors += [t for t in (self.idx_all, self.positions, self.ple_tokens, self.ple_conv) if t is not None]
+        tensors += [t for t in (self.idx_all, self.pooled_all, self.positions, self.ple_tokens, self.ple_conv)
+                    if t is not None]
         return sum(t.numel() * t.element_size() for t in tensors)
