@@ -57,9 +57,11 @@ class HeadSplit:
 
 def head_split(heads: int, kv: int, rank: int, size: int) -> HeadSplit:
     """The rank's HeadSplit of heads query heads in groups over kv KV heads. Two layouts are compared over all
-    ranks: query heads split as evenly as possible (each rank keeps the KV heads its query heads use), and KV heads
-    split as evenly as possible (each rank owns their whole groups). The layout with fewer KV heads on the fullest
-    rank wins, then the one with fewer owned query heads; with even splits both are the usual even split."""
+    ranks: query heads split as evenly as possible (each rank keeps the KV heads its query heads use), and a split by
+    KV head: with at least as many KV heads as ranks, the KV heads split as evenly as possible (each rank owns their
+    whole groups); with fewer, each KV head goes to a set of ranks (split.balanced of the ranks), which share its
+    query heads. The layout with fewer KV heads on the fullest rank wins, then the one with fewer owned query heads;
+    with even splits both are the usual even split."""
     group = heads // kv
 
     def by_heads(r: int) -> HeadSplit:
@@ -71,11 +73,17 @@ def head_split(heads: int, kv: int, rank: int, size: int) -> HeadSplit:
         k0, k1 = balanced(kv, size, r)
         return HeadSplit((k0, k1), (k0 * group, k1 * group), (k0 * group, k1 * group))
 
+    def by_shared(r: int) -> HeadSplit:
+        h = next(h for h in range(kv) if balanced(size, kv, h)[0] <= r < balanced(size, kv, h)[1])
+        a, b = balanced(size, kv, h)
+        o0, o1 = balanced(group, b - a, r - a)
+        return HeadSplit((h, h + 1), (h * group, (h + 1) * group), (h * group + o0, h * group + o1))
+
     def cost(layout) -> tuple[int, int, int]:
         parts = [layout(r) for r in range(size)]
         return (max(p.num_kv for p in parts), max(p.num_own for p in parts), max(p.num_heads for p in parts))
 
-    layouts = [by_heads] + ([by_kv] if kv >= size else [])
+    layouts = [by_heads] + ([by_kv] if kv >= size else [by_shared])
     return min(layouts, key=cost)(rank)
 
 

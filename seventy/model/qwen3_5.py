@@ -138,6 +138,7 @@ class GatedDeltaNetLayer:
         self.norm = _norm_weight(ckpt, f"{p}.norm.weight", device, 0.0)
         self.eps = cfg.rms_norm_eps
         self.par = par
+        self.sigmoid_gate = cfg.exp is not None
 
     def __call__(self, x, step: StepInput, cache: ModelCache, layer: int, rope, slots, stash=None):
         t = x.shape[0]
@@ -147,7 +148,8 @@ class GatedDeltaNetLayer:
         if y.is_cuda and step.max_query_len <= RECURRENT_MAX_TOKENS:
             o = kernels.gdn_recurrent(y, self.conv_weight, cache.conv[layer], cache.state[layer], self.a_log,
                                       self.dt_bias, self.norm, step.query_start_t, step.context_lens_t,
-                                      step.state_slots_t, self.hk, self.hv, self.eps, commit=stash is None)
+                                      step.state_slots_t, self.hk, self.hv, self.eps, commit=stash is None,
+                                      sigmoid_gate=self.sigmoid_gate)
             if stash is not None:
                 stash[layer] = y
             return self.out_proj(self._owned(o))
@@ -176,10 +178,11 @@ class GatedDeltaNetLayer:
             o = ops.gated_delta_rule(q, k, v, g, beta, cache.state[layer], step.query_start, step.context_lens,
                                      step.state_slots)
         if fast:
-            o = kernels.gated_rms_norm(o.view(t, self.hv, self.dv), y, conv_dim, self.norm, self.eps)
+            o = kernels.gated_rms_norm(o.view(t, self.hv, self.dv), y, conv_dim, self.norm, self.eps,
+                                       self.sigmoid_gate)
         else:
             o = ops.gated_rms_norm(o.reshape(t * self.hv, self.dv), z.reshape(t * self.hv, self.dv), self.norm,
-                                   self.eps)
+                                   self.eps, self.sigmoid_gate)
         return self.out_proj(self._owned(o.view(t, val)))
 
     def _owned(self, o: torch.Tensor) -> torch.Tensor:
@@ -212,7 +215,12 @@ class Layer:
             self.mixer = AttentionLayer(cfg, ckpt, f"{p}.self_attn", par, dtype, device, keep_dense)
         else:
             self.mixer = GatedDeltaNetLayer(cfg, ckpt, f"{p}.linear_attn", par, dtype, device, keep_dense)
-        self.mlp = MLP(cfg, ckpt, f"{p}.mlp", par, dtype, device, keep_dense)
+        if cfg.is_moe:
+            from .moe import MoE
+
+            self.mlp = MoE(cfg, ckpt, f"{p}.mlp", par, dtype, device, keep_dense)
+        else:
+            self.mlp = MLP(cfg, ckpt, f"{p}.mlp", par, dtype, device, keep_dense)
         self.input_norm = _norm_weight(ckpt, f"{p}.input_layernorm.weight", device, 1.0)
         self.post_norm = _norm_weight(ckpt, f"{p}.post_attention_layernorm.weight", device, 1.0)
 
@@ -256,9 +264,14 @@ class Qwen35TextModel:
             self.gdn_params = tuple(stacked)
         self.final_norm = _norm_weight(ckpt, f"{p}norm.weight", device, 1.0)
         head = "lm_head.weight" if not t.tie_word_embeddings else f"{p}embed_tokens.weight"
-        self.lm_head = to_device(_to_dtype(ckpt.rows(head, v0, v1), dtype), device)
         self.lm_head_packed = None
-        if self.device.type == "cuda" and dtype == torch.float16:
+        if not t.tie_word_embeddings and ckpt.is_nvfp4("lm_head"):
+            nv = Linear(ckpt, [Source("lm_head", ((v0, v1),))], dtype, device, keep_dense=self.device.type != "cuda")
+            self.lm_head = nv.dense
+            self.lm_head_packed = nv.gemm
+        else:
+            self.lm_head = to_device(_to_dtype(ckpt.linear_part(head[: -len(".weight")], rows=(v0, v1)), dtype), device)
+        if self.lm_head is not None and self.device.type == "cuda" and dtype == torch.float16:
             from ..ops.kernels import DenseWeight
 
             self.lm_head_packed = DenseWeight(self.lm_head)

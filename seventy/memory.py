@@ -83,7 +83,11 @@ def split_problems(cfg: ModelConfig, tp: int, drafter: DrafterShape | None = Non
     if drafter is not None and drafter.heads:
         heads.append(("drafter attention heads", drafter.heads))
     problems += [f"{total} {what} do not split over {tp} GPUs" for what, total in heads if total < tp]
+    if t.is_moe:
+        heads.append(("experts", t.num_experts))
     sizes = [("MLP columns", t.intermediate_size, MLP_ALIGN), ("vocabulary rows", t.vocab_size, VOCAB_ALIGN)]
+    if t.is_moe:
+        sizes.append(("shared expert columns", t.shared_expert_intermediate_size, MLP_ALIGN))
     if drafter is not None and drafter.intermediate:
         sizes.append(("drafter MLP columns", drafter.intermediate, MLP_ALIGN))
     for what, total, align in sizes:

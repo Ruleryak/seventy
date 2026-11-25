@@ -7,7 +7,8 @@ from seventy.ops import reference as R
 pytestmark = pytest.mark.gpu
 
 
-def reference_layer(y, conv_w, conv_state, state, a_log, dt_bias, norm_w, starts, ctx, slots, hk, hv, eps):
+def reference_layer(y, conv_w, conv_state, state, a_log, dt_bias, norm_w, starts, ctx, slots, hk, hv, eps,
+                    sigmoid_gate=False):
     """The same computation with the reference operations, as the model's GatedDeltaNetLayer does it."""
     d = 128
     key, val = hk * d, hv * d
@@ -22,13 +23,14 @@ def reference_layer(y, conv_w, conv_state, state, a_log, dt_bias, norm_w, starts
     v = qkv[:, 2 * key :].view(t, hv, d)
     g, beta = R.gdn_gates(a, b, a_log, dt_bias)
     o = R.gated_delta_rule(q, k, v, g, beta, state, starts, ctx, slots)
-    return R.gated_rms_norm(o.reshape(t * hv, d), z.reshape(t * hv, d), norm_w, eps).view(t, val)
+    return R.gated_rms_norm(o.reshape(t * hv, d), z.reshape(t * hv, d), norm_w, eps, sigmoid_gate).view(t, val)
 
 
 @pytest.mark.parametrize("lengths, ctx, taps", [([1, 1, 1], [5, 0, 9], 4), ([9, 1, 4], [3, 7, 0], 4), ([16], [2], 4),
                                                ([20, 3], [2, 0], 4), ([32], [5], 4), ([9, 2], [4, 0], 3),
                                                ([5, 1], [1, 6], 2)])
-def test_gdn_recurrent_matches_reference(lengths, ctx, taps):
+@pytest.mark.parametrize("sigmoid_gate", [False, True])
+def test_gdn_recurrent_matches_reference(lengths, ctx, taps, sigmoid_gate):
     torch.manual_seed(sum(lengths) + sum(ctx))
     hk, hv, d, eps = 2, 6, 128, 1e-6
     conv_dim = 2 * hk * d + hv * d
@@ -46,12 +48,14 @@ def test_gdn_recurrent_matches_reference(lengths, ctx, taps):
     conv_state = (torch.randn(4, conv_dim, taps - 1) * 0.5).half()
     state = torch.randn(4, hv, d, d) * 0.05
     ref_conv, ref_state = conv_state.clone(), state.clone()
-    ref = reference_layer(y, conv_w, ref_conv, ref_state, a_log, dt_bias, norm_w, starts, ctx, slots, hk, hv, eps)
+    ref = reference_layer(y, conv_w, ref_conv, ref_state, a_log, dt_bias, norm_w, starts, ctx, slots, hk, hv, eps,
+                          sigmoid_gate)
     dev = "cuda"
     k_conv, k_state = conv_state.to(dev), state.to(dev)
     i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=dev)
     out = kernels.gdn_recurrent(y.to(dev), conv_w.to(dev), k_conv, k_state, a_log.to(dev), dt_bias.to(dev),
-                                norm_w.to(dev), i32(starts), i32(ctx), i32(slots), hk, hv, eps)
+                                norm_w.to(dev), i32(starts), i32(ctx), i32(slots), hk, hv, eps,
+                                sigmoid_gate=sigmoid_gate)
     err = (out.cpu().float() - ref.float()).abs()
     print(f"\nmax |out diff| {err.max().item():.2e}, mean {err.mean().item():.2e}, max |ref| {ref.float().abs().max().item():.2f}")
     torch.testing.assert_close(out.cpu().float(), ref.float(), rtol=2e-2, atol=2e-2)

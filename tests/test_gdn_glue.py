@@ -54,3 +54,6 @@ def test_conv_gates_and_norm_match_reference(taps):
     want_o = R.gated_rms_norm(x.reshape(t * hv, d), y[:, channels : channels + val].reshape(t * hv, d), nw, 1e-6)
     got_o = kernels.gated_rms_norm(x, y, channels, nw, 1e-6)
     torch.testing.assert_close(got_o.view(t * hv, d).float(), want_o.float(), rtol=0, atol=4e-3)
+    want_s = R.gated_rms_norm(x.reshape(t * hv, d), y[:, channels : channels + val].reshape(t * hv, d), nw, 1e-6, True)
+    got_s = kernels.gated_rms_norm(x, y, channels, nw, 1e-6, sigmoid_gate=True)
+    torch.testing.assert_close(got_s.view(t * hv, d).float(), want_s.float(), rtol=0, atol=4e-3)

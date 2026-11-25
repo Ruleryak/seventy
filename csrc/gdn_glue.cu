@@ -14,7 +14,7 @@
  * gdn_gates_kernel: g = -exp(a_log) * softplus(a + dt_bias) (softplus(x) = x above 20, as in PyTorch) and
  * beta = sigmoid(b), FP32 [T, hv], from the a and b columns of the input projection.
  *
- * gated_rms_norm_kernel: out = rms_norm(x) * weight * silu(z) per head row of 128 values, one warp per row; z is read
+ * gated_rms_norm_kernel: out = rms_norm(x) * weight * silu(z) (sigmoid(z) with sigmoid_gate) per head row of 128 values, one warp per row; z is read
  * in place from the input projection (row t, columns z_off + h * 128 ...).
  */
 
@@ -119,7 +119,7 @@ __global__ void gdn_gates_kernel(float *g, float *beta, const half *y, int ld, i
 
 __global__ void __launch_bounds__(256) gated_rms_norm_kernel(half *out, const half *x, const half *z, int z_ld,
                                                              int z_off, const float *weight, int rows, int hv,
-                                                             float eps) {
+                                                             float eps, int sigmoid_gate) {
   const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
   const int lane = threadIdx.x & 31;
   if (row >= rows) return;
@@ -139,7 +139,11 @@ __global__ void __launch_bounds__(256) gated_rms_norm_kernel(half *out, const ha
   uint2 ov;
   half *oh = reinterpret_cast<half *>(&ov);
 #pragma unroll
-  for (int i = 0; i < 4; ++i) oh[i] = __float2half_rn(f[i] * inv * weight[lane * 4 + i] * silu(__half2float(zh[i])));
+  for (int i = 0; i < 4; ++i) {
+    const float zf = __half2float(zh[i]);
+    const float gate = sigmoid_gate ? 1.0f / (1.0f + expf(-zf)) : silu(zf);
+    oh[i] = __float2half_rn(f[i] * inv * weight[lane * 4 + i] * gate);
+  }
   *reinterpret_cast<uint2 *>(out + static_cast<int64_t>(row) * 128 + lane * 4) = ov;
 }
 
@@ -195,7 +199,7 @@ SEVENTY_API int seventy_gdn_gates(float *g, float *beta, const void *y, int ld, 
 }
 
 SEVENTY_API int seventy_gated_rms_norm(void *out, const void *x, const void *z, int z_ld, int z_off,
-                                       const float *weight, int tokens, int hv, int dv, float eps,
+                                       const float *weight, int tokens, int hv, int dv, float eps, int sigmoid_gate,
                                        cudaStream_t stream) {
   using namespace seventy;
   if (out == nullptr || x == nullptr || z == nullptr || weight == nullptr || tokens < 0 || hv <= 0 || dv != 128 ||
@@ -206,6 +210,6 @@ SEVENTY_API int seventy_gated_rms_norm(void *out, const void *x, const void *z, 
   if (rows == 0) return SEVENTY_OK;
   gated_rms_norm_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(static_cast<half *>(out), static_cast<const half *>(x),
                                                             static_cast<const half *>(z), z_ld, z_off, weight, rows,
-                                                            hv, eps);
+                                                            hv, eps, sigmoid_gate);
   return launch_status();
 }

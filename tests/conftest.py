@@ -47,6 +47,28 @@ def _find_model() -> Path | None:
         return None
 
 
+MOE_REPO = "nvidia/Qwen3.6-35B-A3B-NVFP4"
+
+
+@pytest.fixture(scope="session")
+def moe_model_path() -> Path:
+    """A Qwen3.5-MoE checkpoint: SEVENTY_TEST_MOE_MODEL, else MOE_REPO in the Hugging Face cache."""
+    override = os.environ.get("SEVENTY_TEST_MOE_MODEL")
+    path = None
+    if override:
+        path = Path(override)
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+
+            path = Path(snapshot_download(MOE_REPO, local_files_only=True))
+        except Exception:
+            path = None
+    if path is None or not (path / "config.json").is_file():
+        pytest.skip(f"MoE checkpoint not found (set SEVENTY_TEST_MOE_MODEL or download {MOE_REPO})")
+    return path
+
+
 @pytest.fixture(scope="session")
 def model_path() -> Path:
     path = _find_model()

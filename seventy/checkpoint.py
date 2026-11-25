@@ -11,6 +11,27 @@ from safetensors import safe_open
 from .nvfp4 import Nvfp4Weight
 
 
+def csf_decode(fixed: torch.Tensor, exceptions: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """NVFP4 block scales [rows, cols] (FP8 E4M3 bytes as uint8) from their CSF code, as in the ModelOpt checkpoints
+    of nvidia (weight_scale.nvfp4_csf_fixed and weight_scale.nvfp4_csf_exceptions). The rows go in blocks of
+    rows / fixed.shape[0]. Each row of fixed holds the base byte of each row of its block, then one 4-bit offset per
+    scale (the first scale in the low nibble): scale = base + offset. Each exception is (scale << 24) | index into
+    the flat scales, for scales that the base and offset do not reach. Lossless; checked byte for byte against the
+    plain scales of the same tensors."""
+    blocks = fixed.shape[0]
+    per = rows // blocks
+    if per * blocks != rows or fixed.shape[1] != per + per * cols // 2:
+        raise ValueError(f"CSF code {tuple(fixed.shape)} does not match scales [{rows}, {cols}]")
+    fixed = fixed.view(torch.uint8)
+    base = fixed[:, :per].to(torch.int32)
+    body = fixed[:, per:]
+    offsets = torch.stack(((body & 15), (body >> 4)), dim=-1).reshape(blocks, per, cols).to(torch.int32)
+    out = (base[:, :, None] + offsets).reshape(-1)
+    exc = exceptions.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    out[exc & 0xFFFFFF] = (exc >> 24).to(torch.int32)
+    return out.to(torch.uint8).view(rows, cols)
+
+
 class Checkpoint:
     """Lazy access to the tensors of a checkpoint folder. Only the requested tensors or slices are read."""
 
@@ -67,33 +88,86 @@ class Checkpoint:
         """Columns [start, stop) of a tensor of two or more dimensions (dimension 1)."""
         return self._handle(name).get_slice(name)[:, start:stop]
 
+    def kind(self, module: str) -> str:
+        """The weight format of a linear module: "nvfp4" (compressed-tensors: weight_packed, weight_scale and
+        weight_global_scale), "modelopt-nvfp4" (weight as packed uint8, weight_scale, weight_scale_2; the block
+        scales may be CSF-coded), "fp8" (FP8 E4M3 weight with one FP32 scale per tensor or per row), "mxfp8" (FP8
+        E4M3 weight with one power-of-two scale per 32 columns) or "dense"."""
+        if f"{module}.weight_packed" in self._files:
+            return "nvfp4"
+        if f"{module}.weight_scale_2" in self._files:
+            return "modelopt-nvfp4"
+        if f"{module}.weight_scale" in self._files:
+            weight = self._slice(f"{module}.weight").get_dtype()
+            scale = self._slice(f"{module}.weight_scale").get_dtype()
+            if weight == "F8_E4M3":
+                return "mxfp8" if scale == "U8" else "fp8"
+        return "dense"
+
     def is_nvfp4(self, module: str) -> bool:
-        return f"{module}.weight_packed" in self._files
+        return self.kind(module) in ("nvfp4", "modelopt-nvfp4")
+
+    def out_rows(self, module: str) -> int:
+        """Rows (output features) of a linear module's weight, in any format."""
+        name = f"{module}.weight_packed" if f"{module}.weight_packed" in self._files else f"{module}.weight"
+        return self.shape(name)[0]
+
+    def _slice(self, name: str):
+        return self._handle(name).get_slice(name)
 
     def nvfp4(self, module: str) -> Nvfp4Weight:
         """The NVFP4 weight of a linear module, for example "model.language_model.layers.0.mlp.up_proj"."""
-        return Nvfp4Weight(
-            packed=self.tensor(f"{module}.weight_packed"),
-            scales=self.tensor(f"{module}.weight_scale").view(torch.uint8),
-            global_scale=float(self.tensor(f"{module}.weight_global_scale").reshape(-1)[0]),
-        )
+        return self.nvfp4_part(module)
 
     def nvfp4_part(
         self, module: str, rows: tuple[int, int] | None = None, cols: tuple[int, int] | None = None
     ) -> Nvfp4Weight:
-        """Rows and columns [start, stop) of an NVFP4 weight, read without loading the rest of it."""
-        n, half_k = self.shape(f"{module}.weight_packed")
+        """Rows and columns [start, stop) of an NVFP4 weight, read without loading the rest of it (CSF-coded block
+        scales are decoded whole first). ModelOpt's weight_scale_2 multiplies where compressed-tensors'
+        weight_global_scale divides, so the global scale of a ModelOpt weight is 1 / weight_scale_2."""
+        modelopt = self.kind(module) == "modelopt-nvfp4"
+        packed_name = f"{module}.weight" if modelopt else f"{module}.weight_packed"
+        n, half_k = self.shape(packed_name)
         r0, r1 = rows if rows is not None else (0, n)
         c0, c1 = cols if cols is not None else (0, 2 * half_k)
         if c0 % 16 or c1 % 16:
             raise ValueError(f"column slice [{c0}, {c1}) of {module} is not aligned to groups of 16")
-        packed = self._handle(f"{module}.weight_packed").get_slice(f"{module}.weight_packed")[r0:r1, c0 // 2 : c1 // 2]
-        scales = self._handle(f"{module}.weight_scale").get_slice(f"{module}.weight_scale")[r0:r1, c0 // 16 : c1 // 16]
-        return Nvfp4Weight(
-            packed=packed.contiguous(),
-            scales=scales.contiguous().view(torch.uint8),
-            global_scale=float(self.tensor(f"{module}.weight_global_scale").reshape(-1)[0]),
-        )
+        packed = self._slice(packed_name)[r0:r1, c0 // 2 : c1 // 2]
+        if f"{module}.weight_scale" in self._files:
+            scales = self._slice(f"{module}.weight_scale")[r0:r1, c0 // 16 : c1 // 16]
+        else:
+            scales = csf_decode(self.tensor(f"{module}.weight_scale.nvfp4_csf_fixed"),
+                                self.tensor(f"{module}.weight_scale.nvfp4_csf_exceptions"), n, 2 * half_k // 16)
+            scales = scales[r0:r1, c0 // 16 : c1 // 16]
+        if modelopt:
+            global_scale = 1.0 / float(self.tensor(f"{module}.weight_scale_2").float().reshape(-1)[0])
+        else:
+            global_scale = float(self.tensor(f"{module}.weight_global_scale").reshape(-1)[0])
+        return Nvfp4Weight(packed=packed.contiguous(), scales=scales.contiguous().view(torch.uint8),
+                           global_scale=global_scale)
+
+    def linear_part(self, module: str, rows: tuple[int, int] | None = None,
+                    cols: tuple[int, int] | None = None) -> torch.Tensor:
+        """Rows and columns [start, stop) of a linear module's weight that is not NVFP4: dense as stored, or FP8 and
+        MXFP8 dequantized to FP32 (exact: E4M3 values times their scales)."""
+        kind = self.kind(module)
+        weight = self.dense_part(f"{module}.weight", rows=rows, cols=cols)
+        if kind == "dense":
+            return weight
+        values = weight.float()
+        scale = self.tensor(f"{module}.weight_scale")
+        if kind == "fp8":
+            scale = scale.float()
+            if scale.numel() == 1:
+                return values * scale.reshape(())
+            r0, r1 = rows if rows is not None else (0, scale.shape[0])
+            return values * scale.reshape(-1)[r0:r1, None]
+        r0, r1 = rows if rows is not None else (0, scale.shape[0])
+        c0, c1 = cols if cols is not None else (0, 32 * scale.shape[1])
+        if c0 % 32 or c1 % 32:
+            raise ValueError(f"column slice [{c0}, {c1}) of {module} is not aligned to MXFP8 blocks of 32")
+        exponent = scale.view(torch.uint8)[r0:r1, c0 // 32 : c1 // 32].float() - 127.0
+        return (values.view(values.shape[0], -1, 32) * torch.exp2(exponent)[..., None]).view(values.shape)
 
     def dense_part(
         self, name: str, rows: tuple[int, int] | None = None, cols: tuple[int, int] | None = None

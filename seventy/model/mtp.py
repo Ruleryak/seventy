@@ -90,7 +90,12 @@ class MtpDrafter:
             q = os.environ.get("SEVENTY_MTP_NVFP4", "1") != "0"
             self.fc = Linear(ckpt, [Source("mtp.fc")], dtype, device, quantize=q)
             self.attn = AttentionLayer(t, ckpt, "mtp.layers.0.self_attn", par, dtype, device, False, quantize=q)
-            self.mlp = MLP(t, ckpt, "mtp.layers.0.mlp", par, dtype, device, False, quantize=q)
+            if t.is_moe:
+                from .moe import MoE
+
+                self.mlp = MoE(t, ckpt, "mtp.layers.0.mlp", par, dtype, device, False)
+            else:
+                self.mlp = MLP(t, ckpt, "mtp.layers.0.mlp", par, dtype, device, False, quantize=q)
             self.input_norm = _norm_weight(ckpt, "mtp.layers.0.input_layernorm.weight", device, 1.0)
             self.post_norm = _norm_weight(ckpt, "mtp.layers.0.post_attention_layernorm.weight", device, 1.0)
             self.pre_e = _norm_weight(ckpt, "mtp.pre_fc_norm_embedding.weight", device, 1.0)
@@ -100,7 +105,10 @@ class MtpDrafter:
         self.head = None
         if (self.device.type == "cuda" and dtype == torch.float16 and target.lm_head_packed is not None
                 and os.environ.get("SEVENTY_MTP_HEAD", "nvfp4") != "fp16"):
-            self.head = _nvfp4_head(target.lm_head_packed)
+            from ..nvfp4 import GemmWeight
+
+            packed = target.lm_head_packed
+            self.head = packed if isinstance(packed, GemmWeight) else _nvfp4_head(packed)
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 

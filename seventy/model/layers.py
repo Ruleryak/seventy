@@ -52,12 +52,12 @@ class Linear:
             raise ValueError(f"cannot fuse quantized and dense modules: {[s.module for s in sources]}")
         pieces = []
         for s in sources:
-            n = ckpt.shape(f"{s.module}.weight_packed" if quantized[0] else f"{s.module}.weight")[0]
+            n = ckpt.out_rows(s.module)
             for r in s.rows or ((0, n),):
                 if quantized[0]:
                     self.parts.append(ckpt.nvfp4_part(s.module, rows=r, cols=cols).to(device))
                 else:
-                    pieces.append(ckpt.dense_part(f"{s.module}.weight", rows=r, cols=cols))
+                    pieces.append(ckpt.linear_part(s.module, rows=r, cols=cols))
         if pieces and quantize and torch.device(device).type == "cuda" and dtype == torch.float16 \
                 and pieces[0].shape[1] % 64 == 0:
             self.gemm = nvfp4.pack_for_gemm([nvfp4.quantize(to_device(_to_dtype(p, dtype), device)) for p in pieces])

@@ -151,14 +151,16 @@ def gdn_gates(y: torch.Tensor, a_off: int, b_off: int, hv: int, a_log: torch.Ten
     return g, beta
 
 
-def gated_rms_norm(x: torch.Tensor, y: torch.Tensor, z_off: int, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """rms_norm(x) * weight * silu(z) for x FP16 [T, hv, 128], z = columns z_off + h * 128 of y FP16 [T, ld]."""
+def gated_rms_norm(x: torch.Tensor, y: torch.Tensor, z_off: int, weight: torch.Tensor, eps: float,
+                   sigmoid_gate: bool = False) -> torch.Tensor:
+    """rms_norm(x) * weight * silu(z) (sigmoid(z) with sigmoid_gate) for x FP16 [T, hv, 128], z = columns
+    z_off + h * 128 of y FP16 [T, ld]."""
     _expect(x, "x", torch.float16)
     t, hv, dv = x.shape
     x = x.contiguous()
     out = torch.empty_like(x)
     code = lib().seventy_gated_rms_norm(out.data_ptr(), x.data_ptr(), y.data_ptr(), y.stride(0), z_off,
-                                        weight.data_ptr(), t, hv, dv, eps, _stream(x))
+                                        weight.data_ptr(), t, hv, dv, eps, int(sigmoid_gate), _stream(x))
     check("gated_rms_norm", code)
     return out
 
@@ -180,6 +182,7 @@ def gdn_recurrent(
     out: torch.Tensor | None = None,
     commit: bool = True,
     commit_lens: torch.Tensor | None = None,
+    sigmoid_gate: bool = False,
 ) -> torch.Tensor | None:
     """Fused Gated DeltaNet decode/verify step; see seventy_gdn_recurrent in csrc/seventy.h. With commit_lens, the
     commit pass of speculative decoding: no outputs, the state takes the first commit_lens[b] rows."""
@@ -200,7 +203,7 @@ def gdn_recurrent(
         y.shape[1], conv_weight.data_ptr(), a_log.data_ptr(), dt_bias.data_ptr(), norm_weight.data_ptr(),
         query_start.data_ptr(), context_lens.data_ptr(), state_slots.data_ptr(),
         commit_lens.data_ptr() if commit_lens is not None else None, 1 if (commit or commit_lens is not None) else 0,
-        context_lens.numel(), hk, hv, dk, dv, conv_weight.shape[1], eps, _stream(y),
+        context_lens.numel(), hk, hv, dk, dv, conv_weight.shape[1], eps, int(sigmoid_gate), _stream(y),
     )
     check("gdn_recurrent", code)
     return out
@@ -840,3 +843,52 @@ def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
     out = torch.empty(rows, two // 2, dtype=torch.float16, device=gate_up.device)
     check("silu_mul", lib().seventy_silu_mul(out.data_ptr(), gate_up.data_ptr(), rows, two // 2, _stream(gate_up)))
     return out
+
+
+MOE_ROWS_PER_SLOT = 8
+
+
+def moe_max_slots(pairs: int, experts: int) -> int:
+    """Slots of a plan of `pairs` pairs over `experts` local experts: whole slots of MOE_ROWS_PER_SLOT pairs, plus
+    one partial slot per expert."""
+    return max(1, -(-pairs // MOE_ROWS_PER_SLOT) + min(experts, pairs))
+
+
+def moe_plan(ids: torch.Tensor, e0: int, e1: int) -> tuple:
+    """The pairs of the local experts [e0, e1) in ids (int32 [pairs] expert ids), sorted by expert, and their slots:
+    (order, slot_expert, slot_start, slot_count, num_slots, max_slots), all on the GPU (csrc/moe.cu)."""
+    _expect(ids, "ids", torch.int32)
+    pairs = ids.numel()
+    max_slots = moe_max_slots(pairs, e1 - e0)
+    dev = ids.device
+    order = torch.empty(max(pairs, 1), dtype=torch.int32, device=dev)
+    slots = torch.empty(3, max_slots, dtype=torch.int32, device=dev)
+    num = torch.empty(1, dtype=torch.int32, device=dev)
+    check("moe_plan", lib().seventy_moe_plan(ids.contiguous().data_ptr(), pairs, e0, e1, MOE_ROWS_PER_SLOT, max_slots,
+                                             order.data_ptr(), slots[0].data_ptr(), slots[1].data_ptr(),
+                                             slots[2].data_ptr(), num.data_ptr(), _stream(ids)))
+    return order, slots[0], slots[1], slots[2], num, max_slots
+
+
+def moe_gemm(x: torch.Tensor, row_div: int, weight: torch.Tensor, scales: torch.Tensor | None,
+             alpha: torch.Tensor | None, plan: tuple, pairs: int, pair_weight: torch.Tensor | None = None,
+             out: torch.Tensor | None = None) -> torch.Tensor:
+    """For every pair of the plan: x[pair / row_div] times its expert's weight (NVFP4 packed [E, n, k / 2] with
+    scales [E, n, k / 16] and alpha [E, n], or FP16 [E, n, k]). FP16 [pairs, n], or FP32 [pairs, n] scaled by
+    pair_weight. Rows of pairs outside the plan are left as they are in out (zeros when out is new)."""
+    _expect(x, "x", torch.float16)
+    x = x.contiguous()
+    nvfp4 = weight.dtype == torch.uint8
+    n = weight.shape[1]
+    k = weight.shape[2] * (2 if nvfp4 else 1)
+    if out is None:
+        out = torch.zeros(pairs, n, dtype=torch.float32 if pair_weight is not None else torch.float16, device=x.device)
+    order, slot_expert, slot_start, slot_count, num, max_slots = plan
+    code = lib().seventy_moe_gemm(out.data_ptr(), x.data_ptr(), row_div, weight.data_ptr(),
+                                  scales.data_ptr() if nvfp4 else None, alpha.data_ptr() if nvfp4 else None,
+                                  int(nvfp4), n, k, order.data_ptr(), slot_expert.data_ptr(), slot_start.data_ptr(),
+                                  slot_count.data_ptr(), num.data_ptr(), max_slots,
+                                  pair_weight.data_ptr() if pair_weight is not None else None, _stream(x))
+    check("moe_gemm", code)
+    return out
+

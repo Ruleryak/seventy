@@ -6,7 +6,8 @@
  * and the gated RMS norm. Prefill (long token runs) uses the chunked form instead.
  *
  * Per token, with a = exp(g) and L2-normalized q (also scaled by 1 / sqrt(Dk)) and k: S = a * S,
- * delta = beta * (v - S^T k), S = S + k delta^T, o = S^T q, out = rms_norm(o) * w * silu(z). The convolution
+ * delta = beta * (v - S^T k), S = S + k delta^T, o = S^T q, out = rms_norm(o) * w * silu(z) (sigmoid(z) with
+ * sigmoid_gate, as in Qwen4-Exp). The convolution
  * output, o and the result are rounded to FP16 where the reference rounds them.
  *
  * One block of 512 threads per (sequence, value head). The columns of S [Dk = 128, Dv = 128] are independent in
@@ -58,7 +59,7 @@ __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
     half *out, half *conv_state, float *state, const half *y, int ld, const float *conv_w, const float *a_log,
     const float *dt_bias, const float *norm_w, const int *query_start, const int *context_lens,
     const int *state_slots, const int *commit_lens, int commit, int hk, int hv, float eps, int64_t y_ls,
-    int64_t conv_ls, int64_t state_ls, int params_ls) {
+    int64_t conv_ls, int64_t state_ls, int params_ls, int sigmoid_gate) {
   __shared__ __align__(16) half raw[kChunk][4 * kD];
   __shared__ __align__(16) float qs[kChunk][kD];
   __shared__ __align__(16) float ks[kChunk][kD];
@@ -224,7 +225,8 @@ __global__ void __launch_bounds__(kThreads) gdn_recurrent_kernel(
 #pragma unroll 1
       for (int t = tid / kD; t < n; t += kThreads / kD) {
         const float z = __half2float(raw[t][3 * kD + ov]);
-        const float r = os[t * 2 * kD + ov] * rinv_s[t] * nw * (z / (1.0f + expf(-z)));
+        const float gate = sigmoid_gate ? 1.0f / (1.0f + expf(-z)) : z / (1.0f + expf(-z));
+        const float r = os[t * 2 * kD + ov] * rinv_s[t] * nw * gate;
         out[static_cast<int64_t>(t0 + c0 + t) * hv * kD + h * kD + ov] = __float2half_rn(r);
       }
     }
@@ -273,11 +275,11 @@ void launch_recurrent(dim3 grid, half *out, half *conv_state, float *state, cons
                       const float *a_log, const float *dt_bias, const float *norm_w, const int *query_start,
                       const int *context_lens, const int *state_slots, const int *commit_lens, int commit, int hk,
                       int hv, float eps, int64_t y_ls, int64_t conv_ls, int64_t state_ls, int params_ls,
-                      cudaStream_t stream) {
+                      int sigmoid_gate, cudaStream_t stream) {
   gdn_recurrent_kernel<kTaps><<<grid, kThreads, 0, stream>>>(out, conv_state, state, y, ld, conv_w, a_log, dt_bias,
                                                              norm_w, query_start, context_lens, state_slots,
                                                              commit_lens, commit, hk, hv, eps, y_ls, conv_ls,
-                                                             state_ls, params_ls);
+                                                             state_ls, params_ls, sigmoid_gate);
   if (commit)
     gdn_qk_history_kernel<kTaps><<<dim3(grid.x / hv, grid.y), 256, 0, stream>>>(
         conv_state, y, ld, query_start, context_lens, state_slots, commit_lens, hk, hv, y_ls, conv_ls);
@@ -290,7 +292,8 @@ SEVENTY_API int seventy_gdn_recurrent(void *out, void *conv_state, float *state,
                                       const float *conv_w, const float *a_log, const float *dt_bias,
                                       const float *norm_w, const int *query_start, const int *context_lens,
                                       const int *state_slots, const int *commit_lens, int commit, int num_seqs,
-                                      int hk, int hv, int dk, int dv, int taps, float eps, cudaStream_t stream) {
+                                      int hk, int hv, int dk, int dv, int taps, float eps, int sigmoid_gate,
+                                      cudaStream_t stream) {
   using namespace seventy;
   if ((out == nullptr && commit_lens == nullptr) || conv_state == nullptr || state == nullptr || y == nullptr || conv_w == nullptr ||
       a_log == nullptr || dt_bias == nullptr || norm_w == nullptr || query_start == nullptr ||
@@ -302,7 +305,7 @@ SEVENTY_API int seventy_gdn_recurrent(void *out, void *conv_state, float *state,
   const auto launch = taps == 2 ? launch_recurrent<2> : taps == 3 ? launch_recurrent<3> : launch_recurrent<4>;
   launch(dim3(static_cast<unsigned>(num_seqs * hv)), static_cast<half *>(out), static_cast<half *>(conv_state), state,
          static_cast<const half *>(y), ld, conv_w, a_log, dt_bias, norm_w, query_start, context_lens, state_slots,
-         commit_lens, commit, hk, hv, eps, 0, 0, 0, 0, stream);
+         commit_lens, commit, hk, hv, eps, 0, 0, 0, 0, sigmoid_gate, stream);
   return launch_status();
 }
 
@@ -324,6 +327,6 @@ SEVENTY_API int seventy_gdn_commit_layers(void *conv_state, float *state, const 
   const auto launch = taps == 2 ? launch_recurrent<2> : taps == 3 ? launch_recurrent<3> : launch_recurrent<4>;
   launch(dim3(static_cast<unsigned>(num_seqs * hv), static_cast<unsigned>(layers)), nullptr,
          static_cast<half *>(conv_state), state, static_cast<const half *>(y), ld, conv_w, a_log, dt_bias, norm_w,
-         query_start, context_lens, state_slots, commit_lens, 1, hk, hv, eps, y_ls, conv_ls, state_ls, 1, stream);
+         query_start, context_lens, state_slots, commit_lens, 1, hk, hv, eps, y_ls, conv_ls, state_ls, 1, 0, stream);
   return launch_status();
 }

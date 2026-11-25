@@ -25,10 +25,12 @@ def rms_norm(
     return out.to(x.dtype), (None if residual is None else s)
 
 
-def gated_rms_norm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """rms_norm(x) * weight * silu(z), over the last dimension."""
+def gated_rms_norm(x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float,
+                   sigmoid_gate: bool = False) -> torch.Tensor:
+    """rms_norm(x) * weight * silu(z) (sigmoid(z) with sigmoid_gate), over the last dimension."""
     f = x.float()
-    out = f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + eps) * weight.float() * F.silu(z.float())
+    gate = torch.sigmoid(z.float()) if sigmoid_gate else F.silu(z.float())
+    out = f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + eps) * weight.float() * gate
     return out.to(x.dtype)
 
 

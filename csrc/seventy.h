@@ -82,7 +82,8 @@ SEVENTY_API int seventy_gdn_recurrent(void *out, void *conv_state, float *state,
                                       const float *conv_w, const float *a_log, const float *dt_bias,
                                       const float *norm_w, const int *query_start, const int *context_lens,
                                       const int *state_slots, const int *commit_lens, int commit, int num_seqs,
-                                      int hk, int hv, int dk, int dv, int taps, float eps, cudaStream_t stream);
+                                      int hk, int hv, int dk, int dv, int taps, float eps, int sigmoid_gate,
+                                      cudaStream_t stream);
 
 /*
  * The commit pass of seventy_gdn_recurrent for `layers` layers in one launch. The arrays of layer l start at a fixed
@@ -160,7 +161,8 @@ SEVENTY_API int seventy_gdn_prepare(void *w, void *u, void *gq, void *p, void *k
  * silu(causal depthwise convolution of the first channels columns of y [T, ld] with conv_w FP32 [channels, taps]),
  * continuing each sequence from its history in conv_state FP16 [slots, channels, taps - 1] (none if its context
  * length is 0), which it then updates. seventy_gdn_gates: g and beta FP32 [T, hv] from the a and b columns of y
- * (offsets a_off, b_off). seventy_gated_rms_norm: out = rms_norm(x) * weight * silu(z) for x FP16 [T * hv, 128]
+ * (offsets a_off, b_off). seventy_gated_rms_norm: out = rms_norm(x) * weight * silu(z) (sigmoid(z) with
+ * sigmoid_gate) for x FP16 [T * hv, 128]
  * and z the columns z_off + h * 128 of y-like rows (row stride z_ld). Sequence arrays as in seventy_gdn_recurrent.
  */
 SEVENTY_API int seventy_gdn_conv(void *out, void *conv_state, const void *y, int ld, const float *conv_w,
@@ -169,7 +171,7 @@ SEVENTY_API int seventy_gdn_conv(void *out, void *conv_state, const void *y, int
 SEVENTY_API int seventy_gdn_gates(float *g, float *beta, const void *y, int ld, int a_off, int b_off,
                                   const float *a_log, const float *dt_bias, int tokens, int hv, cudaStream_t stream);
 SEVENTY_API int seventy_gated_rms_norm(void *out, const void *x, const void *z, int z_ld, int z_off,
-                                       const float *weight, int tokens, int hv, int dv, float eps,
+                                       const float *weight, int tokens, int hv, int dv, float eps, int sigmoid_gate,
                                        cudaStream_t stream);
 
 /*
