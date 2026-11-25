@@ -223,12 +223,13 @@ __global__ void __launch_bounds__(kMoeThreads) moe_gemm_kernel(
 }
 
 /*
- * moe_route_kernel: one warp per token. Each lane keeps the logits of the experts lane, lane + 32, ... in registers;
- * k rounds of a warp argmax (ties: the lower id) pick the experts, and lane j keeps pick j.
+ * moe_route_kernel: one warp per token. Each lane keeps the logits of the experts lane, lane + 32, ... (kPer of them)
+ * in registers and its own best one. Each of the k rounds takes the warp's best (ties: the lower id); only the lane
+ * that held it looks for its next best. Lane j keeps pick j.
  */
-constexpr int kRoutePer = kMoeMaxExperts / 32;
 constexpr int kRouteWarps = 4;
 
+template <int kPer>
 __global__ void __launch_bounds__(32 * kRouteWarps) moe_route_kernel(const float *logits, int64_t ld, int tokens,
                                                                      int experts, int k, int renorm, int32_t *ids,
                                                                      float *weights) {
@@ -236,34 +237,36 @@ __global__ void __launch_bounds__(32 * kRouteWarps) moe_route_kernel(const float
   const int t = blockIdx.x * kRouteWarps + (threadIdx.x >> 5);
   if (t >= tokens) return;
   const float *row = logits + static_cast<int64_t>(t) * ld;
-  float v[kRoutePer];
+  float v[kPer];
   float mx = -INFINITY;
 #pragma unroll
-  for (int i = 0; i < kRoutePer; ++i) {
+  for (int i = 0; i < kPer; ++i) {
     const int e = lane + 32 * i;
     v[i] = e < experts ? row[e] : -INFINITY;
     mx = fmaxf(mx, v[i]);
   }
+  float lb = -INFINITY;
+  int li = experts;
+#pragma unroll
+  for (int i = 0; i < kPer; ++i)
+    if (v[i] > lb) {
+      lb = v[i];
+      li = lane + 32 * i;
+    }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
   float sum = 0.0f;
   if (!renorm) {
 #pragma unroll
-    for (int i = 0; i < kRoutePer; ++i)
+    for (int i = 0; i < kPer; ++i)
       if (lane + 32 * i < experts) sum += expf(v[i] - mx);
     sum = warp_sum(sum);
   }
   float mine_v = -INFINITY;
   int mine_i = 0;
   for (int j = 0; j < k; ++j) {
-    float best = -INFINITY;
-    int bi = experts;
-#pragma unroll
-    for (int i = 0; i < kRoutePer; ++i)
-      if (v[i] > best) {
-        best = v[i];
-        bi = lane + 32 * i;
-      }
+    float best = lb;
+    int bi = li;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
       const float ov = __shfl_xor_sync(0xffffffffu, best, o);
@@ -273,12 +276,21 @@ __global__ void __launch_bounds__(32 * kRouteWarps) moe_route_kernel(const float
         bi = oi;
       }
     }
-#pragma unroll
-    for (int i = 0; i < kRoutePer; ++i)
-      if (lane + 32 * i == bi) v[i] = -INFINITY;
     if (lane == j) {
       mine_v = best;
       mine_i = bi;
+    }
+    if (li == bi) {
+      lb = -INFINITY;
+      li = experts;
+#pragma unroll
+      for (int i = 0; i < kPer; ++i) {
+        if (lane + 32 * i == bi) v[i] = -INFINITY;
+        if (v[i] > lb) {
+          lb = v[i];
+          li = lane + 32 * i;
+        }
+      }
     }
   }
   const float w = lane < k ? expf(mine_v - mx) : 0.0f;
@@ -382,8 +394,13 @@ SEVENTY_API int seventy_moe_route(const float *logits, int64_t ld, int tokens, i
       experts > kMoeMaxExperts || k < 1 || k > 16 || k > experts || ld < experts)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (tokens == 0) return SEVENTY_OK;
-  moe_route_kernel<<<(tokens + kRouteWarps - 1) / kRouteWarps, 32 * kRouteWarps, 0, stream>>>(
-      logits, ld, tokens, experts, k, renorm, ids, weights);
+  const dim3 grid((tokens + kRouteWarps - 1) / kRouteWarps);
+  if (experts <= 256)
+    moe_route_kernel<8><<<grid, 32 * kRouteWarps, 0, stream>>>(logits, ld, tokens, experts, k, renorm, ids, weights);
+  else if (experts <= 512)
+    moe_route_kernel<16><<<grid, 32 * kRouteWarps, 0, stream>>>(logits, ld, tokens, experts, k, renorm, ids, weights);
+  else
+    moe_route_kernel<32><<<grid, 32 * kRouteWarps, 0, stream>>>(logits, ld, tokens, experts, k, renorm, ids, weights);
   return launch_status();
 }
 

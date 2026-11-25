@@ -129,21 +129,24 @@ def test_finish_adds_local_picks_and_the_gated_shared_expert(shared):
 
 def test_small_batch_moe_matches_the_unfused_path():
     """MoE._small (one product for the router and the shared gate, warp route, moe_finish) against the earlier
-    GPU path on random FP16 experts of a small config."""
+    GPU path on random FP16 experts of a small config, with BF16 router weights that need the power-of-two scale."""
     from types import SimpleNamespace
 
     from seventy.model.moe import MoE
     from seventy.ops import kernels
-    from seventy.ops.kernels import DenseWeight
-
     g = torch.Generator().manual_seed(3)
     hidden, width, experts = 256, 64, 32
     m = MoE.__new__(MoE)
     m.cfg = SimpleNamespace(num_experts=experts, experts_per_token=4, norm_topk_prob=True)
     m.top_k, m.e0, m.e1, m.dtype, m.device = 4, 8, 24, torch.float16, torch.device("cuda")
-    m.router = (torch.randn(experts, hidden, generator=g) * 0.05).half().float().cuda()
-    m.shared_gate = (torch.randn(1, hidden, generator=g) * 0.05).half().float().cuda()
-    m.gates = DenseWeight(torch.cat((m.router, m.shared_gate)).half())
+    router = (torch.randn(experts, hidden, generator=g) * 0.05).bfloat16().float()
+    router[0, :8] = torch.tensor([5e-8, -7e-8, 3e-7, 2.375, -1.5, 1e-6, 0.0, 4e-5]).bfloat16().float()
+    m.router = router.cuda()
+    m.shared_gate = (torch.randn(1, hidden, generator=g) * 0.05).bfloat16().float().cuda()
+    m.gates, m.gate_scale = None, 1.0
+    want_logits = torch.cat((m.router, m.shared_gate))
+    assert m.use_fp16_gates() and m.gate_scale < 1.0
+    assert torch.equal(torch.cat((m.router, m.shared_gate)).float() * m.gate_scale, want_logits)
     from seventy.model.moe import ExpertStack
 
     m.gate_up = ExpertStack(weight=(torch.randn(16, 2 * width, hidden, generator=g) * 0.05).half().cuda())

@@ -21,6 +21,8 @@ product per picked expert.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -114,19 +116,36 @@ class MoE:
             self.down = ExpertStack(weight=torch.stack([self.down.dense(e, dtype) for e in range(n)]))
         self.width = cfg.moe_intermediate_size
         self.gates = None
+        self.gate_scale = 1.0
         if self.device.type == "cuda" and dtype == torch.float16:
-            both = torch.cat((self.router, self.shared_gate))
-            if torch.equal(both.half().float(), both):
-                from ..ops.kernels import DenseWeight
+            self.use_fp16_gates()
 
-                self.gates = DenseWeight(both.half())
-                self.router, self.shared_gate = self.router.half(), self.shared_gate.half()
-                torch.cuda.empty_cache()
+    def use_fp16_gates(self) -> bool:
+        """Keep the router and the shared expert's gate (FP32 [E, H] and [1, H]) as FP16 times 2^e when that is
+        exact (BF16 weights whose range fits), for the one-product route of _small. Returns whether it is."""
+        from ..ops.kernels import DenseWeight
+
+        both = torch.cat((self.router.float(), self.shared_gate.float()))
+        top = both.abs().max().item()
+        e = math.floor(math.log2(32768.0 / top)) if top > 0 else 0
+        scaled = both * 2.0**e
+        if not torch.equal(scaled.half().float(), scaled):
+            return False
+        self.gates = DenseWeight(scaled.half())
+        self.gate_scale = 2.0**-e
+        self.gate_rows = torch.full((SMALL_TOKENS,), self.gate_scale, device=both.device)
+        n = self.router.shape[0]
+        self.router, self.shared_gate = scaled[:n].half(), scaled[n:].half()
+        torch.cuda.empty_cache()
+        return True
 
     def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """(expert ids [tokens, k] int64, or int32 from the kernel, weights [tokens, k] FP32) of each token. The router
-        weights are FP32, or FP16 when that is exact (with self.gates); the logits are FP32 either way."""
+        weights are FP32, or FP16 times 2^e (gate_scale = 2^-e) when that holds the BF16 weights exactly (with
+        self.gates); the logits are FP32 either way."""
         logits = x.float() @ self.router.float().T
+        if self.gate_scale != 1.0:
+            logits = logits * self.gate_scale
         if logits.is_cuda:
             from ..ops import kernels
 
@@ -139,7 +158,7 @@ class MoE:
 
     def _shared(self, x: torch.Tensor) -> torch.Tensor:
         shared = self.shared_down(ops.silu_mul(self.shared_gate_up(x)))
-        return shared.float() * torch.sigmoid(x.float() @ self.shared_gate.float().T)
+        return shared.float() * torch.sigmoid((x.float() @ self.shared_gate.float().T) * self.gate_scale)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's partial sum of the MoE output (the all-reduce after the MLP completes it)."""
@@ -165,12 +184,13 @@ class MoE:
 
     def _small(self, x: torch.Tensor) -> torch.Tensor:
         """Up to SMALL_TOKENS tokens on the GPU, without host synchronization: one FP16 product gives the router
-        logits and the shared expert's gate logit (the BF16 weights are exact in FP16; FP32 sums), then the route,
+        logits and the shared expert's gate logit (the BF16 weights times a power of two are exact in FP16, the
+        tensor-core products are exact and the sums FP32, and the output scale 2^-e is exact), then the route,
         the plan and the two grouped expert products, and moe_finish adds the gated shared expert."""
         from ..ops import kernels
 
         t, k, n = x.shape[0], self.top_k, self.cfg.num_experts
-        logits = kernels.dense_gemm(x, self.gates)
+        logits = kernels.dense_gemm(x, self.gates, row_scale=self.gate_rows[:t])
         ids, weights = kernels.moe_route(logits, k, self.cfg.norm_topk_prob, experts=n)
         shared = self.shared_down(ops.silu_mul(self.shared_gate_up(x)))
         ids = ids.reshape(-1)
