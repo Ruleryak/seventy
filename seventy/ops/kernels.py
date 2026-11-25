@@ -882,6 +882,19 @@ def moe_max_slots(pairs: int, experts: int) -> int:
     return max(1, -(-pairs // MOE_ROWS_PER_SLOT) + min(experts, pairs))
 
 
+def moe_route(logits: torch.Tensor, k: int, renorm: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """(expert ids int32 [tokens, k], weights FP32 [tokens, k]) of router logits FP32 [tokens, experts]: the top k
+    (ties: the lower id), weighted by the softmax over the k picked logits (renorm) or over all logits."""
+    _expect(logits, "logits", torch.float32)
+    logits = logits.contiguous()
+    t, e = logits.shape
+    ids = torch.empty(t, k, dtype=torch.int32, device=logits.device)
+    weights = torch.empty(t, k, dtype=torch.float32, device=logits.device)
+    check("moe_route", lib().seventy_moe_route(logits.data_ptr(), t, e, k, int(renorm), ids.data_ptr(),
+                                               weights.data_ptr(), _stream(logits)))
+    return ids, weights
+
+
 def moe_plan(ids: torch.Tensor, e0: int, e1: int) -> tuple:
     """The pairs of the local experts [e0, e1) in ids (int32 [pairs] expert ids), sorted by expert, and their slots:
     (order, slot_expert, slot_start, slot_count, num_slots, max_slots), all on the GPU (csrc/moe.cu)."""

@@ -24,11 +24,14 @@ split evenly."""
 def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int = 1, extra_layers: int = 0) -> int:
     """Bytes of one KV block on one rank: K and V of the local KV heads of every full-attention layer, and of
     extra_layers more (the MTP drafter's attention layer), as INT8 values plus one FP32 scale per token and head,
-    or FP16."""
+    or FP16. Qwen4-Exp models add the FP16 indexer key of every attention layer and the token's rotary positions."""
     t = cfg.text
     per_vec = t.head_dim + 4 if kv_dtype == "int8" else 2 * t.head_dim
     kv_heads = max_head_split(t.num_heads, t.num_kv_heads, tp)[0]
-    return (len(t.attention_layers) + extra_layers) * 2 * block_size * kv_heads * per_vec
+    kv = (len(t.attention_layers) + extra_layers) * 2 * block_size * kv_heads * per_vec
+    if t.exp is not None:
+        kv += block_size * (len(t.attention_layers) * t.exp.indexer_head_dim * 2 + 3 * 4)
+    return kv
 
 
 def prefix_entries(max_num_seqs: int, prefix_cache: bool, cache_entries: int = 0) -> int:
@@ -38,11 +41,15 @@ def prefix_entries(max_num_seqs: int, prefix_cache: bool, cache_entries: int = 0
 
 def state_bytes_per_slot(cfg: ModelConfig, tp: int = 1) -> int:
     """Bytes of one Gated DeltaNet state slot on one rank: the FP32 recurrent state and the FP16 convolution
-    state of every linear-attention layer (of the fullest rank when the heads do not split evenly)."""
+    state of every linear-attention layer (Qwen4-Exp: also the PLE tokens and convolution inputs) (of the fullest rank when the heads do not split evenly)."""
     t = cfg.text
     hk, hv = max_head_split(t.gdn_v_heads, t.gdn_k_heads, tp)
     conv = 2 * hk * t.gdn_k_dim + hv * t.gdn_v_dim
-    return len(t.linear_layers) * (hv * t.gdn_k_dim * t.gdn_v_dim * 4 + conv * (t.conv_kernel - 1) * 2)
+    state = len(t.linear_layers) * (hv * t.gdn_k_dim * t.gdn_v_dim * 4 + conv * (t.conv_kernel - 1) * 2)
+    if t.exp is not None:
+        e = t.exp
+        state += (e.ngram_size - 1) * 8 + len(e.ple_layers) * (e.ple_conv_kernel - 1) * e.ngram_size * e.hc_count * t.hidden_size * 2
+    return state
 
 
 @dataclass(frozen=True)
@@ -120,9 +127,38 @@ def drafter_bytes_per_slot(shape: DrafterShape, tp: int = 1) -> int:
     return 2 * shape.layers * shape.ring * kv * shape.head_dim * 2
 
 
+def _shard_files(path: Path) -> list[Path]:
+    index = path / "model.safetensors.index.json"
+    if index.is_file():
+        files = sorted(set(json.loads(index.read_text())["weight_map"].values()))
+        return [path / f for f in files]
+    return sorted(path.glob("*.safetensors"))
+
+
+def host_table_bytes(path: str | Path) -> int:
+    """Bytes of the tensors that stay in host memory: the n-gram embedding tables of Qwen4-Exp checkpoints
+    (*.ngram_embedding.shard_*), from the headers of their files."""
+    import struct
+
+    total = 0
+    for f in _shard_files(Path(path)):
+        try:
+            with open(f, "rb") as fh:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                header = json.loads(fh.read(n))
+        except (OSError, ValueError):
+            continue
+        total += sum(m["data_offsets"][1] - m["data_offsets"][0] for name, m in header.items()
+                     if name != "__metadata__" and ".ngram_embedding.shard_" in name)
+    return total
+
+
 def checkpoint_bytes(path: str | Path) -> int:
-    """Total size of a checkpoint's safetensors files."""
-    return sum(f.stat().st_size for f in Path(path).glob("*.safetensors"))
+    """Total size of a checkpoint's safetensors files (the files of its index, which may be in a subfolder), less
+    the tensors that stay in host memory (host_table_bytes)."""
+    files = _shard_files(Path(path))
+    total = sum(f.stat().st_size for f in files if f.is_file())
+    return total - host_table_bytes(path) if total else total
 
 
 def tied_head_bytes(cfg: ModelConfig, tp: int = 1) -> int:

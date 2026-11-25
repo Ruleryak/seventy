@@ -73,3 +73,19 @@ def test_grouped_gemm_matches_dense_products(fmt, tokens, k, n, kk):
         tol = 2e-3 * ref.abs().max().item() + 1e-3
         assert (got16[p].float() - ref).abs().max().item() < tol + 2e-3 * ref.abs().max().item()
         assert (got32[p] - ref * pw[p]).abs().max().item() < tol
+
+
+@pytest.mark.parametrize("tokens,experts,k", [(1, 256, 8), (40, 256, 8), (64, 512, 10), (3, 16, 4)])
+@pytest.mark.parametrize("renorm", [True, False])
+def test_route_matches_softmax_topk(tokens, experts, k, renorm):
+    from seventy.ops import kernels
+
+    g = torch.Generator().manual_seed(tokens + experts)
+    logits = (torch.randn(tokens, experts, generator=g) * 2).cuda()
+    ids, w = kernels.moe_route(logits, k, renorm)
+    probs = torch.softmax(logits, dim=-1)
+    want_w, want_ids = torch.topk(probs, k, dim=-1)
+    if renorm:
+        want_w = want_w / want_w.sum(-1, keepdim=True)
+    assert torch.equal(ids.long(), want_ids)
+    torch.testing.assert_close(w, want_w, rtol=1e-5, atol=1e-6)

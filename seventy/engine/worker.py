@@ -26,7 +26,12 @@ from .runner import ModelRunner, build_step
 def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None):
     cfg = load_config(Path(model_path))
     with Checkpoint(Path(model_path)) as ckpt:
-        model = Qwen35TextModel(cfg, ckpt, device, dtype, par=Parallel(rank, size), layers=layers)
+        if cfg.text.exp is not None:
+            from ..model.qwen4_exp import Qwen4ExpTextModel
+
+            model = Qwen4ExpTextModel(cfg, ckpt, device, dtype, par=Parallel(rank, size), layers=layers)
+        else:
+            model = Qwen35TextModel(cfg, ckpt, device, dtype, par=Parallel(rank, size), layers=layers)
         model.vision = None
         prefix = "model.visual."
         if cfg.vision is not None and torch.device(device).type == "cuda" and ckpt.names(prefix):

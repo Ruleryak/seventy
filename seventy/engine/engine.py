@@ -6,6 +6,8 @@ before the first prefill chunk that reaches their tokens, and released once pref
 
 from __future__ import annotations
 
+import dataclasses
+
 import faulthandler
 import itertools
 import os
@@ -131,6 +133,9 @@ class Engine:
             self.device = torch.device("cuda", 0 if tp > 1 else torch.cuda.current_device())
         path = Path(config.model)
         self.model_config = load_config(path)
+        if self.model_config.text.exp is not None and config.cuda_graphs:
+            print("seventy: Qwen4-Exp models run without CUDA graphs in this build", flush=True)
+            config = self.config = dataclasses.replace(config, cuda_graphs=False)
         if self.device.type == "cuda":
             devices = [self.device.index] if tp == 1 else list(range(tp))
             _check_gpus(devices)

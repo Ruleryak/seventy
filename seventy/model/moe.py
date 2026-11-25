@@ -115,8 +115,13 @@ class MoE:
         self.width = cfg.moe_intermediate_size
 
     def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(expert ids [tokens, k] int64, weights [tokens, k] FP32) of each token."""
-        probs = torch.softmax(x.float() @ self.router.T, dim=-1)
+        """(expert ids [tokens, k] int64, or int32 from the kernel, weights [tokens, k] FP32) of each token."""
+        logits = x.float() @ self.router.T
+        if logits.is_cuda:
+            from ..ops import kernels
+
+            return kernels.moe_route(logits, self.top_k, self.cfg.norm_topk_prob)
+        probs = torch.softmax(logits, dim=-1)
         weights, ids = torch.topk(probs, self.top_k, dim=-1)
         if not self.cfg.norm_topk_prob:
             return ids, weights
@@ -137,7 +142,7 @@ class MoE:
             from ..ops import kernels
 
             pairs = t * self.top_k
-            plan = kernels.moe_plan(ids.reshape(-1).int(), self.e0, self.e1)
+            plan = kernels.moe_plan(ids.reshape(-1), self.e0, self.e1)
             h = kernels.moe_gemm(x, self.top_k, self._w(self.gate_up), self.gate_up.scales, self.gate_up.alpha, plan,
                                  pairs)
             a = ops.silu_mul(h)
@@ -153,7 +158,7 @@ class MoE:
     def _loop(self, x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """One dense product per picked local expert (prefill and the CPU)."""
         t = x.shape[0]
-        flat = ids.reshape(-1)
+        flat = ids.reshape(-1).long()
         token = torch.arange(t, device=x.device).repeat_interleave(self.top_k)
         mine = (flat >= self.e0) & (flat < self.e1)
         local = flat[mine] - self.e0

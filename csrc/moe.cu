@@ -13,6 +13,9 @@
  * `per` pairs of one expert: slot s covers order[start[s] .. start[s] + count[s]) of expert slot_expert[s]. The
  * order is stable, so results do not depend on timing.
  *
+ * seventy_moe_route: for each token, the top k of its router logits (ties: the lower expert id) and their weights:
+ * the softmax over the k picked logits (renorm), or over all logits. One block per token.
+ *
  * seventy_moe_gemm: for each slot, the rows of its pairs times the weight of its expert. Row r of x for pair p is
  * x[p / row_div] (row_div k: x holds the tokens, for gate_up; row_div 1: x holds the pairs, for down). One block
  * takes 64 output columns of one slot; each warp takes 8 columns at once: each lane reads the same group of 16
@@ -26,6 +29,7 @@ namespace seventy {
 namespace {
 
 constexpr int kMoeMaxExperts = 1024;
+constexpr int kMoeMaxPairs = 4096;
 constexpr int kMoeMaxRows = 8;
 constexpr int kMoeWarpCols = 2;
 constexpr int kMoeThreads = 256;
@@ -34,50 +38,67 @@ __device__ __forceinline__ uint32_t code_pair_to_half2(uint32_t x) {
   return (x & 0x80008000u) | ((x >> 3) & 0x0E000E00u);
 }
 
-__global__ void moe_plan_kernel(const int32_t *ids, int pairs, int e0, int e1, int per, int max_slots,
-                                int32_t *order, int32_t *slot_expert, int32_t *slot_start, int32_t *slot_count,
-                                int32_t *num_slots) {
+__global__ void __launch_bounds__(1024) moe_plan_kernel(const int32_t *ids, int pairs, int e0, int e1, int per,
+                                                        int max_slots, int32_t *order, int32_t *slot_expert,
+                                                        int32_t *slot_start, int32_t *slot_count,
+                                                        int32_t *num_slots) {
   __shared__ int counts[kMoeMaxExperts];
-  __shared__ int offsets[kMoeMaxExperts];
-  __shared__ int slot_base[kMoeMaxExperts];
+  __shared__ int scan_a[kMoeMaxExperts];
+  __shared__ int scan_b[kMoeMaxExperts];
+  __shared__ int pair_ids[kMoeMaxPairs];
   const int experts = e1 - e0;
-  for (int e = threadIdx.x; e < experts; e += blockDim.x) counts[e] = 0;
+  const int tid = threadIdx.x;
+  if (tid < experts) counts[tid] = 0;
+  for (int p = tid; p < pairs; p += blockDim.x) pair_ids[p] = ids[p];
   __syncthreads();
-  for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
-    const int e = ids[p];
+  for (int p = tid; p < pairs; p += blockDim.x) {
+    const int e = pair_ids[p];
     if (e >= e0 && e < e1) atomicAdd(&counts[e - e0], 1);
   }
   __syncthreads();
-  for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-    int off = 0, slots = 0;
-    for (int f = 0; f < e; ++f) {
-      off += counts[f];
-      slots += (counts[f] + per - 1) / per;
-    }
-    offsets[e] = off;
-    slot_base[e] = slots;
+  const int c = tid < experts ? counts[tid] : 0;
+  const int sl = (c + per - 1) / per;
+  if (tid < experts) {
+    scan_a[tid] = c;
+    scan_b[tid] = sl;
   }
   __syncthreads();
-  for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-    const int c = counts[e];
-    for (int j = 0; j * per < c; ++j) {
-      const int s = slot_base[e] + j;
+  for (int step = 1; step < experts; step <<= 1) {
+    int a = 0, b = 0;
+    if (tid < experts && tid >= step) {
+      a = scan_a[tid - step];
+      b = scan_b[tid - step];
+    }
+    __syncthreads();
+    if (tid < experts && tid >= step) {
+      scan_a[tid] += a;
+      scan_b[tid] += b;
+    }
+    __syncthreads();
+  }
+  if (tid < experts) {
+    const int off = scan_a[tid] - c;
+    const int base = scan_b[tid] - sl;
+    for (int j = 0; j < sl; ++j) {
+      const int s = base + j;
       if (s < max_slots) {
-        slot_expert[s] = e;
-        slot_start[s] = offsets[e] + j * per;
+        slot_expert[s] = tid;
+        slot_start[s] = off + j * per;
         slot_count[s] = min(per, c - j * per);
       }
     }
-    if (e == experts - 1) *num_slots = min(max_slots, slot_base[e] + (c + per - 1) / per);
+    counts[tid] = off;
+    if (tid == experts - 1) *num_slots = min(max_slots, scan_b[tid]);
   }
-  for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
-    const int e = ids[p];
+  if (experts == 0 && tid == 0) *num_slots = 0;
+  __syncthreads();
+  for (int p = tid; p < pairs; p += blockDim.x) {
+    const int e = pair_ids[p];
     if (e < e0 || e >= e1) continue;
     int rank = 0;
-    for (int q = 0; q < p; ++q) rank += ids[q] == e;
-    order[offsets[e - e0] + rank] = p;
+    for (int q = 0; q < p; ++q) rank += pair_ids[q] == e;
+    order[counts[e - e0] + rank] = p;
   }
-  if (experts == 0 && threadIdx.x == 0) *num_slots = 0;
 }
 
 template <bool kNvfp4, int kRows, int kCols>
@@ -197,6 +218,86 @@ __global__ void __launch_bounds__(kMoeThreads) moe_gemm_kernel(
   }
 }
 
+__global__ void __launch_bounds__(256) moe_route_kernel(const float *logits, int experts, int k, int renorm,
+                                                       int32_t *ids, float *weights) {
+  __shared__ float vals[kMoeMaxExperts];
+  __shared__ float red_v[8];
+  __shared__ int red_i[8];
+  __shared__ int picked[16];
+  const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const float *row = logits + static_cast<int64_t>(t) * experts;
+  float mx = -INFINITY;
+  for (int e = tid; e < experts; e += blockDim.x) {
+    vals[e] = row[e];
+    mx = fmaxf(mx, vals[e]);
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  if (lane == 0) red_v[warp] = mx;
+  __syncthreads();
+  mx = red_v[0];
+  for (int w = 1; w < 8; ++w) mx = fmaxf(mx, red_v[w]);
+  __syncthreads();
+  float sum = 0.0f;
+  if (!renorm) {
+    for (int e = tid; e < experts; e += blockDim.x) sum += expf(vals[e] - mx);
+    sum = warp_sum(sum);
+    if (lane == 0) red_v[warp] = sum;
+    __syncthreads();
+    sum = 0.0f;
+    for (int w = 0; w < 8; ++w) sum += red_v[w];
+    __syncthreads();
+  }
+  for (int j = 0; j < k; ++j) {
+    float best = -INFINITY;
+    int bi = experts;
+    for (int e = tid; e < experts; e += blockDim.x) {
+      const float v = vals[e];
+      if (v > best || (v == best && e < bi)) {
+        best = v;
+        bi = e;
+      }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+      const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+      if (ov > best || (ov == best && oi < bi)) {
+        best = ov;
+        bi = oi;
+      }
+    }
+    if (lane == 0) {
+      red_v[warp] = best;
+      red_i[warp] = bi;
+    }
+    __syncthreads();
+    if (tid == 0) {
+      float bv = red_v[0];
+      int bx = red_i[0];
+      for (int w = 1; w < 8; ++w)
+        if (red_v[w] > bv || (red_v[w] == bv && red_i[w] < bx)) {
+          bv = red_v[w];
+          bx = red_i[w];
+        }
+      picked[j] = bx;
+      vals[bx] = -INFINITY;
+      ids[static_cast<int64_t>(t) * k + j] = bx;
+      weights[static_cast<int64_t>(t) * k + j] = bv;
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float total = 0.0f;
+    for (int j = 0; j < k; ++j) total += expf(weights[static_cast<int64_t>(t) * k + j] - mx);
+    const float denom = renorm ? total : sum;
+    for (int j = 0; j < k; ++j) {
+      float *w = weights + static_cast<int64_t>(t) * k + j;
+      *w = expf(*w - mx) / denom;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace seventy
 
@@ -205,7 +306,7 @@ SEVENTY_API int seventy_moe_plan(const int32_t *ids, int pairs, int e0, int e1, 
                                  int32_t *num_slots, cudaStream_t stream) {
   using namespace seventy;
   if (ids == nullptr || order == nullptr || slot_expert == nullptr || slot_start == nullptr || slot_count == nullptr ||
-      num_slots == nullptr || pairs < 0 || e1 < e0 || e1 - e0 > kMoeMaxExperts || per < 1 || per > kMoeMaxRows ||
+      num_slots == nullptr || pairs < 0 || pairs > kMoeMaxPairs || e1 < e0 || e1 - e0 > kMoeMaxExperts || per < 1 || per > kMoeMaxRows ||
       max_slots < 1)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   moe_plan_kernel<<<1, 1024, 0, stream>>>(ids, pairs, e0, e1, per, max_slots, order, slot_expert, slot_start,
@@ -249,5 +350,16 @@ SEVENTY_API int seventy_moe_gemm(void *out, const void *x, int row_div, const vo
   }
 #undef SEVENTY_MOE_COLS
 #undef SEVENTY_MOE_LAUNCH
+  return launch_status();
+}
+
+SEVENTY_API int seventy_moe_route(const float *logits, int tokens, int experts, int k, int renorm, int32_t *ids,
+                                  float *weights, cudaStream_t stream) {
+  using namespace seventy;
+  if (logits == nullptr || ids == nullptr || weights == nullptr || tokens < 0 || experts < 1 ||
+      experts > kMoeMaxExperts || k < 1 || k > 16 || k > experts)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (tokens == 0) return SEVENTY_OK;
+  moe_route_kernel<<<tokens, 256, 0, stream>>>(logits, experts, k, renorm, ids, weights);
   return launch_status();
 }
