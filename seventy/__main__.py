@@ -142,6 +142,7 @@ def cmd_engine(args: argparse.Namespace) -> int:
         model=model, max_num_seqs=args.max_num_seqs,
         max_model_len=min(args.max_model_len or cfg.text.max_position_embeddings, cfg.text.max_position_embeddings),
         gpu_memory_utilization=args.gpu_memory_utilization, prefill_budget=args.prefill_budget,
+        activation_reserve_gib=args.activation_reserve,
         kv_dtype=args.kv_cache_dtype, tensor_parallel=tp, cuda_graphs=not args.no_cuda_graphs,
         draft_model=draft_model, mtp_tokens=args.mtp_tokens, prefix_cache=not args.no_prefix_cache,
         cache_entries=args.cache_entries,
@@ -191,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
     eng.add_argument("--max-num-seqs", type=int, default=8)
     eng.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     eng.add_argument("--prefill-budget", type=int, default=8192, help="prompt tokens per engine step")
+    eng.add_argument("--activation-reserve", type=float, default=3.0,
+                     help="GiB of each GPU kept for activations and CUDA graphs (less with a smaller prefill budget)")
     eng.add_argument("--kv-cache-dtype", choices=("int8", "fp16"), default="int8")
     eng.add_argument("--no-cuda-graphs", action="store_true")
     eng.add_argument("--no-prefix-cache", action="store_true")

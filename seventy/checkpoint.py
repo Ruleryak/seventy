@@ -156,6 +156,24 @@ class Checkpoint:
         r0, r1 = rows if rows is not None else (0, scale.numel())
         return weight, scale[r0:r1].clone()
 
+    def mxfp8_rows(self, module: str, rows: tuple[int, int] | None = None,
+                   cols: tuple[int, int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """An "mxfp8" module as FP8 E4M3 with one scale per row: (E4M3 bytes uint8, FP32 row scale = the row's
+        largest block scale). Each block's values move by its exponent below the largest, which rounds the smallest
+        values of the lower blocks to E4M3 subnormals: on Flash-Next's weights 0.01 to 0.02 % of the values change,
+        and the weights move by 3e-7 to 6e-7 relative."""
+        weight = self.dense_part(f"{module}.weight", rows=rows, cols=cols).view(torch.float8_e4m3fn).float()
+        scale = self.tensor(f"{module}.weight_scale").view(torch.uint8)
+        r0, r1 = rows if rows is not None else (0, scale.shape[0])
+        c0, c1 = cols if cols is not None else (0, 32 * scale.shape[1])
+        if c0 % 32 or c1 % 32:
+            raise ValueError(f"column slice [{c0}, {c1}) of {module} is not aligned to MXFP8 blocks of 32")
+        e = scale[r0:r1, c0 // 32 : c1 // 32].float() - 127.0
+        top = e.amax(dim=1, keepdim=True)
+        n, k = weight.shape
+        shifted = (weight.view(n, -1, 32) * torch.exp2(e - top)[..., None]).view(n, k)
+        return shifted.to(torch.float8_e4m3fn).view(torch.uint8), torch.exp2(top.reshape(-1))
+
     def linear_part(self, module: str, rows: tuple[int, int] | None = None,
                     cols: tuple[int, int] | None = None) -> torch.Tensor:
         """Rows and columns [start, stop) of a linear module's weight that is not NVFP4: dense as stored, or FP8 and

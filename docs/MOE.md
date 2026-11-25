@@ -52,11 +52,21 @@ Other Flash-Next checkpoints that were compared:
 | `nvidia/Qwen3.6-35B-A3B-NVFP4` | 4 | MTP | 3,516,528 | pass | 168 tok/s |
 | `Qwen/Qwen3.6-35B-A3B` (BF16) | 3 | none | 408,816 | pass (lowercase image text) | 95 tok/s |
 | `Qwen/Qwen3.6-35B-A3B` (BF16) | 4 | none | 1,614,544 | pass (lowercase image text) | 102 tok/s |
-| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | none | 408,048 | pass, needles at 8K and 30K (lowercase image text); a 250K-token needle passes | 47.7 tok/s |
-| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | none | 47,904 (2 streams, `--gpu-memory-utilization 0.97`) | pass, needles at 8K and 30K (lowercase image text) | 45.5 tok/s |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | none | 490,128 | pass, needles at 8K and 30K (lowercase image text); a 250K-token needle passes (max-model-len 262144) | 50.9 tok/s |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | none | 125,712 (4 streams, `--gpu-memory-utilization 0.97`) | pass (lowercase image text) | 48.8 tok/s |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | none | 262,144 (1 stream, no prefix cache, 0.97, `--prefill-budget 2048 --activation-reserve 1.5`) | pass, a 250K-token needle passes | 49.2 tok/s |
 
-Flash-Next with 8 identical requests at the same time: 182 tok/s in total on 4 GPUs. With the default settings,
-the weights and the activation reserve do not fit on three 32 GB GPUs.
+Flash-Next with 8 identical requests at the same time: 192 tok/s in total on 4 GPUs, all 8 texts the same. With
+the default settings, the weights and the activation reserve take 0.3 GiB more than three 32 GB GPUs have. Prefill
+of a 250K-token prompt took 307 s on 4 GPUs and 390 s on 3 GPUs (the MoE prefill runs one product per expert).
+
+The MXFP8 weights (attention, Gated DeltaNet and shared experts) are kept as FP8 with one scale per row
+(`Checkpoint.mxfp8_rows`): each 32-value block moves by its scale's exponent below the row's largest, which rounds
+0.01 to 0.02 % of the values (the smallest) to E4M3 subnormals and moves the weights by 3e-7 to 6e-7 relative.
+`SEVENTY_MXFP8_ROWS=0` keeps them in FP16 instead (exact, twice the memory).
+
+The engine option `--activation-reserve` (GiB, default 3) sets the memory each GPU keeps for activations and CUDA
+graphs; with a smaller prefill budget, less is enough.
 
 The smoke checks: greedy and sampled answers, needles at 8K and 30K or 100K tokens, an image, 8 identical greedy
 requests at the same time, one stream of 512 tokens.
@@ -70,8 +80,6 @@ requests at the same time, one stream of 512 tokens.
 
 ## Not done
 
-- Flash-Next: its MTP layer and its DFlash2 drafter; MXFP8 GEMMs (the attention, Gated DeltaNet and shared-expert
-  weights are FP16 on the GPU now, twice their checkpoint size), which would also leave room for a larger KV cache
-  on 3 GPUs; faster prefill (the QSA scores run row by row).
+- Flash-Next: its MTP layer and its DFlash2 drafter; faster prefill (grouped expert GEMMs for long chunks).
 - Faster MoE decode: the shared expert in the grouped GEMM, fewer small kernels per layer, MXFP8 GEMMs.
 - The panel's checks for MoE checkpoints (sizes of the expert weights per GPU).

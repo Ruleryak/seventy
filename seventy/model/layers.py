@@ -17,6 +17,7 @@ from ..upload import to_device
 
 SMALL_BATCH = 64
 FP8_LINEAR = os.environ.get("SEVENTY_FP8_LINEAR", "1") != "0"
+MXFP8_ROWS = os.environ.get("SEVENTY_MXFP8_ROWS", "1") != "0"
 
 
 @dataclass(frozen=True)
@@ -81,21 +82,23 @@ class Linear:
                              else sum(p.shape[0] for p in self.parts))
 
     def _fp8(self, ckpt: Checkpoint, sources: list[Source], device, cols) -> bool:
-        """Keep FP8 modules (one scale per tensor or per row) as FP8 for the FP8 GEMM: the leading sources that are
-        FP8 form one weight, and dense sources after them a small FP16 tail (in the Gated DeltaNet projection,
+        """Keep FP8 modules (one scale per tensor or per row; MXFP8 modules with one scale per row, see
+        Checkpoint.mxfp8_rows) as FP8 for the FP8 GEMM: the leading sources that are FP8 form one weight, and dense sources after them a small FP16 tail (in the Gated DeltaNet projection,
         the gate rows b and a). False, and nothing kept, when no leading source is FP8 or k is not a multiple
         of 64."""
+        fp8 = ("fp8", "mxfp8") if MXFP8_ROWS else ("fp8",)
         kinds = [ckpt.kind(s.module) for s in sources]
         lead = 0
-        while lead < len(kinds) and kinds[lead] == "fp8":
+        while lead < len(kinds) and kinds[lead] in fp8:
             lead += 1
-        if not lead or any(k == "fp8" for k in kinds[lead:]):
+        if not lead or any(k in fp8 for k in kinds[lead:]):
             return False
         values, scales = [], []
-        for s in sources[:lead]:
+        for s, kind in zip(sources[:lead], kinds):
             n = ckpt.out_rows(s.module)
             for r in s.rows or ((0, n),):
-                v, sc = ckpt.fp8_part(s.module, rows=r, cols=cols)
+                part = ckpt.fp8_part if kind == "fp8" else ckpt.mxfp8_rows
+                v, sc = part(s.module, rows=r, cols=cols)
                 values.append(v)
                 scales.append(sc)
         if values[0].shape[1] % 64:
