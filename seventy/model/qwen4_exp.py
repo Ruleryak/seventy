@@ -228,6 +228,12 @@ class PLE:
         return out
 
 
+def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMS norm in FP32 of the last dimension, times weight (already 1 + w)."""
+    f = x.float()
+    return f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + eps) * weight
+
+
 class Indexer:
     """The Qwen Sparse Attention indexer of one attention layer: indexer_heads query heads and one key head of
     indexer_head_dim, from one projection of the block input. Raw keys go into the cache (cache.idx_k). A block of
@@ -248,7 +254,7 @@ class Indexer:
         qk = F.linear(x.float(), self.proj.dense)
         q = qk[:, : self.heads * self.dim].view(-1, self.heads, self.dim)
         k = qk[:, self.heads * self.dim :]
-        q = ops.rms_norm(q.reshape(-1, self.dim), self.q_norm, self.eps)[0].view(-1, self.heads, self.dim)
+        q = _rms(q.reshape(-1, self.dim), self.q_norm, self.eps).view(-1, self.heads, self.dim)
         return ops.apply_rotary(q, cos, sin), k
 
     def selected(self, q: torch.Tensor, keys: torch.Tensor, cos_all, sin_all, first: int) -> torch.Tensor:
@@ -269,7 +275,7 @@ class Indexer:
             return out
         blocks = ctx // c
         pooled = keys[: blocks * c].float().view(blocks, c, self.dim).mean(1)
-        pooled = ops.rms_norm(pooled, self.k_norm, self.eps)[0]
+        pooled = _rms(pooled, self.k_norm, self.eps)
         starts = torch.arange(blocks, device=dev) * c
         pooled = ops.apply_rotary(pooled[:, None], cos_all[starts], sin_all[starts])[:, 0]
         rows = torch.nonzero(long).reshape(-1)
