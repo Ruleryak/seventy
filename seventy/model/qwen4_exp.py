@@ -60,9 +60,41 @@ class HyperConnection:
         self.up = Linear(ckpt, [Source(f"{p}.input_mix_weight_up")], torch.float32, device, keep_dense=True)
         self.inject = (Linear(ckpt, [Source(f"{p}.block_inject_weight")], torch.float32, device, keep_dense=True)
                        if combine else None)
+        self.rank = self.down.dense.shape[0]
+        self.packed = None
+        if torch.device(device).type == "cuda" and dtype == torch.float16:
+            from ..ops.kernels import DenseWeight
+
+            first = torch.cat([self.down.dense] + ([self.inject.dense] if combine else []))
+            self.packed = (DenseWeight(first.half()), DenseWeight(self.up.dense.half()))
+            self.down.dense = self.up.dense = None
+            if self.inject is not None:
+                self.inject.dense = None
+            torch.cuda.empty_cache()
 
     def __call__(self, h: torch.Tensor):
-        """(block input [T, hidden] FP32, injection weights [T, hc] or None) of the streams h [T, hc x hidden] FP32."""
+        """(block input [T, hidden] (FP16 on the GPU, FP32 on the CPU), injection weights [T, hc] FP32 or None) of the
+        streams h [T, hc x hidden] FP32. On the GPU: seventy_hc_* kernels around two dense GEMMs."""
+        if self.packed is not None and 0 < h.shape[0] <= 64:
+            from ..ops import kernels
+
+            first, up = self.packed
+            n = kernels.hc_norm(h, self.norm, self.hc, self.eps)
+            d = kernels.dense_gemm(n, first)
+            s, inject = kernels.hc_act(d, self.rank, self.hc, self.inject is not None)
+            u = kernels.dense_gemm(s, up)
+            return kernels.hc_combine(u, n, self.hc), inject
+        if self.packed is not None:
+            from ..ops.kernels import dense_unpack
+
+            first, up = self.packed
+            n = grouped_rms_norm(h, self.norm, self.hidden, self.eps)
+            w_first = dense_unpack(first).float()
+            d = F.linear(n, w_first)
+            mix = torch.sigmoid(F.linear(F.silu(d[:, : self.rank] / self.hc), dense_unpack(up).float()))
+            x = (mix * n).view(-1, self.hc, self.hidden).mean(dim=1)
+            inject = 2.0 * torch.sigmoid(d[:, self.rank :] / self.hc) if self.inject is not None else None
+            return x, inject
         n = grouped_rms_norm(h, self.norm, self.hidden, self.eps)
         mix = torch.sigmoid(F.linear(F.silu(F.linear(n, self.down.dense) / self.hc), self.up.dense))
         x = (mix * n).view(-1, self.hc, self.hidden).mean(dim=1)
@@ -291,14 +323,23 @@ class Indexer:
 
 
 class ExpAttention:
-    """Gated full attention with the QSA indexer: each query attends to the tokens Indexer.selected gives (all
-    visible tokens up to the budget), in chunks of QUERY_CHUNK queries over the gathered keys and values. A PyTorch
-    path on the CPU and the GPU; the QSA kernels are not written yet."""
+    """Gated full attention with the QSA indexer. While every sequence of a step fits in the budget (dense()), QSA is
+    causal attention, and the GPU runs the attention kernels of AttentionLayer. Otherwise each query attends to the
+    tokens Indexer.selected gives, in chunks of QUERY_CHUNK queries over the gathered keys and values (PyTorch, on
+    the CPU and the GPU; the QSA kernels are not written yet). The indexer keys go into the cache in both cases."""
 
     def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense):
         self.attn = AttentionLayer(cfg, ckpt, p, par, dtype, device, keep_dense)
         self.indexer = Indexer(cfg, ckpt, f"{p}.indexer", device)
         self.cfg = cfg
+
+    def dense(self, step: StepInput) -> bool:
+        """Whether every query of the step attends to all its visible tokens (each sequence has no more than
+        indexer_budget tokens in whole blocks), so that QSA is plain causal attention."""
+        e = self.cfg.exp
+        top = e.indexer_budget // e.indexer_compress
+        return all((step.context_lens[b] + step.query_start[b + 1] - step.query_start[b]) // e.indexer_compress <= top
+                   for b in range(len(step.context_lens)))
 
     def __call__(self, x, step: StepInput, cache: ModelCache, layer: int, rope, slots, model) -> torch.Tensor:
         a = self.attn
@@ -306,6 +347,8 @@ class ExpAttention:
         cos, sin = rope
         iq, ik = self.indexer.queries_and_keys(x, cos, sin)
         cache.idx_k[layer].view(-1, cache.idx_k[layer].shape[-1])[slots] = ik.to(cache.idx_k[layer].dtype)
+        if x.is_cuda and d == 256 and self.dense(step):
+            return a(x, step, cache, layer, None, None)
         qkv = a.qkv(x)
         qg = qkv[:, : 2 * d * a.heads].view(t, a.heads, 2, d)
         q = qg[:, :, 0].contiguous()
@@ -332,17 +375,17 @@ class ExpAttention:
             flat = table[pos // bs].long() * bs + pos % bs
             keys_i = cache.idx_k[layer].view(-1, cache.idx_k[layer].shape[-1])[flat]
             cos_all, sin_all = model.position_rope(cache, step, b, ctx)
-            kk = _read_cache(cache.k[layer], ks, flat).float()
-            vv = _read_cache(cache.v[layer], vs, flat).float()
             for c0 in range(q0, q1, QUERY_CHUNK):
                 c1 = min(q1, c0 + QUERY_CHUNK)
                 sel = self.indexer.selected(iq[c0:c1], keys_i, cos_all, sin_all, before + (c0 - q0))
                 valid = sel >= 0
-                g = sel.clamp(min=0).long()
+                rows = flat[sel.clamp(min=0).long()].reshape(-1)
+                kk = _read_cache(cache.k[layer], ks, rows).float().view(c1 - c0, -1, a.kv_heads, d)
+                vv = _read_cache(cache.v[layer], vs, rows).float().view(c1 - c0, -1, a.kv_heads, d)
                 qg = q[c0:c1].float().view(c1 - c0, a.kv_heads, group, d)
-                scores = torch.einsum("qgrd,qkgd->qgrk", qg, kk[g]) * a.scale
+                scores = torch.einsum("qgrd,qkgd->qgrk", qg, kk) * a.scale
                 scores = scores.masked_fill(~valid[:, None, None, :], float("-inf"))
-                o = torch.einsum("qgrk,qkgd->qgrd", torch.softmax(scores, dim=-1), vv[g])
+                o = torch.einsum("qgrk,qkgd->qgrd", torch.softmax(scores, dim=-1), vv)
                 out[c0:c1] = o.reshape(c1 - c0, a.heads, d).to(x.dtype)
         o = ops.sigmoid_gate(out.reshape(t, a.heads * d), gate)
         return a.o_proj(a._owned(o))
@@ -410,6 +453,14 @@ class Qwen4ExpTextModel(Qwen35TextModel):
             self.lm_head = None
             torch.cuda.empty_cache()
 
+    def _inject(self, h: torch.Tensor, y: torch.Tensor, inject: torch.Tensor) -> torch.Tensor:
+        """h + the block output y added to every stream with its injection weight."""
+        if h.is_cuda and y.dtype == torch.float16:
+            from ..ops import kernels
+
+            return kernels.hc_inject(h, y, inject, self.cfg.exp.hc_count)
+        return h + (y.float()[:, None, :] * inject[:, :, None]).reshape(h.shape)
+
     def position_rope(self, cache: ModelCache, step: StepInput, b: int, ctx: int):
         """cos and sin of every position 0 .. ctx - 1 of sequence b, from the positions the cache keeps per token."""
         bs = step.block_size
@@ -443,11 +494,9 @@ class Qwen4ExpTextModel(Qwen35TextModel):
                 y = layer.mixer(xin, step, cache, i, rope, slots, self)
             else:
                 y = layer.mixer(xin, step, cache, i, rope, slots)
-            y = self.par.all_reduce(y).float()
-            h = h + (y[:, None, :] * inject[:, :, None]).reshape(h.shape)
+            h = self._inject(h, self.par.all_reduce(y), inject)
             x, inject = layer.mlp_hc(h)
-            y = self.par.all_reduce(layer.mlp(x.to(self.dtype))).float()
-            h = h + (y[:, None, :] * inject[:, :, None]).reshape(h.shape)
+            h = self._inject(h, self.par.all_reduce(layer.mlp(x.to(self.dtype))), inject)
             if i in capture:
                 captured[i] = h.clone()
         x, _ = self.mixer(h)

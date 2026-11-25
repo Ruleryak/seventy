@@ -6,10 +6,23 @@ import json
 from pathlib import Path
 
 import jinja2
+import jinja2.ext
 
 
 class TemplateError(ValueError):
     pass
+
+
+class GenerationBlocks(jinja2.ext.Extension):
+    """{% generation %} ... {% endgeneration %} (transformers marks the assistant's tokens for training masks with
+    it): rendered as its content."""
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return jinja2.nodes.Scope(body, lineno=lineno)
 
 
 def _raise(message: str):
@@ -64,7 +77,8 @@ class ChatTemplate:
             source = json.loads((path / "tokenizer_config.json").read_text()).get("chat_template")
         if not source:
             raise FileNotFoundError(f"no chat template in {path}")
-        env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True,
+                                 extensions=["jinja2.ext.loopcontrols", GenerationBlocks])
         env.filters["tojson"] = _tojson
         env.globals["raise_exception"] = _raise
         self.template = env.from_string(source)

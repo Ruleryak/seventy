@@ -933,3 +933,47 @@ def moe_gemm(x: torch.Tensor, row_div: int, weight: torch.Tensor, scales: torch.
     check("moe_gemm", code)
     return out
 
+
+def hc_norm(h: torch.Tensor, weight: torch.Tensor, hc: int, eps: float) -> torch.Tensor:
+    """RMS norm of each of the hc streams of h FP32 [rows, hc * hidden], times weight FP32 [hc * hidden]: FP16."""
+    _expect(h, "h", torch.float32)
+    h = h.contiguous()
+    rows = h.shape[0]
+    out = torch.empty(h.shape, dtype=torch.float16, device=h.device)
+    check("hc_norm", lib().seventy_hc_norm(out.data_ptr(), h.data_ptr(), weight.data_ptr(), rows, hc,
+                                           h.shape[1] // hc, eps, _stream(h)))
+    return out
+
+
+def hc_act(d: torch.Tensor, rank: int, hc: int, inject: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """(silu(d[:, :rank] / hc) FP16, 2 sigmoid(d[:, rank:rank + hc] / hc) FP32 or None) of d FP32 [rows, >= rank]."""
+    _expect(d, "d", torch.float32)
+    d = d.contiguous()
+    rows = d.shape[0]
+    s = torch.empty(rows, rank, dtype=torch.float16, device=d.device)
+    w = torch.empty(rows, hc, dtype=torch.float32, device=d.device) if inject else None
+    check("hc_act", lib().seventy_hc_act(s.data_ptr(), w.data_ptr() if w is not None else None, d.data_ptr(), rows,
+                                         rank, hc, d.shape[1], _stream(d)))
+    return s, w
+
+
+def hc_combine(u: torch.Tensor, n: torch.Tensor, hc: int) -> torch.Tensor:
+    """mean over streams of sigmoid(u) * n (u FP32, n FP16 [rows, hc * hidden]): FP16 [rows, hidden]."""
+    _expect(u, "u", torch.float32)
+    _expect(n, "n", torch.float16)
+    rows, width = n.shape
+    x = torch.empty(rows, width // hc, dtype=torch.float16, device=n.device)
+    check("hc_combine", lib().seventy_hc_combine(x.data_ptr(), u.contiguous().data_ptr(), n.contiguous().data_ptr(),
+                                                 rows, hc, width // hc, _stream(n)))
+    return x
+
+
+def hc_inject(h: torch.Tensor, y: torch.Tensor, w: torch.Tensor, hc: int) -> torch.Tensor:
+    """h FP32 [rows, hc * hidden] += y FP16 [rows, hidden] times w FP32 [rows, hc] per stream, in place."""
+    _expect(h, "h", torch.float32)
+    _expect(y, "y", torch.float16)
+    rows = h.shape[0]
+    check("hc_inject", lib().seventy_hc_inject(h.data_ptr(), y.contiguous().data_ptr(), w.contiguous().data_ptr(), rows,
+                                               hc, h.shape[1] // hc, _stream(h)))
+    return h
+
