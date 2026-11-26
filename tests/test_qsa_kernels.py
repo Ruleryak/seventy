@@ -317,3 +317,21 @@ def test_split_kv_halves_merge_to_the_whole(int8, rows):
         assert torch.equal(kp, kc[:, p::2]) and torch.equal(vp, vc[:, p::2])
         if int8:
             assert torch.equal(ksp, kcs[:, p::2]) and torch.equal(vsp, vcs[:, p::2])
+
+
+@pytest.mark.parametrize("rows,nb,heads", [(1, 33, 4), (37, 1000, 4), (256, 4097, 4), (64, 64, 2)])
+def test_prefill_scores_match_the_per_head_products(rows, nb, heads):
+    """seventy_qsa_prefill_scores (one tensor-core kernel) against sum over heads of relu(q_h . key) / sqrt(128)."""
+    from seventy.ops._lib import check, lib
+
+    g = torch.Generator().manual_seed(rows + nb)
+    q = torch.randn(rows, heads, 128, generator=g).half().cuda()
+    keys = torch.randn(nb, 128, generator=g).half().cuda()
+    ld = nb + 3
+    got = torch.full((rows, ld), -7.0, device="cuda")
+    check("qsa_prefill_scores", lib().seventy_qsa_prefill_scores(got.data_ptr(), ld, q.data_ptr(), heads,
+                                                                 keys.data_ptr(), nb, rows, 1 / math.sqrt(128),
+                                                                 torch.cuda.current_stream().cuda_stream))
+    want = sum(torch.relu(q[:, h].float() @ keys.float().T) for h in range(heads)) / math.sqrt(128)
+    torch.testing.assert_close(got[:, :nb], want, rtol=1e-3, atol=1e-3)
+    assert bool((got[:, nb:] == -7.0).all())

@@ -56,6 +56,12 @@ Other Flash-Next checkpoints that were compared:
     Decode selects with a score kernel and a top-k kernel; prefill scores the blocks with cuBLAS. The sparse
     attention kernel reads each query's selected positions in chunks from the paged cache.
   - Speculative verify: the Gated DeltaNet and PLE states wait for the accepted rows (`commit`).
+  - Prefill on several GPUs (steps of at least 256 rows, `SEVENTY_SP_ROWS`) splits the hyper-connection streams by
+    rows over the GPUs (sequence parallel, `_forward_sp`): each GPU runs the hyper-connections, injections and PLE
+    gates of its quarter of the rows, which every GPU ran for all rows before (about a third of a prefill step). A
+    block's input is all-gathered and its partial sums reduce-scattered (the same NCCL traffic as the all-reduce).
+    Prefill block scores for the selection come from one tensor-core kernel (`seventy_qsa_prefill_scores`, 7 times
+    faster than one cuBLAS product per head and the relu and adds).
 - YaRN (`seventy/rope.py`): checkpoints whose config has YaRN rope parameters load with their longer context, and
   `--yarn-factor` applies YaRN to a checkpoint without it. Flash-Next is trained for 262,144 tokens; its model card
   gives up to 1,000,000 with YaRN. For example:
@@ -89,8 +95,9 @@ case-sensitive, and some runs read the image text correctly in lowercase.
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | `--gpu-memory-utilization 0.97` | 69,392 | 65 tok/s | 362 tok/s |
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | `--draft-model mtp --expert-offload 0.25` | 371,184 | 87 tok/s | 336 tok/s |
 
-Prefill: a 100K-token prompt takes 14 s with the 35B-A3B NVFP4 on 4 GPUs, 22 s with Flash-Next on 4 GPUs (MTP; 23 s
-with `--expert-offload 0.25`) and 28 s on 3 GPUs (MTP, `--expert-offload 0.25`). With `--yarn-factor 2 --max-model-len 524288`, a 500K-token needle passes with Flash-Next on 4 GPUs (238 s,
+Prefill: a 100K-token prompt takes 14 s with the 35B-A3B NVFP4 on 4 GPUs and 15.6 s with Flash-Next on 4 GPUs (MTP;
+22.3 s before the sequence-parallel streams and the score kernel; 23 s with `--expert-offload 0.25` before them) and
+28 s on 3 GPUs (MTP, `--expert-offload 0.25`, before them). With `--yarn-factor 2 --max-model-len 524288`, a 500K-token needle passes with Flash-Next on 4 GPUs (238 s,
 before the tensor-core QSA attention kernel). On three 32 GB GPUs, Flash-Next with the default settings needs 0.4
 GiB more than the GPUs have; `--expert-offload 0.25` makes room for MTP and 371K KV tokens.
 
@@ -156,6 +163,8 @@ graphs; with a smaller prefill budget, less is enough.
   `tests/test_fp8_linear.py`: the kernels, the formats and YaRN against PyTorch and transformers references.
 - `tests/test_qsa_kernels.py` and `tests/test_allreduce.py`: the two halves of a split KV head merge to the attention
   over the whole cache, on one GPU and between peer GPUs (2 and 4 GPUs).
+- `tests/test_flash_next_sp.py`: the sequence-parallel prefill on 4 GPUs against the replicated path (logits of the
+  prefill and of the decode steps after it).
 - `tests/test_moe_kernels.py` and `tests/test_expert_profile.py`: offloaded experts through the cache slots and the
   prefill banks against the per-expert loop, the cache's pointers and slot contents, the use counts, and the
   profile files.

@@ -87,6 +87,7 @@ SIGNATURES = {
                                 _I32, _I32, _I32, _F32, _P]),
     "seventy_qsa_index_prep": (_I32, [_P, _P, _P, _I64, _P, _P, _P, _P, _I32, _I32, _I32, _I32, _F32, _P]),
     "seventy_qsa_select_scores": (_I32, [_P, _I32, _P, _I32, _P, _P, _I32, _I32, _I32, _I32, _I32, _P]),
+    "seventy_qsa_prefill_scores": (_I32, [_P, _I64, _P, _I32, _P, _I32, _I32, _F32, _P]),
     "seventy_qsa_select": (_I32, [_P, _I32, _P, _I32, _P, _I32, _P, _P, _I32, _P, _P, _I32, _I32, _I32, _I32, _I32,
                                   _I32, _P]),
     "seventy_qsa_attention": (_I32, [_P, _P, _P, _P, _P, _P, _P, _P, _I32, _P, _I32, _P, _I32, _I32, _I32, _I32,

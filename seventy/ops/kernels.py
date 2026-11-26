@@ -1135,15 +1135,22 @@ def qsa_index_prep(qk: torch.Tensor, q_norm: torch.Tensor, cos: torch.Tensor, si
 
 def qsa_select_prefill(q: torch.Tensor, keys: torch.Tensor, query_start_t: torch.Tensor, context_lens_t: torch.Tensor,
                        compress: int, top: int, row0: int) -> torch.Tensor:
-    """qsa_select for the rows row0 .. row0 + rows - 1 of one sequence (prefill), with the scores from cuBLAS:
-    keys FP16 [blocks, dim] are the sequence's pooled block keys (all blocks the rows can see), and each block's
-    score is sum over heads of relu(q_h . key) / sqrt(dim) from FP16 tensor-core products with FP32 sums."""
+    """qsa_select for the rows row0 .. row0 + rows - 1 of one sequence (prefill), with the scores of the tensor-core
+    score kernel (seventy_qsa_prefill_scores; with more than 4 heads or another dim, cuBLAS per head): keys FP16
+    [blocks, dim] are the sequence's pooled block keys (all blocks the rows can see), and each block's score is sum
+    over heads of relu(q_h . key) / sqrt(dim) from FP16 tensor-core products with FP32 sums."""
     _expect(q, "q", torch.float16)
     rows, heads, dim = q.shape
     width = top * compress + compress - 1
     sel = torch.empty(rows, width, dtype=torch.int32, device=q.device)
     nb = keys.shape[0]
-    if nb > top:
+    if nb > top and heads <= 4 and dim == 128:
+        scores = torch.empty(rows, nb, dtype=torch.float32, device=q.device)
+        check("qsa_prefill_scores", lib().seventy_qsa_prefill_scores(
+            scores.data_ptr(), nb, q.contiguous().data_ptr(), heads, keys.contiguous().data_ptr(), nb, rows,
+            1.0 / math.sqrt(dim), _stream(q)))
+        ld = nb
+    elif nb > top:
         scores = torch.zeros(rows, nb, dtype=torch.float32, device=q.device)
         for h in range(heads):
             scores.add_(torch.relu(torch.mm(q[:, h], keys.T, out_dtype=torch.float32)))

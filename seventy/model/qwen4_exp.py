@@ -23,6 +23,7 @@ after its all-reduce, so each rank keeps the full residual streams.
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 import torch
@@ -68,6 +69,9 @@ class HyperConnection:
             from ..ops.kernels import DenseWeight
 
             first = torch.cat([self.down.dense] + ([self.inject.dense] if combine else []))
+            pad = -first.shape[0] % 8
+            if pad:
+                first = torch.cat((first, first.new_zeros(pad, first.shape[1])))
             self.packed = (DenseWeight(first.half()), DenseWeight(self.up.dense.half()))
             self.down.dense = self.up.dense = None
             if self.inject is not None:
@@ -77,7 +81,8 @@ class HyperConnection:
     def __call__(self, h: torch.Tensor):
         """(block input [T, hidden] (FP16 on the GPU, FP32 on the CPU), injection weights [T, hc] FP32 or None) of the
         streams h [T, hc x hidden] FP32. On the GPU: seventy_hc_* kernels around two products with FP16 weights and
-        FP32 sums (the dense GEMM kernel up to 64 rows, else cuBLAS tensor cores)."""
+        FP32 sums (the dense GEMM kernel up to 64 rows, else cuBLAS tensor cores); the first product's weight (the
+        mix and injection rows) has zero rows up to a multiple of 8, so that cuBLAS takes its aligned kernels."""
         if self.packed is not None and 0 < h.shape[0] <= 64:
             from ..ops import kernels
 
@@ -238,7 +243,10 @@ class PLE:
         torch.cuda.empty_cache()
 
     def _gpu_call(self, h: torch.Tensor, step: StepInput, cache: ModelCache, index: int,
-                  par: Parallel | None, stash: list | None = None) -> torch.Tensor:
+                  par: Parallel | None, stash: list | None = None, shard=None) -> torch.Tensor:
+        """shard (sequence-parallel prefill): (r0, r1, gather) when h holds only the rows r0 .. r1 - 1 of this rank
+        (padded to its share), and gather all-gathers each rank's share of a tensor into all rows. The gates of the
+        rank's rows come from its streams and are gathered; the rest runs on all rows; returns the rank's rows."""
         from ..ops import kernels
 
         g = self.gpu
@@ -257,10 +265,18 @@ class PLE:
         key = grouped_rms_norm(g["key"](emb).float(), self.norm_key, self.hidden, self.eps)
         value = g["value"](emb).float()
         query = grouped_rms_norm(h, self.norm_query, self.hidden, self.eps)
-        gate = (key.view(-1, self.hc, self.hidden) * query.view(-1, self.hc, self.hidden)).sum(-1, keepdim=True)
-        gate = gate / math.sqrt(self.hidden)
+        rows = emb.shape[0]
+        if shard is not None:
+            r0, r1, gather = shard
+            k = torch.zeros(h.shape[0], key.shape[1], dtype=key.dtype, device=key.device)
+            k[: r1 - r0] = key[r0:r1]
+            key = k
+        gate = (key.view(-1, self.hc, self.hidden) * query.view(-1, self.hc, self.hidden)).sum(-1)
+        if shard is not None:
+            gate = gather(gate)
+        gate = gate[:, :, None] / math.sqrt(self.hidden)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-        gated = (torch.sigmoid(gate) * value[:, None, :]).reshape(h.shape[0], -1).contiguous()
+        gated = (torch.sigmoid(gate) * value[:, None, :]).reshape(rows, -1).contiguous()
         normed = grouped_rms_norm(gated, self.norm_conv, self.hidden, self.eps).contiguous()
         out = kernels.ple_conv(gated, normed, cache.ple_conv[index], self.conv, step.state_slots_t,
                                step.query_start_t, step.context_lens_t, self.taps, self.dilation)
@@ -270,6 +286,10 @@ class PLE:
         tok = cache.ple_tokens if self.last else cache.ple_tokens.clone()
         kernels.ple_state(tok, cache.ple_conv[index], step.token_ids, normed, step.state_slots_t,
                           step.query_start_t, step.context_lens_t, self.eos)
+        if shard is not None:
+            mine = torch.zeros_like(h)
+            mine[: shard[1] - shard[0]] = out[shard[0] : shard[1]]
+            return mine
         return out
 
     def ngram_ids(self, tokens: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
@@ -577,6 +597,9 @@ class ExpAttention:
 
 
 STREAMS = -2
+SP_ROWS = int(os.environ.get("SEVENTY_SP_ROWS", "256"))
+"""Prefill steps with at least this many rows on several GPUs split the streams by rows (_forward_sp); 0 turns it
+off (SEVENTY_SP_ROWS)."""
 QUERY_CHUNK = 64
 SELECT_ROWS = 256
 PREFILL_ROWS = 64
@@ -693,19 +716,22 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         x0 = self.embed_tokens(step.token_ids).float()
         for start, rows in step.embeds.items():
             x0[start : start + rows.shape[0]] = rows.float()
-        h = x0.repeat(1, e.hc_count)
-        if h.is_cuda:
+        if x0.is_cuda:
             pos = step.positions.to(torch.float32)[self.rope_axis].T
             angles = pos * self.inv_freq
             rope = (torch.cos(angles) * self.rope_scale, torch.sin(angles) * self.rope_scale)
         else:
             cos, sin = ops.rotary_cos_sin(step.positions, self.inv_freq, t.mrope_section)
             rope = (cos * self.rope_scale, sin * self.rope_scale)
-        if h.is_cuda:
+        if x0.is_cuda:
             slots = step.kv_slots_t.long()
         else:
             slots = ops.kv_slots(step.query_start, step.context_lens, step.block_tables, step.block_size)
         cache.positions.view(-1, 3)[slots] = step.positions.T.to(cache.positions.dtype)
+        if (x0.is_cuda and stash is None and self.par.size > 1 and 0 < SP_ROWS <= x0.shape[0]
+                and all(layer.ple is None or layer.ple.gpu is not None for layer in self.layers)):
+            return self._forward_sp(step, cache, capture, top, x0, rope, slots)
+        h = x0.repeat(1, e.hc_count)
         captured = {}
         if stash is not None and self.gdn_params is not None and GDN_COMMIT_LAYERS:
             stash["y_all"] = torch.empty(len(self.gdn), h.shape[0], self.gdn[0].in_proj.out_features,
@@ -733,6 +759,58 @@ class Qwen4ExpTextModel(Qwen35TextModel):
             captured[STREAMS] = h
         x, _ = self.mixer(h)
         x = x.to(self.dtype)
+        if FINAL in capture:
+            captured[FINAL] = x
+        if top:
+            return self.head_top(x[step.logit_rows], top), captured
+        return self.logits(x[step.logit_rows]), captured
+
+    def _forward_sp(self, step: StepInput, cache: ModelCache, capture: tuple[int, ...], top: int, x0: torch.Tensor,
+                    rope, slots):
+        """forward for a prefill step on several GPUs with the streams split by rows (sequence parallel): rank r
+        keeps the streams of rows r S .. (r + 1) S - 1 (S = ceil(rows / ranks); rows past the step are zeros) and runs
+        the hyper-connections, the injections and the PLE gates only for them, which every rank ran for all rows
+        before (about a third of a prefill step). Each block input is all-gathered for the block, and the block's
+        partial sums go back with a reduce-scatter instead of an all-reduce (the same NCCL traffic). The PLE layer
+        gathers its gates and runs the rest for all rows; captured streams are gathered."""
+        par, e = self.par, self.cfg.exp
+        rows = x0.shape[0]
+        share = -(-rows // par.size)
+        r0, r1 = min(rows, par.rank * share), min(rows, (par.rank + 1) * share)
+
+        def gather(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(share * par.size, *x.shape[1:], dtype=x.dtype, device=x.device)
+            torch.distributed.all_gather_into_tensor(out, x.contiguous())
+            return out[:rows]
+
+        def scatter(y: torch.Tensor) -> torch.Tensor:
+            if y.shape[0] != share * par.size:
+                y = torch.cat((y, y.new_zeros(share * par.size - y.shape[0], *y.shape[1:])))
+            out = torch.empty(share, *y.shape[1:], dtype=y.dtype, device=y.device)
+            torch.distributed.reduce_scatter_tensor(out, y.contiguous())
+            return out
+
+        h = torch.zeros(share, e.hc_count * x0.shape[1], dtype=torch.float32, device=x0.device)
+        h[: r1 - r0] = x0[r0:r1].repeat(1, e.hc_count)
+        captured = {}
+        for i, layer in enumerate(self.layers):
+            if layer.ple is not None:
+                h = h + layer.ple._gpu_call(h, step, cache, e.ple_layers.index(i), self.par, shard=(r0, r1, gather))
+            x, inject = layer.attn_hc(h)
+            xin = gather(x.to(self.dtype))
+            if layer.kind == "full_attention":
+                y = layer.mixer(xin, step, cache, i, rope, slots, self)
+            else:
+                y = layer.mixer(xin, step, cache, i, rope, slots)
+            h = self._inject(h, scatter(y), inject)
+            x, inject = layer.mlp_hc(h)
+            h = self._inject(h, scatter(layer.mlp(gather(x.to(self.dtype)))), inject)
+            if i in capture:
+                captured[i] = gather(h)
+        if STREAMS in capture:
+            captured[STREAMS] = gather(h)
+        x, _ = self.mixer(h)
+        x = gather(x.to(self.dtype))
         if FINAL in capture:
             captured[FINAL] = x
         if top:

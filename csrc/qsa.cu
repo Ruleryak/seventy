@@ -766,8 +766,121 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_mma_kernel(
   }
 }
 
+/*
+ * qsa_prefill_score_kernel: the block scores of qsa_score for prefill rows on the tensor cores: scores[r][j] =
+ * scale * sum over heads of relu(q[r][h] . keys[j]), FP16 products with FP32 sums, written once (it replaces one
+ * cuBLAS product per head and the relu and adds over the [rows, blocks] matrix). One block of 4 warps per 32 rows
+ * (warp w: rows 8 w .. 8 w + 7, one m-tile) and per range of key tiles; the rows' queries of all heads stay in shared
+ * memory (rows of 4 x 128 + 4 halves), each tile of 32 keys (rows of 132 halves) is loaded into registers while the
+ * block computes the one before. Per 4-dim step the key fragment serves every head (mma.m8n8k4: quad-pair p and
+ * index i take key 4 i + p, as in qsa_attention_mma_kernel); each head's 8 x 32 product goes through relu into the
+ * sum after its last step.
+ */
+constexpr int kScoreRows = 32;
+constexpr int kScoreKeys = 32;
+constexpr int kScoreHeads = 4;
+constexpr int kScoreQStride = kScoreHeads * kIdx + 4;
+constexpr int kScoreKStride = kIdx + 4;
+
+__global__ void __launch_bounds__(128) qsa_prefill_score_kernel(float *scores, int64_t ld, const half *q, int heads,
+                                                               const half *keys, int nb, int rows, float scale,
+                                                               int tiles_per_block) {
+  __shared__ __align__(16) half qs[kScoreRows][kScoreQStride];
+  __shared__ __align__(16) half ks[kScoreKeys][kScoreKStride];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int qp = (lane >> 2) & 3, idx = (lane & 3) + ((lane >> 4) << 2);
+  const int r0 = blockIdx.x * kScoreRows;
+  const int t0 = blockIdx.y * tiles_per_block;
+  const int t1 = min((nb + kScoreKeys - 1) / kScoreKeys, t0 + tiles_per_block);
+  if (t0 >= t1) return;
+  for (int e = tid; e < kScoreRows * kScoreHeads * (kIdx / 8); e += 128) {
+    const int r = e / (kScoreHeads * kIdx / 8), part = e % (kScoreHeads * kIdx / 8);
+    const int h = part / (kIdx / 8), d8 = part % (kIdx / 8);
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (r0 + r < rows && h < heads)
+      v = *reinterpret_cast<const uint4 *>(q + (static_cast<int64_t>(r0 + r) * heads + h) * kIdx + d8 * 8);
+    uint32_t *dst = reinterpret_cast<uint32_t *>(&qs[r][h * kIdx + d8 * 8]);
+    dst[0] = v.x;
+    dst[1] = v.y;
+    dst[2] = v.z;
+    dst[3] = v.w;
+  }
+  constexpr int kLoads = kScoreKeys * kIdx / 8 / 128;
+  uint4 kr[kLoads];
+  auto fetch = [&](int tile) {
+#pragma unroll
+    for (int i = 0; i < kLoads; ++i) {
+      const int e = tid + i * 128;
+      const int key = tile * kScoreKeys + e / (kIdx / 8);
+      kr[i] = key < nb ? *reinterpret_cast<const uint4 *>(keys + static_cast<int64_t>(key) * kIdx + (e % (kIdx / 8)) * 8)
+                       : make_uint4(0, 0, 0, 0);
+    }
+  };
+  fetch(t0);
+  for (int tile = t0; tile < t1; ++tile) {
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < kLoads; ++i) {
+      const int e = tid + i * 128;
+      uint32_t *dst = reinterpret_cast<uint32_t *>(&ks[e / (kIdx / 8)][(e % (kIdx / 8)) * 8]);
+      dst[0] = kr[i].x;
+      dst[1] = kr[i].y;
+      dst[2] = kr[i].z;
+      dst[3] = kr[i].w;
+    }
+    __syncthreads();
+    if (tile + 1 < t1) fetch(tile + 1);
+    float total[8];
+    float acc[kScoreHeads][8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) total[j] = 0.0f;
+#pragma unroll
+    for (int h = 0; h < kScoreHeads; ++h)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[h][j] = 0.0f;
+    const int key = 4 * idx + qp;
+#pragma unroll 4
+    for (int s4 = 0; s4 < kIdx / 4; ++s4) {
+      const uint2 b = *reinterpret_cast<const uint2 *>(&ks[key][s4 * 4]);
+#pragma unroll
+      for (int h = 0; h < kScoreHeads; ++h) {
+        const uint2 a = *reinterpret_cast<const uint2 *>(&qs[warp * 8 + idx][h * kIdx + s4 * 4]);
+        mma_m8n8k4(acc[h], a.x, a.y, b.x, b.y);
+      }
+    }
+#pragma unroll
+    for (int h = 0; h < kScoreHeads; ++h)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) total[j] += fmaxf(acc[h][j], 0.0f);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int r = r0 + warp * 8 + (idx & 1) + 2 * ((j >> 1) & 1) + 4 * (idx >> 2);
+      const int col = (j & 1) + 2 * ((idx >> 1) & 1) + 4 * (j >> 2);
+      const int k = tile * kScoreKeys + 4 * col + qp;
+      if (r < rows && k < nb) scores[static_cast<int64_t>(r) * ld + k] = total[j] * scale;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace seventy
+
+SEVENTY_API int seventy_qsa_prefill_scores(float *scores, int64_t ld, const void *q, int heads, const void *keys,
+                                           int nb, int rows, float scale, cudaStream_t stream) {
+  using namespace seventy;
+  if (scores == nullptr || q == nullptr || keys == nullptr || heads < 1 || heads > kScoreHeads || nb < 0 || rows < 0 ||
+      ld < nb)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (rows == 0 || nb == 0) return SEVENTY_OK;
+  const int row_tiles = (rows + kScoreRows - 1) / kScoreRows;
+  const int key_tiles = (nb + kScoreKeys - 1) / kScoreKeys;
+  int per = (key_tiles * row_tiles + 639) / 640;
+  per = per < 1 ? 1 : per;
+  const dim3 grid(row_tiles, (key_tiles + per - 1) / per);
+  qsa_prefill_score_kernel<<<grid, 128, 0, stream>>>(scores, ld, static_cast<const half *>(q), heads,
+                                                     static_cast<const half *>(keys), nb, rows, scale, per);
+  return launch_status();
+}
 
 SEVENTY_API int seventy_qsa_pool(void *pooled, const void *raw, void *ring, int ring_len, const int *state_slots,
                                  const int *positions, const int *block_tables, int table_width,
