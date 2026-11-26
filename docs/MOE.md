@@ -87,8 +87,8 @@ Other Flash-Next checkpoints that were compared:
 The smoke checks: greedy and sampled answers, needles at 8K and 30K or 100K tokens, an image, 8 identical greedy
 requests at the same time, one stream of 512 tokens. All pass, except where noted: the image check is
 case-sensitive, and some runs read the image text correctly in lowercase. The GGUF file has no vision tower and no MTP layer, so its runs skip the image check
-and run without a drafter; its experts decode slower than the NVFP4 experts (the GGUF expert kernel decodes each
-weight in FP32 and does not use integer dot products yet).
+and run without a drafter; it decodes slower than the NVFP4 checkpoint: its dense weights are FP16 (twice the bytes
+of the NVFP4 checkpoint's FP8 weights) and the GGUF expert kernel decodes each weight in FP32.
 
 | Model | GPUs | Settings | KV tokens | One stream | 8 identical requests |
 |---|---:|---|---:|---:|---:|
@@ -104,7 +104,7 @@ weight in FP32 and does not use integer dot products yet).
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | `--draft-model mtp` | 1,014,304 | 131 tok/s | 441 tok/s |
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | `--draft-model mtp --expert-offload 0.1` | 1,405,536 | 120 tok/s | 391 tok/s |
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | `--draft-model mtp --expert-offload 0.25` | 1,982,448 | 95 tok/s | 298 tok/s |
-| `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` IQ3_XXS (GGUF) | 4 | defaults | 2,716,672 | 48 tok/s | 208 tok/s |
+| `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` IQ3_XXS (GGUF) | 4 | defaults | 2,668,272 | 55 tok/s | 251 tok/s |
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | `--gpu-memory-utilization 0.97` | 69,392 | 65 tok/s | 362 tok/s |
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | `--draft-model mtp --expert-offload 0.25` | 371,184 | 87 tok/s | 336 tok/s |
 

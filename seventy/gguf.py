@@ -349,6 +349,8 @@ class GGUFCheckpoint:
     without its middle dimension. The routed experts stay in their GGUF blocks (experts()); the PLE n-gram table too
     (ple_table())."""
 
+    pack_dense = True
+
     def __init__(self, path: str | Path, text_prefix: str = "model.language_model."):
         files = sorted(Path(path).glob("*.gguf")) if Path(path).is_dir() else [Path(path)]
         first = [f for f in files if "-00001-of-" in f.name] or files

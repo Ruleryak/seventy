@@ -10,11 +10,13 @@
  * values (group g of a block) to FP32; seventy/gguf.py has the same decoding on the CPU. A weight row of k values is
  * k / Block::kValues blocks of Block::kBytes bytes; an expert is n such rows.
  *
- * gguf_moe_kernel: one block of 4 warps per (tile of kTileRows output rows, slot: one row per warp, so that a step
- * with few experts still has many warps). The slot's activation rows (up to
- * 8, gathered through the plan) wait in shared memory as FP16; warp w takes rows w, w + 4, ... of the tile, and lane
- * l the groups l, l + 32, ... of each row (consecutive lanes read consecutive groups of one block), decodes each
- * group and adds its 8 products per activation row in FP32; a warp sum gives each output. FP16 out (row stride
+ * gguf_moe_kernel: one block of 4 warps per (tile of 4 x kRowsPerWarp output rows, slot). The slot's activation rows (up to
+ * 8, gathered through the plan) are read through the read-only cache (staging them in shared memory limited the
+ * kernel to 2 blocks per SM); warp w takes kRowsPerWarp consecutive rows of the tile (1 for k >= 2048, so that a
+ * step with few experts has enough warps; 4 for shorter rows)
+ * at once (their loads overlap: the loop is bound by the latency of the dependent byte and table loads), and lane l
+ * the groups l, l + 32, ... of each row (consecutive lanes read consecutive groups of one block), decodes each group
+ * and adds its 8 products per activation row in FP32; a warp sum gives each output. FP16 out (row stride
  * out_ld), or FP32 times pair_weight[pair] (row stride n). compact as in seventy_moe_mma: bit 0, x rows in plan
  * order; bit 1, out rows in plan order.
  */
@@ -218,10 +220,9 @@ struct IQ3_S {
 };
 
 constexpr int kGgufThreads = 128;
-constexpr int kTileRows = 16;
 constexpr int kMaxSlotRows = 8;
 
-template <class B>
+template <class B, int kRowsPerWarp>
 __global__ void __launch_bounds__(kGgufThreads) gguf_moe_kernel(void *out, int out_ld, const half *x, int row_div,
                                                                 int k, int n, const uint8_t *const *wptrs,
                                                                 const uint8_t *wbase, int64_t w_stride,
@@ -229,19 +230,16 @@ __global__ void __launch_bounds__(kGgufThreads) gguf_moe_kernel(void *out, int o
                                                                 const int32_t *slot_start,
                                                                 const int32_t *slot_count, const int32_t *num_slots,
                                                                 const float *pair_weight, int compact) {
-  extern __shared__ __align__(16) half xs[];
   __shared__ int pair_of[kMaxSlotRows];
+  __shared__ int64_t x_row[kMaxSlotRows];
   const int slot = blockIdx.y;
   if (slot >= *num_slots) return;
   const int e = slot_expert[slot], start = slot_start[slot];
   const int m = min(slot_count[slot], kMaxSlotRows);
-  if (threadIdx.x < kMaxSlotRows) pair_of[threadIdx.x] = threadIdx.x < m ? order[start + threadIdx.x] : 0;
-  __syncthreads();
-  for (int i = threadIdx.x; i < m * (k / 8); i += kGgufThreads) {
-    const int r = i / (k / 8), part = i % (k / 8);
-    const int64_t xr = (compact & 1) ? start + r : pair_of[r] / row_div;
-    reinterpret_cast<uint4 *>(xs + static_cast<int64_t>(r) * k)[part] =
-        reinterpret_cast<const uint4 *>(x + xr * k)[part];
+  if (threadIdx.x < kMaxSlotRows) {
+    const int p = threadIdx.x < m ? order[start + threadIdx.x] : 0;
+    pair_of[threadIdx.x] = p;
+    x_row[threadIdx.x] = ((compact & 1) ? start + threadIdx.x : p / row_div) * static_cast<int64_t>(k);
   }
   __syncthreads();
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -249,36 +247,46 @@ __global__ void __launch_bounds__(kGgufThreads) gguf_moe_kernel(void *out, int o
   const uint8_t *w = wptrs != nullptr ? wptrs[e] : wbase + static_cast<int64_t>(e) * w_stride;
   constexpr int kGroups = B::kValues / 8;
   const int groups = k / 8;
-  for (int j = blockIdx.x * kTileRows + warp; j < min(n, (blockIdx.x + 1) * kTileRows); j += 4) {
-    const uint8_t *row = w + static_cast<int64_t>(j) * row_bytes;
-    float acc[kMaxSlotRows];
+  const int j0 = blockIdx.x * 4 * kRowsPerWarp + warp * kRowsPerWarp;
+  const uint8_t *rows[kRowsPerWarp];
 #pragma unroll
-    for (int r = 0; r < kMaxSlotRows; ++r) acc[r] = 0.0f;
-#pragma unroll 4
-    for (int gi = lane; gi < groups; gi += 32) {
-      float v[8];
-      B::group(row + (gi / kGroups) * B::kBytes, gi % kGroups, v);
+  for (int q = 0; q < kRowsPerWarp; ++q) rows[q] = w + static_cast<int64_t>(min(j0 + q, n - 1)) * row_bytes;
+  float acc[kRowsPerWarp][kMaxSlotRows];
 #pragma unroll
-      for (int r = 0; r < kMaxSlotRows; ++r) {
-        if (r >= m) break;
-        const uint4 raw = reinterpret_cast<const uint4 *>(xs + static_cast<int64_t>(r) * k)[gi];
-        const half2 *h = reinterpret_cast<const half2 *>(&raw);
-        float s = acc[r];
+  for (int q = 0; q < kRowsPerWarp; ++q)
 #pragma unroll
-        for (int t = 0; t < 4; ++t) {
-          const float2 f = __half22float2(h[t]);
-          s = fmaf(v[2 * t], f.x, fmaf(v[2 * t + 1], f.y, s));
-        }
-        acc[r] = s;
-      }
-    }
+    for (int r = 0; r < kMaxSlotRows; ++r) acc[q][r] = 0.0f;
+  for (int gi = lane; gi < groups; gi += 32) {
+    float v[kRowsPerWarp][8];
+#pragma unroll
+    for (int q = 0; q < kRowsPerWarp; ++q) B::group(rows[q] + (gi / kGroups) * B::kBytes, gi % kGroups, v[q]);
 #pragma unroll
     for (int r = 0; r < kMaxSlotRows; ++r) {
       if (r >= m) break;
-      float s = acc[r];
+      const uint4 raw = __ldg(reinterpret_cast<const uint4 *>(x + x_row[r]) + gi);
+      const half2 *h = reinterpret_cast<const half2 *>(&raw);
+      float2 f[4];
+#pragma unroll
+      for (int t = 0; t < 4; ++t) f[t] = __half22float2(h[t]);
+#pragma unroll
+      for (int q = 0; q < kRowsPerWarp; ++q) {
+        float s = acc[q][r];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) s = fmaf(v[q][2 * t], f[t].x, fmaf(v[q][2 * t + 1], f[t].y, s));
+        acc[q][r] = s;
+      }
+    }
+  }
+#pragma unroll
+  for (int q = 0; q < kRowsPerWarp; ++q) {
+    const int j = j0 + q;
+#pragma unroll
+    for (int r = 0; r < kMaxSlotRows; ++r) {
+      if (r >= m) break;
+      float s = acc[q][r];
 #pragma unroll
       for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
-      if (lane == 0) {
+      if (lane == 0 && j < n) {
         const int p = pair_of[r];
         const int64_t orow = (compact & 2) ? start + r : p;
         if (pair_weight != nullptr)
@@ -369,15 +377,19 @@ SEVENTY_API int seventy_gguf_moe(void *out, int out_ld, const void *x, int row_d
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (seventy_gguf_row_bytes(type, k) < 0) return SEVENTY_ERR_INVALID_ARGUMENT;
   if (!aligned(x, 16)) return SEVENTY_ERR_MISALIGNED;
-  const size_t smem = static_cast<size_t>(kMaxSlotRows) * k * sizeof(half);
-  if (smem > 48 * 1024) return SEVENTY_ERR_INVALID_ARGUMENT;
-  const dim3 grid((n + kTileRows - 1) / kTileRows, max_slots);
   const int code = dispatch(type, [&](auto b) {
     using B = decltype(b);
-    gguf_moe_kernel<B><<<grid, kGgufThreads, smem, stream>>>(
-        out, out_ld, static_cast<const half *>(x), row_div, k, n, static_cast<const uint8_t *const *>(wptrs),
-        static_cast<const uint8_t *>(wbase), w_stride, order, slot_expert, slot_start, slot_count, num_slots,
-        pair_weight, compact);
+    if (k >= 2048) {
+      gguf_moe_kernel<B, 1><<<dim3((n + 3) / 4, max_slots), kGgufThreads, 0, stream>>>(
+          out, out_ld, static_cast<const half *>(x), row_div, k, n, static_cast<const uint8_t *const *>(wptrs),
+          static_cast<const uint8_t *>(wbase), w_stride, order, slot_expert, slot_start, slot_count, num_slots,
+          pair_weight, compact);
+    } else {
+      gguf_moe_kernel<B, 4><<<dim3((n + 15) / 16, max_slots), kGgufThreads, 0, stream>>>(
+          out, out_ld, static_cast<const half *>(x), row_div, k, n, static_cast<const uint8_t *const *>(wptrs),
+          static_cast<const uint8_t *>(wbase), w_stride, order, slot_expert, slot_start, slot_count, num_slots,
+          pair_weight, compact);
+    }
   });
   if (code != SEVENTY_OK) return code;
   return launch_status();
