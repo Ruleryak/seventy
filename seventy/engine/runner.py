@@ -122,10 +122,12 @@ class ModelRunner:
         """Decode work (one new token per sequence) through the CUDA graphs when a bucket fits."""
         if self.graphs is None or self.graphs.bucket(len(work)) is None:
             return self.run(work)
-        payload = [(w.request.token_range(w.start, w.start + 1), w.start, w.request.blocks, w.request.slot, "last",
-                    w.request.rope_delta, ()) for w in work]
-        self._send(("decode", payload))
-        return self.graphs.run(payload)
+        payload = [(int(w.request.token_range(w.start, w.start + 1)[0]), w.start, w.request.slot, w.request.rope_delta)
+                   for w in work]
+        updates = self.graphs.table_updates([(w.request.slot, w.request.blocks, (w.request.id, w.request.blocks_epoch))
+                                             for w in work])
+        self._send(("decode", payload, updates))
+        return self.graphs.run(payload, updates)
 
     def run(self, work: list[Work], capture: bool = False) -> torch.Tensor:
         """FP32 logits for the rows each work item asked for ("last": its last token, "all": every token), in order.

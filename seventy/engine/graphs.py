@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import torch
 
 from .cache import ModelCache
@@ -37,6 +38,9 @@ class DecodeGraphs:
         self.width = max_blocks_per_seq
         self.buckets = tuple(sorted(b for b in buckets if b <= cache.num_slots + 64))
         self.graphs: dict[int, tuple[torch.cuda.CUDAGraph, StepInput, torch.Tensor]] = {}
+        self.sent: dict[int, tuple] = {}
+        self.slot_tables: dict[int, np.ndarray] = {}
+        self.slot_len: dict[int, int] = {}
 
     def _static_step(self, b: int) -> StepInput:
         dev = self.device
@@ -76,33 +80,60 @@ class DecodeGraphs:
     def bucket(self, n: int) -> int | None:
         return next((b for b in self.buckets if b >= n), None)
 
-    def run(self, payload: list[tuple]) -> torch.Tensor:
-        """payload: (token_ids [1], context_len, block_table, state_slot, logits, rope delta, ()) per sequence.
-        Returns the logits of the real rows."""
+    def table_updates(self, rows: list[tuple]) -> list[tuple]:
+        """(slot, first, total, ids) for each (slot, blocks, table_key) whose block table differs from what the
+        ranks have: the appended blocks when the slot holds the same sequence with the same block list (table_key:
+        sequence id, blocks epoch), else the whole table (as SpecGraphs._table_updates)."""
+        updates = []
+        for slot, blocks, key in rows:
+            total = len(blocks)
+            sent = self.sent.get(slot)
+            same = key is not None and sent is not None and sent[0] == key
+            if same and sent[1] == total:
+                continue
+            first = sent[1] if same and sent[1] < total else 0
+            updates.append((slot, first, total, np.asarray(blocks[first:], dtype=np.int32)))
+            self.sent[slot] = (key, total)
+        return updates
+
+    def _apply_tables(self, updates: list) -> None:
+        for slot, first, total, ids in updates:
+            t = self.slot_tables.get(slot)
+            if t is None or len(t) < total:
+                grown = np.full(max(total, 64, 2 * (len(t) if t is not None else 0)), self.cache.scratch_block,
+                                dtype=np.int32)
+                if t is not None:
+                    grown[:first] = t[:first]
+                t = self.slot_tables[slot] = grown
+            t[first:total] = ids
+            self.slot_len[slot] = total
+
+    def run(self, payload: list[tuple], updates: list) -> torch.Tensor:
+        """payload: (token id, context_len, state_slot, rope delta) per sequence; updates: table_updates of the
+        sequences' block tables (every rank keeps per-slot tables). Returns the logits of the real rows."""
         n = len(payload)
         b = self.bucket(n)
         graph, st, logits = self.graphs[b]
         bs = self.cache.block_size
         scratch = self.cache.scratch_block
-        tokens = torch.zeros(b, dtype=torch.long)
-        pos = torch.zeros(b, dtype=torch.long)
-        ctx = torch.zeros(b, dtype=torch.int32)
-        slots = torch.full((b,), self.cache.scratch_slot, dtype=torch.int32)
-        kv = torch.full((b,), scratch * bs, dtype=torch.int32)
-        width = max(len(p[2]) for p in payload)
-        table = torch.full((b, width), scratch, dtype=torch.int32)
-        for i, (ids, c, blocks, slot, _, delta, _) in enumerate(payload):
-            tokens[i] = ids[0]
-            pos[i] = c + delta
-            ctx[i] = c
-            slots[i] = slot
-            kv[i] = blocks[c // bs] * bs + c % bs
-            table[i, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32)
-        st.token_ids.copy_(tokens, non_blocking=True)
-        st.positions.copy_(pos.expand(3, b), non_blocking=True)
-        st.context_lens_t.copy_(ctx, non_blocking=True)
-        st.state_slots_t.copy_(slots, non_blocking=True)
-        st.kv_slots_t.copy_(kv, non_blocking=True)
-        st.block_tables[:, :width].copy_(table, non_blocking=True)
+        self._apply_tables(updates)
+        ids = np.zeros(b, dtype=np.int64)
+        pos = np.zeros(b, dtype=np.int64)
+        ctx = np.zeros(b, dtype=np.int32)
+        slots = np.full(b, self.cache.scratch_slot, dtype=np.int32)
+        kv = np.full(b, scratch * bs, dtype=np.int32)
+        width = max(self.slot_len[p[2]] for p in payload)
+        table = np.full((b, width), scratch, dtype=np.int32)
+        for i, (tok, c, slot, delta) in enumerate(payload):
+            t = self.slot_tables[slot]
+            ids[i], pos[i], ctx[i], slots[i] = tok, c + delta, c, slot
+            kv[i] = t[c // bs] * bs + c % bs
+            table[i, : self.slot_len[slot]] = t[: self.slot_len[slot]]
+        st.token_ids.copy_(torch.from_numpy(ids), non_blocking=True)
+        st.positions.copy_(torch.from_numpy(pos).expand(3, b), non_blocking=True)
+        st.context_lens_t.copy_(torch.from_numpy(ctx), non_blocking=True)
+        st.state_slots_t.copy_(torch.from_numpy(slots), non_blocking=True)
+        st.kv_slots_t.copy_(torch.from_numpy(kv), non_blocking=True)
+        st.block_tables[:, :width].copy_(torch.from_numpy(table), non_blocking=True)
         graph.replay()
         return logits[:n]

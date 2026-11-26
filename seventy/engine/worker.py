@@ -164,7 +164,7 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
             elif msg[0] == "mtp_verify":
                 runner.mtp_verify(*msg[1:], send=False)
             elif msg[0] == "decode":
-                graphs.run(msg[1])
+                graphs.run(msg[1], msg[2])
             elif msg[0] == "copy":
                 cache.apply(msg[1])
             elif msg[0] == "encode":
