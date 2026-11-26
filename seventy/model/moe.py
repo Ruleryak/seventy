@@ -210,7 +210,7 @@ class MoE:
         t = x.shape[0]
         if not t:
             return x.new_zeros(0, x.shape[1])
-        if x.is_cuda and x.dtype == torch.float16:
+        if x.is_cuda and x.dtype == torch.float16 and (t <= SMALL_TOKENS or self.gate_up.gemm is not None):
             return self._small(x) if t <= SMALL_TOKENS else self._large(x)
         out = self._shared(x)
         ids, weights = self.route(x)
@@ -257,8 +257,9 @@ class MoE:
         return kernels.moe_finish(y, ids, k, self.e0, self.e1, shared, gate)
 
     def _large(self, x: torch.Tensor) -> torch.Tensor:
-        """More than SMALL_TOKENS tokens on the GPU (prefill): the same grouped expert products as _small with larger
-        slots, on rows in plan order (only this rank's pairs; one host synchronization for their number)."""
+        """More than SMALL_TOKENS tokens on the GPU (prefill) with repacked NVFP4 experts: the same grouped expert
+        products as _small with slots of 64 pairs, on rows in plan order (only this rank's pairs; one host
+        synchronization for their number). FP16 experts (BF16 checkpoints) take _loop: cuBLAS per expert."""
         from ..ops import kernels
 
         t, k, n = x.shape[0], self.top_k, self.cfg.num_experts
