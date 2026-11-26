@@ -161,17 +161,20 @@ Prefill: a 100K-token prompt takes 14 s with the 35B-A3B NVFP4 on 4 GPUs and 15.
 before the tensor-core QSA attention kernel). On three 32 GB GPUs, Flash-Next with the default settings needs 0.4
 GiB more than the GPUs have; `--expert-offload 0.25` makes room for MTP and 371K KV tokens.
 
-Flash-Next on 4 GPUs with MTP, the README sweep method (sampled, thinking on, 512 tokens per request; tok/s, two
-runs per cell):
+Flash-Next on 4 GPUs with MTP, the README sweep method (bench/sweep.py: sampled, thinking on, 512 tokens per
+request; tok/s, two runs per cell), with the installed wheel of commit edfa915 at 250 W:
 
 | Context | 1 stream | 4 streams (per stream) | 8 streams (total) | Cold prefill |
 |---|---:|---:|---:|---:|
-| 2,000 | 98 / 147 | 72 / 80 | 516 / 546 | 2,682 tok/s |
-| 32,000 | 124 / 107 | 101 / 83 | 507 / 507 | 3,357 tok/s |
-| 64,000 | 115 / 134 | 88 / 100 | 480 / 505 | 3,260 tok/s |
-| 100,000 | 136 / 127 | 79 / 75 | - | 3,121 tok/s |
+| 2,000 | 129 / 126 | 80 / 75 | 511 / 559 | 4,462 tok/s |
+| 32,000 | 140 / 143 | 92 / 86 | 482 / 504 | 6,970 tok/s |
+| 64,000 | 118 / 116 | 87 / 90 | 473 / 503 | 6,850 tok/s |
+| 100,000 | 122 / 117 | 75 / 75 | 458 / 474 | 6,661 tok/s |
 
-The sweep ran before the tensor-core QSA attention kernel, which made the 100K prefill about a quarter faster.
+The cold prefill is about twice the speed of the sweep before the tensor-core QSA kernel, the KV split and the
+sequence-parallel prefill (2,682 tok/s at 2,000 tokens, 3,121 at 100,000). The decode speeds are close to that
+sweep (one stream at 100,000 tokens: 136 / 127 then). With one stream, the speed changes from run to run with the
+sampled text, because the share of accepted MTP tokens changes.
 
 Expert offload (`--expert-offload F`) keeps that share of each GPU's routed experts in pinned host memory. It frees
 GPU memory for the KV cache, or lets a model run on GPUs that cannot hold all its experts. The MTP layer's experts
