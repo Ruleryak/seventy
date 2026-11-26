@@ -165,3 +165,17 @@ def test_kernel_problems_name_the_head_sizes():
     raw["text_config"].update(head_dim=256, linear_key_head_dim=128, linear_value_head_dim=128,
                               rope_parameters=dict(raw["text_config"]["rope_parameters"], mrope_section=[11, 11, 10]))
     assert kernel_problems(parse_config(raw)) == []
+
+
+def test_gguf_folder_ignores_the_quantization_config(tmp_path):
+    """A GGUF folder takes config.json from the Hugging Face model: its quantization_config describes that model's
+    files, not the GGUF files, and does not count. In a safetensors folder it does."""
+    import json
+
+    raw = small_config()
+    raw["quantization_config"] = nvfp4_quant()
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "m.gguf").write_bytes(b"GGUF")
+    assert load_config(tmp_path).quant.method == "bf16"
+    (tmp_path / "model.safetensors").write_bytes(b"")
+    assert load_config(tmp_path).quant.method == "nvfp4"

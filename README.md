@@ -12,7 +12,10 @@ It serves an OpenAI-compatible API and has a control panel in the browser.
 
 seventy serves checkpoints with the `Qwen3_5ForConditionalGeneration` architecture, with NVFP4 weights
 (compressed-tensors) or BF16 or FP16 weights. A DFlash2 drafter, or the MTP layer of the model, makes decoding faster
-(speculative decoding).
+(speculative decoding). It also serves the mixture-of-experts architectures `Qwen3_5MoeForConditionalGeneration`
+(Qwen3.6-35B-A3B) and `Qwen4ExpForConditionalGeneration` (Qwen3.8 Flash-Next), with NVFP4 and FP8 weights (ModelOpt)
+or BF16 weights, and the GGUF files of Qwen3.8 Flash-Next. [docs/MOE.md](docs/MOE.md) describes them, with expert
+offload to host memory and the GGUF folder.
 
 Tested models:
 
@@ -21,6 +24,9 @@ Tested models:
 | `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` | target model (text, images, videos) |
 | `incoai/Qwen3.8-27B-DFlash2` | drafter for the model above |
 | `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.5-4B`, `Qwen/Qwen3.5-2B`, `Qwen/Qwen3.5-0.8B` | official BF16 checkpoints, tested on 16 GB GPUs (the 9B also with its MTP layer as the drafter) |
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | mixture of experts, 1 to 4 GPUs, with its MTP layer as the drafter |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | mixture of experts (text, images), 4 GPUs, or 3 GPUs with `--expert-offload 0.25`, with its MTP layer as the drafter |
+| `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` (IQ3_XXS) | GGUF files of Flash-Next (text), 3 or 4 GPUs, with the MTP layer of `ggml-org/Qwen3.8-Flash-Next-GGUF` as the drafter |
 
 To check a checkpoint folder before you start it:
 

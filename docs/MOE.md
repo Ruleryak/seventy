@@ -19,8 +19,9 @@ Other Flash-Next checkpoints that were compared:
 - `nvidia/Qwen3.8-Flash-Next-NVFP4`: post-training quantization (ModelOpt), 124 GiB, scores close to FP8.
 - `autotrust/Qwen3.8-Flash-Next-E384-FP4-*`: the QAD checkpoint with 384 of the 512 experts kept (80 GiB); it loses
   5 to 9 points on knowledge benchmarks (GPQA, MMLU). The V2 checkpoint is also fine-tuned for security tasks.
-- GGUF checkpoints (the most downloaded, for example `ISTA-DASLab/...-GSQ-RCO-GGUF`) and AWQ or AutoRound INT4
-  checkpoints: formats that seventy does not read.
+- GGUF checkpoints (the most downloaded, for example `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`): seventy reads
+  them (see "GGUF checkpoints of Flash-Next" below); the IQ3_XXS files fit on 3 GPUs without offload.
+- AWQ or AutoRound INT4 checkpoints: formats that seventy does not read.
 
 ## What the branch has
 
@@ -80,17 +81,49 @@ Other Flash-Next checkpoints that were compared:
   to FP16 for cuBLAS), the PLE n-gram table stays in its blocks in pinned host memory (`seventy_gguf_gather`), and
   the other tensors are dequantized to FP16 at load. The loader undoes llama.cpp's converter: norm weights stored as
   1 + w, A_log as -exp(A_log), the Gated DeltaNet value heads in tile-major order, the indexer projection in two
-  parts.
+  parts. The `quantization_config` in `config.json` (of the Hugging Face model's files) does not apply to a GGUF
+  folder.
 
   The ISTA files have no MTP layer. llama.cpp keeps the MTP layer of Flash-Next in a separate file (its `nextn`
-  layer), for example `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` from `ggml-org/Qwen3.8-Flash-Next-GGUF` (4.1 GB). Put
-  that file in the same folder, then use `--draft-model mtp`. The loader uses the MTP file's layer only (the
-  drafter uses the main file's embedding and output head):
+  layer), for example `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` from `ggml-org/Qwen3.8-Flash-Next-GGUF` (4.1 GB). With
+  that file in the same folder, `--draft-model mtp` works. The loader uses the MTP file's layer only (the drafter
+  uses the main file's embedding and output head).
 
-  ```bash
-  hf download ggml-org/Qwen3.8-Flash-Next-GGUF mtp-Qwen3.8-Flash-Next-Q8_0.gguf --local-dir ./flash-next-gguf
-  seventy engine --model ./flash-next-gguf --draft-model mtp
-  ```
+  To make the folder (`./flash-next-gguf/IQ3_XXS`, about 80 GB):
+
+  1. Download the IQ3_XXS files (75.8 GB). They go into the `IQ3_XXS` folder of the repository:
+
+     ```bash
+     hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "IQ3_XXS/*" --local-dir ./flash-next-gguf
+     ```
+
+  2. Download the configuration and the tokenizer of the Hugging Face model into the same folder:
+
+     ```bash
+     hf download nvidia/Qwen3.8-Flash-Next-FP4-Local config.json generation_config.json tokenizer.json \
+       tokenizer_config.json vocab.json merges.txt chat_template.jinja --local-dir ./flash-next-gguf/IQ3_XXS
+     ```
+
+  3. For MTP, download the MTP file into the same folder (4.1 GB):
+
+     ```bash
+     hf download ggml-org/Qwen3.8-Flash-Next-GGUF mtp-Qwen3.8-Flash-Next-Q8_0.gguf --local-dir ./flash-next-gguf/IQ3_XXS
+     ```
+
+  4. Start the engine on 4 GPUs, with MTP:
+
+     ```bash
+     seventy engine --model ./flash-next-gguf/IQ3_XXS --gpus 0,1,2,3 --draft-model mtp
+     ```
+
+     Or without MTP (no step 3 needed):
+
+     ```bash
+     seventy engine --model ./flash-next-gguf/IQ3_XXS --gpus 0,1,2,3
+     ```
+
+  You can run each download again: `hf download` skips the files that it has. At each start, the engine reads all
+  of the GGUF files (about 80 GB); when they are in the page cache, loading takes about 2 minutes.
 
 ## Results on 4 x V100-SXM2-32GB (local, 250 W)
 
@@ -117,6 +150,8 @@ FP32.
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | `--draft-model mtp --expert-offload 0.25` | 1,982,448 | 95 tok/s | 298 tok/s |
 | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` IQ3_XXS (GGUF) | 4 | defaults | 2,668,272 | 55 tok/s | 251 tok/s |
 | IQ3_XXS (GGUF) with `ggml-org` MTP Q8_0 | 4 | `--draft-model mtp` | 2,241,120 | 95 tok/s | 292 tok/s |
+| `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` IQ3_XXS (GGUF) | 3 | defaults | 814,656 | 53 tok/s | 243 tok/s |
+| IQ3_XXS (GGUF) with `ggml-org` MTP Q8_0 | 3 | `--draft-model mtp` | 588,784 | 90 tok/s | 288 tok/s |
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | `--gpu-memory-utilization 0.97` | 69,392 | 65 tok/s | 362 tok/s |
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | `--draft-model mtp --expert-offload 0.25` | 371,184 | 87 tok/s | 336 tok/s |
 
@@ -202,5 +237,20 @@ graphs; with a smaller prefill budget, less is enough.
 - Flash-Next's DFlash2 drafter; context past 524,288 tokens (1,000,000 with `--yarn-factor 4` needs more KV cache
   than 4 GPUs have without offload).
 - GGUF: the routed experts on the CPU for decoding with offload (only the GPU kernels exist), and native GGUF
-  kernels for the dense weights (dequantized to FP16 now).
+  kernels for the dense weights (dequantized to FP16 now). A GEMV on the GGUF blocks (FP32 sums, no tensor cores)
+  was faster than the FP16 dense GEMM only up to 8 rows (16 against 28 us at 1 row, 94 against 35 us at 32 rows,
+  for a Q6_K [2560, 2560] weight), so it is not used.
 - The panel's checks for MoE checkpoints (sizes of the expert weights per GPU).
+
+Tried or measured, and not kept:
+
+- Prefetch of offloaded experts (the next layer's router on this layer's input, as in Eliseev and Mazur, "Fast
+  Inference of Mixture-of-Experts Language Models with Offloading"). The prediction finds 66 % of the next layer's
+  experts in its top 10 (57 % two layers ahead). With MTP and `--expert-offload 0.25` on 4 GPUs, one stream made
+  87 to 91 tok/s with the prefetch and 94 to 95 without: a copy takes about as long as a layer (0.3 ms), most
+  predicted experts are not used, and the layer that needs a copy waits for it.
+- Expert placement for prefill load balance (as DeepSeek's EPLB, without replicas). In a 100K-token prefill on 4
+  GPUs, the GPUs wait 12 % of the time in the collectives; the wait after the MoE layer (a GPU with more routed
+  tokens than the others) is 5 % of the prefill. A placement from an expert profile lowers the largest GPU share of
+  a prefill's routed tokens from 1.21 to 1.16 times the mean (1.08 with 8 copies of the most used experts on each
+  GPU, about 1 GB per GPU): about 1 % of the prefill. The share changes with each prompt.

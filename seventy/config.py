@@ -169,11 +169,21 @@ class ModelConfig:
     vision_end_token_id: int | None
 
 
+def is_gguf_folder(path: str | Path) -> bool:
+    """Whether a folder holds GGUF files and no safetensors (a GGUF checkpoint, seventy.gguf)."""
+    p = Path(path)
+    return p.is_dir() and any(p.glob("*.gguf")) and not any(p.glob("*.safetensors"))
+
+
 def load_config(path: str | Path, yarn_factor: float | None = None) -> ModelConfig:
     """Read config.json (and generation_config.json, if present) from a checkpoint folder. yarn_factor: extend the
-    context with YaRN by this factor over the checkpoint's original length (see parse_config)."""
+    context with YaRN by this factor over the checkpoint's original length (see parse_config). In a GGUF folder
+    (GGUF files and no safetensors) the config.json comes from the Hugging Face model, so its quantization_config
+    (of that model's files) does not apply."""
     path = Path(path)
     raw = json.loads((path / "config.json").read_text())
+    if is_gguf_folder(path):
+        raw.pop("quantization_config", None)
     generation = None
     if (path / "generation_config.json").is_file():
         generation = json.loads((path / "generation_config.json").read_text())
@@ -506,7 +516,7 @@ def has_mtp(path: str | Path) -> bool:
     from the tensor names of its index file, else of the header of its model.safetensors. A GGUF folder: whether a
     GGUF file in it holds llama.cpp's nextn layer (qwen4exp.nextn_predict_layers)."""
     p = Path(path)
-    if p.is_dir() and any(p.glob("*.gguf")) and not any(p.glob("*.safetensors")):
+    if is_gguf_folder(p):
         from .gguf import GGUFFile
 
         for f in p.glob("*.gguf"):
