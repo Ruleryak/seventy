@@ -56,7 +56,7 @@ def fits(cfg, size: int, gpu_bytes: int, gpu_count: int) -> list[int]:
         slots = 8 + prefix_entries(8, True)
         used = size // n + tied_head_bytes(cfg, n) + OVERHEAD_GUESS.get(n, OVERHEAD_GUESS_TP)
         p = plan(cfg, gpu_bytes - CUDA_HIDDEN, used, n, slots, 16,
-                 "int8", 0.9, RESERVE, None, cfg.text.max_position_embeddings)
+                 "int8", 0.9, RESERVE, None, cfg.text.max_context)
         if p.blocks * 16 >= 1024:
             out.append(n)
     return out
@@ -87,7 +87,7 @@ def classify(raw: dict, where: str, name: str, size: int, tokenizer: bool, mtp: 
     return ModelInfo(where, name, "target", not reasons, size, reasons, {
         "architecture": cfg.architecture, "layers": t.num_layers, "hidden": t.hidden_size,
         "weights": cfg.quant.method, "vision": cfg.vision is not None,
-        "max_context": t.max_position_embeddings, "kv_heads": t.num_kv_heads, "mtp": mtp,
+        "max_context": t.max_context, "kv_heads": t.num_kv_heads, "mtp": mtp,
         "gpu_counts": [n for n in GPU_COUNTS if not split_problems(cfg, n)],
         "fits": fits(cfg, size, gpu_bytes, gpu_count) if gpu_bytes and size else None,
     })

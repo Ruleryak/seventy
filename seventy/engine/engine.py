@@ -43,6 +43,7 @@ class EngineConfig:
     cache_entries: int = 0
     draft_model: str | None = None
     mtp_tokens: int = 4
+    yarn_factor: float | None = None
 
 
 @dataclass
@@ -130,7 +131,7 @@ class Engine:
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", 0 if tp > 1 else torch.cuda.current_device())
         path = Path(config.model)
-        self.model_config = load_config(path)
+        self.model_config = load_config(path, yarn_factor=config.yarn_factor)
         if self.device.type == "cuda":
             devices = [self.device.index] if tp == 1 else list(range(tp))
             _check_gpus(devices)
@@ -151,7 +152,8 @@ class Engine:
                 parent, child = ctx.Pipe()
                 p = ctx.Process(target=_worker_entry, daemon=True,
                                 args=(rank, tp, port, "nccl", f"cuda:{rank}", str(path), "float16",
-                                      config.gpu_memory_utilization, reserve, child, None, self._draft_spec(config)))
+                                      config.gpu_memory_utilization, reserve, child, None, self._draft_spec(config),
+                                      config.yarn_factor))
                 p.start()
                 child.close()
                 self.workers.append(p)
@@ -160,7 +162,7 @@ class Engine:
         from .worker import load_shard
 
         _stage("weights", f"loading {display_name(path)} on {tp} GPU(s)")
-        _, self.model = load_shard(str(path), 0, tp, self.device, torch.float16)
+        _, self.model = load_shard(str(path), 0, tp, self.device, torch.float16, yarn_factor=config.yarn_factor)
         torch.cuda.synchronize()
         weights = torch.cuda.memory_allocated(self.device)
         self.drafter = None

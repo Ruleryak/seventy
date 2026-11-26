@@ -82,9 +82,9 @@ def plan(s: Settings, inv: Inventory, profiles: Profiles | None = None) -> dict:
     errors.extend(memory.split_problems(cfg, tp, drafter))
     if s.kv_cache_dtype not in memory.KV_DTYPES:
         errors.append(f"KV cache format must be one of {', '.join(memory.KV_DTYPES)}")
-    max_len = s.max_model_len or t.max_position_embeddings
-    if max_len > t.max_position_embeddings:
-        errors.append(f"the model allows at most {t.max_position_embeddings} tokens of context")
+    max_len = s.max_model_len or t.max_context
+    if max_len > t.max_context:
+        errors.append(f"the model allows at most {t.max_context} tokens of context")
     if errors:
         return out
     known = {g.id: g for g in inv.gpus}

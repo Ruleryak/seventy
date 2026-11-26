@@ -83,7 +83,7 @@ def create_app(config: ServerConfig) -> FastAPI:
     defaults = _generation_defaults(model_path)
     client = EngineClient(config.engine)
     max_len = config.engine.max_model_len
-    model_cfg = load_config(model_path)
+    model_cfg = load_config(model_path, yarn_factor=config.engine.yarn_factor)
     images_cfg = multimodal.ImageSettings.from_model(model_path)
     videos_cfg = multimodal.VideoSettings.from_model(model_path)
     media_tokens = multimodal.MediaTokens(model_cfg.image_token_id, model_cfg.video_token_id,

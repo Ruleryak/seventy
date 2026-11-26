@@ -102,6 +102,7 @@ class MtpDrafter:
             self.pre_h = _norm_weight(ckpt, "mtp.pre_fc_norm_hidden.weight", device, 1.0)
             self.norm = _norm_weight(ckpt, "mtp.norm.weight", device, 1.0)
         self.attn.inv_freq = target.inv_freq
+        self.attn.rope_scale = getattr(target, "rope_scale", 1.0)
         self.head = None
         if (self.device.type == "cuda" and dtype == torch.float16 and target.lm_head_packed is not None
                 and os.environ.get("SEVENTY_MTP_HEAD", "nvfp4") != "fp16"):
@@ -136,7 +137,8 @@ class MtpDrafter:
         if x.is_cuda:
             rope = slots = None
         else:
-            rope = ops.rotary_cos_sin(step.positions, self.target.inv_freq, self.target.cfg.mrope_section)
+            cos, sin = ops.rotary_cos_sin(step.positions, self.target.inv_freq, self.target.cfg.mrope_section)
+            rope = (cos * self.attn.rope_scale, sin * self.attn.rope_scale)
             slots = ops.kv_slots(step.query_start, step.context_lens, step.block_tables, step.block_size)
         x = self.attn(x, step, cache, self.cfg.layer, rope, slots)
         x, residual = self.par.reduce_norm(x, self.post_norm, self.eps, residual)

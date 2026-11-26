@@ -61,8 +61,9 @@ __global__ void __launch_bounds__(kHead) attn_prep_kernel(half *q_out, T *k_cach
                                                           float *v_scale, const half *qkv, int ld,
                                                           const float *q_norm, const float *k_norm,
                                                           const int64_t *positions, int64_t pos_stride,
-                                                          const float *inv_freq, int s1, int s2, int rotary_dim,
-                                                          const int *slots, int hq, int hkv, float eps) {
+                                                          const float *inv_freq, float rope_scale, int s1, int s2,
+                                                          int rotary_dim, const int *slots, int hq, int hkv,
+                                                          float eps) {
   __shared__ float scratch[32];
   __shared__ float vals[kHead];
   const int t = blockIdx.x;
@@ -86,6 +87,8 @@ __global__ void __launch_bounds__(kHead) attn_prep_kernel(half *q_out, T *k_cach
     const float pos = static_cast<float>(positions[axis * pos_stride + t]);
     float sn, cs;
     sincosf(pos * inv_freq[i], &sn, &cs);
+    sn *= rope_scale;
+    cs *= rope_scale;
     r = d < half_rot ? vals[d] * cs - vals[d + half_rot] * sn : vals[d] * cs + vals[d - half_rot] * sn;
   }
   const half out = __float2half_rn(r);
@@ -280,9 +283,9 @@ __global__ void __launch_bounds__(kHead) attention_combine_kernel(half *out, con
 
 SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, float *k_scale, float *v_scale,
                                   int kv_type, const void *qkv, int ld, const float *q_norm, const float *k_norm,
-                                  const int64_t *positions, int64_t pos_stride, const float *inv_freq, int section1,
-                                  int section2, int rotary_dim, const int *slots, int tokens, int hq, int hkv,
-                                  int head_dim, float eps, cudaStream_t stream) {
+                                  const int64_t *positions, int64_t pos_stride, const float *inv_freq,
+                                  float rope_scale, int section1, int section2, int rotary_dim, const int *slots,
+                                  int tokens, int hq, int hkv, int head_dim, float eps, cudaStream_t stream) {
   using namespace seventy;
   if (q_out == nullptr || k_cache == nullptr || v_cache == nullptr || qkv == nullptr || q_norm == nullptr ||
       k_norm == nullptr || positions == nullptr || inv_freq == nullptr || slots == nullptr)
@@ -295,13 +298,13 @@ SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, flo
   if (kv_type == 1) {
     attn_prep_kernel<int8_t><<<dim3(tokens, hq + hkv), kHead, 0, stream>>>(
         static_cast<half *>(q_out), static_cast<int8_t *>(k_cache), static_cast<int8_t *>(v_cache), k_scale, v_scale,
-        static_cast<const half *>(qkv), ld, q_norm, k_norm, positions, pos_stride, inv_freq, section1, section2,
-        rotary_dim, slots, hq, hkv, eps);
+        static_cast<const half *>(qkv), ld, q_norm, k_norm, positions, pos_stride, inv_freq, rope_scale, section1,
+        section2, rotary_dim, slots, hq, hkv, eps);
   } else {
     attn_prep_kernel<half><<<dim3(tokens, hq + hkv), kHead, 0, stream>>>(
         static_cast<half *>(q_out), static_cast<half *>(k_cache), static_cast<half *>(v_cache), nullptr, nullptr,
-        static_cast<const half *>(qkv), ld, q_norm, k_norm, positions, pos_stride, inv_freq, section1, section2,
-        rotary_dim, slots, hq, hkv, eps);
+        static_cast<const half *>(qkv), ld, q_norm, k_norm, positions, pos_stride, inv_freq, rope_scale, section1,
+        section2, rotary_dim, slots, hq, hkv, eps);
   }
   return launch_status();
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,21 @@ class TextConfig:
     shared_expert_intermediate_size: int = 0
     norm_topk_prob: bool = True
     exp: "ExpConfig | None" = None
+    rope_type: str = "default"
+    rope_factor: float = 1.0
+    rope_original_max: int = 0
+    rope_attention_factor: float = 1.0
+    rope_beta_fast: float = 32.0
+    rope_beta_slow: float = 1.0
+    rope_truncate: bool = True
+
+    @property
+    def max_context(self) -> int:
+        """The longest context: max_position_embeddings, or with YaRN the original length times the factor if
+        that is longer."""
+        if self.rope_type == "yarn":
+            return max(self.max_position_embeddings, int(self.rope_original_max * self.rope_factor))
+        return self.max_position_embeddings
 
     @property
     def is_moe(self) -> bool:
@@ -153,23 +169,59 @@ class ModelConfig:
     vision_end_token_id: int | None
 
 
-def load_config(path: str | Path) -> ModelConfig:
-    """Read config.json (and generation_config.json, if present) from a checkpoint folder."""
+def load_config(path: str | Path, yarn_factor: float | None = None) -> ModelConfig:
+    """Read config.json (and generation_config.json, if present) from a checkpoint folder. yarn_factor: extend the
+    context with YaRN by this factor over the checkpoint's original length (see parse_config)."""
     path = Path(path)
     raw = json.loads((path / "config.json").read_text())
     generation = None
     if (path / "generation_config.json").is_file():
         generation = json.loads((path / "generation_config.json").read_text())
-    return parse_config(raw, path=path, generation=generation)
+    return parse_config(raw, path=path, generation=generation, yarn_factor=yarn_factor)
 
 
-def parse_config(raw: dict, path: Path | None = None, generation: dict | None = None) -> ModelConfig:
+def yarn_attention_factor(factor: float, mscale: float | None = None, mscale_all_dim: float | None = None) -> float:
+    """YaRN's attention factor for cos and sin when the config does not give one (transformers' get_mscale)."""
+
+    def get(scale: float, m: float = 1.0) -> float:
+        return 1.0 if scale <= 1 else 0.1 * m * math.log(scale) + 1.0
+
+    if mscale and mscale_all_dim:
+        return get(factor, mscale) / get(factor, mscale_all_dim)
+    return get(factor)
+
+
+def with_yarn(text_raw: dict, factor: float) -> dict:
+    """A copy of a text config with YaRN at factor over its original length (the length of an existing YaRN config,
+    else max_position_embeddings), as the model cards describe for longer contexts."""
+    out = dict(text_raw)
+    key = "rope_parameters" if "rope_parameters" in out or "rope_scaling" not in out else "rope_scaling"
+    rope = dict(out.get(key) or {})
+    if rope.get("rope_type", rope.get("type", "default")) == "yarn":
+        original = int(rope.get("original_max_position_embeddings") or out.get("max_position_embeddings") or 0)
+    else:
+        original = int(out.get("max_position_embeddings") or 0)
+    for k in ("type", "attention_factor", "mscale", "mscale_all_dim"):
+        rope.pop(k, None)
+    rope.update(rope_type="yarn", factor=float(factor), original_max_position_embeddings=original)
+    if "rope_theta" not in rope and "rope_theta" in out:
+        rope["rope_theta"] = out["rope_theta"]
+    out[key] = rope
+    return out
+
+
+def parse_config(raw: dict, path: Path | None = None, generation: dict | None = None,
+                 yarn_factor: float | None = None) -> ModelConfig:
     reasons: list[str] = []
     architectures = raw.get("architectures") or []
     architecture = architectures[0] if architectures else ""
     if architecture not in ARCHITECTURES:
         reasons.append(f"architecture {architecture or '(none)'} is not supported; supported: {', '.join(ARCHITECTURES)}")
     text_raw = raw.get("text_config", raw)
+    if yarn_factor:
+        if yarn_factor < 1:
+            reasons.append(f"the YaRN factor {yarn_factor} is below 1")
+        text_raw = with_yarn(text_raw, yarn_factor)
     text = _parse_text(text_raw, generation, reasons)
     vision = None
     if architecture in MULTIMODAL_ARCHITECTURES and not raw.get("language_model_only", False):
@@ -220,8 +272,20 @@ def _parse_text(raw: dict, generation: dict | None, reasons: list[str]) -> TextC
     head_dim = _require(raw, "head_dim", reasons)
     rope = raw.get("rope_parameters") or raw.get("rope_scaling") or {}
     rope_type = rope.get("rope_type", rope.get("type", "default"))
-    if rope_type != "default":
-        reasons.append(f"rope type {rope_type!r} is not supported")
+    yarn = {}
+    if rope_type == "yarn":
+        yarn_f = float(rope.get("factor") or 0)
+        original = int(rope.get("original_max_position_embeddings") or raw.get("max_position_embeddings") or 0)
+        if yarn_f < 1 or original <= 0:
+            reasons.append("the YaRN rope parameters need a factor of at least 1 and the original length")
+        attention = rope.get("attention_factor")
+        if attention is None:
+            attention = yarn_attention_factor(yarn_f, rope.get("mscale"), rope.get("mscale_all_dim"))
+        yarn = dict(rope_type="yarn", rope_factor=yarn_f, rope_original_max=original,
+                    rope_attention_factor=float(attention), rope_beta_fast=float(rope.get("beta_fast") or 32),
+                    rope_beta_slow=float(rope.get("beta_slow") or 1), rope_truncate=bool(rope.get("truncate", True)))
+    elif rope_type != "default":
+        reasons.append(f"rope type {rope_type!r} is not supported (only default and yarn)")
     factor = rope.get("partial_rotary_factor", raw.get("partial_rotary_factor", 1.0))
     rotary_dim = int(round(head_dim * factor))
     if rotary_dim <= 0 or rotary_dim % 2 or abs(rotary_dim - head_dim * factor) > 1e-6 or rotary_dim > head_dim:
@@ -305,6 +369,7 @@ def _parse_text(raw: dict, generation: dict | None, reasons: list[str]) -> TextC
         eos_token_ids=eos,
         exp=exp,
         **moe,
+        **yarn,
     )
 
 

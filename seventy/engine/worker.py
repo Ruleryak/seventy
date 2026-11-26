@@ -23,11 +23,11 @@ from .graphs import DecodeGraphs
 from .runner import ModelRunner, build_step
 
 
-def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None):
+def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None, yarn_factor: float | None = None):
     """This rank's shard of the model, with the peer-to-peer all-reduce when the start check passes on every rank.
     With tensor parallel, it ends with a first NCCL all-reduce: NCCL then makes its communicator (and its buffers
     in GPU memory) before the caller measures the memory that is left for the KV cache."""
-    cfg = load_config(Path(model_path))
+    cfg = load_config(Path(model_path), yarn_factor=yarn_factor)
     with Checkpoint(Path(model_path)) as ckpt:
         if cfg.text.exp is not None:
             from ..model.qwen4_exp import Qwen4ExpTextModel
@@ -76,7 +76,8 @@ def _watch_parent() -> None:
 
 
 def worker_main(rank: int, size: int, port: int, backend: str, device_name: str, model_path: str, dtype_name: str,
-                utilization: float, reserve_bytes: int, conn, layers=None, draft_path: str | None = None) -> None:
+                utilization: float, reserve_bytes: int, conn, layers=None, draft_path: str | None = None,
+                yarn_factor: float | None = None) -> None:
     faulthandler.register(signal.SIGUSR1, all_threads=True)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     _watch_parent()
@@ -88,7 +89,7 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
             torch.cuda.set_device(device)
         distributed.init(rank, size, port, backend)
         dtype = getattr(torch, dtype_name)
-        cfg, model = load_shard(model_path, rank, size, device, dtype, layers)
+        cfg, model = load_shard(model_path, rank, size, device, dtype, layers, yarn_factor=yarn_factor)
         drafter = None
         if draft_path:
             from .engine import make_drafter

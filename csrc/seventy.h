@@ -105,14 +105,14 @@ SEVENTY_API int seventy_gdn_commit_layers(void *conv_state, float *state, const 
  * kv_type 0: FP16 caches. kv_type 1: int8 caches with FP32 scales [blocks, block_size, hkv] (k_scale, v_scale):
  * scale = max |x| / 127 over the head's 256 values, value = round(x / scale).
  * qkv: FP16 [T, ld] = [q_proj (per head: query 256 | gate 256) | k_proj | v_proj]. positions: int64 [3, T]
- * (row stride pos_stride). inv_freq: FP32 [rotary_dim / 2]. section1, section2: the height and width sections of
- * the interleaved multimodal rotary.
+ * (row stride pos_stride). inv_freq: FP32 [rotary_dim / 2]. rope_scale multiplies cos and sin (YaRN's attention
+ * factor; 1 otherwise). section1, section2: the height and width sections of the interleaved multimodal rotary.
  */
 SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, float *k_scale, float *v_scale,
                                   int kv_type, const void *qkv, int ld, const float *q_norm, const float *k_norm,
-                                  const int64_t *positions, int64_t pos_stride, const float *inv_freq, int section1,
-                                  int section2, int rotary_dim, const int *slots, int tokens, int hq, int hkv,
-                                  int head_dim, float eps, cudaStream_t stream);
+                                  const int64_t *positions, int64_t pos_stride, const float *inv_freq,
+                                  float rope_scale, int section1, int section2, int rotary_dim, const int *slots,
+                                  int tokens, int hq, int hkv, int head_dim, float eps, cudaStream_t stream);
 
 SEVENTY_API int64_t seventy_decode_attention_workspace(int tokens, int hq, int splits);
 

@@ -24,6 +24,7 @@ from ..engine.cache import ModelCache
 from ..engine.spec import merge_top
 from ..engine.step import StepInput
 from ..ops import gdn_prefill, kernels
+from ..rope import frequencies
 from ..parallel import MLP_ALIGN, SINGLE, VOCAB_ALIGN, Parallel
 from ..upload import to_device
 
@@ -62,6 +63,7 @@ class AttentionLayer:
         self.scale = 1.0 / math.sqrt(d)
         self.par = par
         self.section = cfg.mrope_section
+        self.rope_scale = 1.0
 
     def __call__(self, x, step: StepInput, cache: ModelCache, layer: int, rope, slots):
         t, d = x.shape[0], self.head_dim
@@ -70,7 +72,7 @@ class AttentionLayer:
             ks, vs = cache.k_scale.get(layer), cache.v_scale.get(layer)
             q = kernels.attn_prep(qkv, self.q_norm, self.k_norm, step.positions, self.inv_freq, self.section,
                                   step.kv_slots_t, cache.k[layer], cache.v[layer], self.heads, self.kv_heads, self.eps,
-                                  ks, vs)
+                                  ks, vs, rope_scale=self.rope_scale)
             n = step.max_query_len
             if (kernels.VERIFY_SPLITD and ks is not None and step.num_seqs > 0
                     and step.query_start[-1] == n * step.num_seqs and (self.heads // self.kv_heads) * n <= 48):
@@ -245,11 +247,11 @@ class Qwen35TextModel:
         self.embed = to_device(_to_dtype(ckpt.rows(f"{p}embed_tokens.weight", v0, v1), dtype), device)
         count = t.num_layers if layers is None else layers
         self.layers = [Layer(t, ckpt, i, par, dtype, device, keep_dense) for i in range(count)]
-        half = t.rotary_dim // 2
-        inv_freq = 1.0 / (t.rope_theta ** (torch.arange(0, half, dtype=torch.float64) * 2 / t.rotary_dim))
+        inv_freq, self.rope_scale = frequencies(t)
         for layer in self.layers:
             if layer.kind == "full_attention":
-                layer.mixer.inv_freq = inv_freq.float().to(device)
+                layer.mixer.inv_freq = inv_freq.to(device)
+                layer.mixer.rope_scale = self.rope_scale
         self.gdn = [layer.mixer for layer in self.layers if layer.kind != "full_attention"]
         self.gdn_params = None
         for j, m in enumerate(self.gdn):
@@ -277,9 +279,7 @@ class Qwen35TextModel:
             self.lm_head_packed = DenseWeight(self.lm_head)
             self.lm_head = None
             torch.cuda.empty_cache()
-        half = t.rotary_dim // 2
-        self.inv_freq = 1.0 / (t.rope_theta ** (torch.arange(0, half, dtype=torch.float64) * 2 / t.rotary_dim))
-        self.inv_freq = self.inv_freq.float().to(device)
+        self.inv_freq = inv_freq.to(device)
 
     def embed_tokens(self, ids: torch.Tensor) -> torch.Tensor:
         v0, v1 = self.vocab_span
@@ -368,7 +368,8 @@ class Qwen35TextModel:
         if h.is_cuda:
             rope = slots = None
         else:
-            rope = ops.rotary_cos_sin(step.positions, self.inv_freq, t.mrope_section)
+            cos, sin = ops.rotary_cos_sin(step.positions, self.inv_freq, t.mrope_section)
+            rope = (cos * self.rope_scale, sin * self.rope_scale)
             slots = ops.kv_slots(step.query_start, step.context_lens, step.block_tables, step.block_size)
         residual = h
         x = ops.rms_norm(h, self.layers[0].input_norm, t.rms_norm_eps)[0]

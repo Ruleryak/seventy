@@ -267,8 +267,9 @@ def _kv_args(k_cache, v_cache, k_scale, v_scale):
 def attn_prep(qkv: torch.Tensor, q_norm: torch.Tensor, k_norm: torch.Tensor, positions: torch.Tensor,
               inv_freq: torch.Tensor, section: tuple[int, int, int], slots: torch.Tensor, k_cache: torch.Tensor,
               v_cache: torch.Tensor, hq: int, hkv: int, eps: float, k_scale: torch.Tensor | None = None,
-              v_scale: torch.Tensor | None = None) -> torch.Tensor:
-    """Normed, rotated queries [T, hq, 256]; keys and values written to the caches at `slots` (int32 [T])."""
+              v_scale: torch.Tensor | None = None, rope_scale: float = 1.0) -> torch.Tensor:
+    """Normed, rotated queries [T, hq, 256]; keys and values written to the caches at `slots` (int32 [T]).
+    rope_scale multiplies cos and sin (YaRN's attention factor)."""
     _expect(qkv, "qkv", torch.float16)
     _expect(positions, "positions", torch.int64)
     _expect(slots, "slots", torch.int32)
@@ -277,8 +278,8 @@ def attn_prep(qkv: torch.Tensor, q_norm: torch.Tensor, k_norm: torch.Tensor, pos
     ks, vs, kind = _kv_args(k_cache, v_cache, k_scale, v_scale)
     code = lib().seventy_attn_prep(
         q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), ks, vs, kind, qkv.data_ptr(), qkv.shape[1], q_norm.data_ptr(),
-        k_norm.data_ptr(), positions.data_ptr(), positions.shape[1], inv_freq.data_ptr(), section[1], section[2],
-        2 * inv_freq.numel(), slots.data_ptr(), t, hq, hkv, 256, eps, _stream(qkv),
+        k_norm.data_ptr(), positions.data_ptr(), positions.shape[1], inv_freq.data_ptr(), rope_scale, section[1],
+        section[2], 2 * inv_freq.numel(), slots.data_ptr(), t, hq, hkv, 256, eps, _stream(qkv),
     )
     check("attn_prep", code)
     return q
@@ -1057,7 +1058,8 @@ def hc_inject(h: torch.Tensor, y: torch.Tensor, w: torch.Tensor, hc: int) -> tor
 def qsa_pool(pooled: torch.Tensor, raw: torch.Tensor, ring: torch.Tensor, state_slots_t: torch.Tensor,
              positions: torch.Tensor, block_tables: torch.Tensor, query_start_t: torch.Tensor,
              context_lens_t: torch.Tensor, tokens: int, k_norm: torch.Tensor, inv_freq: torch.Tensor,
-             section: tuple[int, int, int], rotary_dim: int, compress: int, block_size: int, eps: float) -> None:
+             section: tuple[int, int, int], rotary_dim: int, compress: int, block_size: int, eps: float,
+             rope_scale: float = 1.0) -> None:
     """The pooled keys of the blocks that the step's new tokens complete, from the step's raw keys FP16 [tokens,
     128] and the sequences' rings FP16 [slots, ring_len, 128]; then the rings take the step's raw keys
     (seventy_qsa_pool)."""
@@ -1067,8 +1069,8 @@ def qsa_pool(pooled: torch.Tensor, raw: torch.Tensor, ring: torch.Tensor, state_
     check("qsa_pool", lib().seventy_qsa_pool(
         pooled.data_ptr(), raw.data_ptr(), ring.data_ptr(), ring.shape[1], state_slots_t.data_ptr(),
         positions.data_ptr(), bt.data_ptr(), bt.shape[1], query_start_t.data_ptr(), context_lens_t.data_ptr(),
-        context_lens_t.numel(), tokens, k_norm.data_ptr(), inv_freq.data_ptr(), section[1], section[2], rotary_dim,
-        compress, block_size, eps, _stream(raw)))
+        context_lens_t.numel(), tokens, k_norm.data_ptr(), inv_freq.data_ptr(), rope_scale, section[1], section[2],
+        rotary_dim, compress, block_size, eps, _stream(raw)))
 
 
 def qsa_index_prep(qk: torch.Tensor, q_norm: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, heads: int,

@@ -34,6 +34,7 @@ from ..config import ModelConfig, TextConfig
 from ..engine.cache import ModelCache
 from ..engine.step import StepInput
 from ..parallel import SINGLE, VOCAB_ALIGN, Parallel
+from ..rope import frequencies
 from ..upload import to_device
 from .layers import Linear, Source, _to_dtype
 from ..split import balanced
@@ -438,12 +439,12 @@ class ExpAttention:
         qkv = a.qkv(x)
         ks, vs = cache.k_scale.get(layer), cache.v_scale.get(layer)
         q = kernels.attn_prep(qkv, a.q_norm, a.k_norm, step.positions, a.inv_freq, a.section, step.kv_slots_t,
-                              cache.k[layer], cache.v[layer], a.heads, a.kv_heads, a.eps, ks, vs)
+                              cache.k[layer], cache.v[layer], a.heads, a.kv_heads, a.eps, ks, vs, rope_scale=a.rope_scale)
         iq16, raw = self.indexer.prep(x, cos, sin)
         kernels.qsa_pool(cache.pooled[layer], raw, cache.idx_ring[layer], step.state_slots_t, cache.positions,
                          step.block_tables, step.query_start_t, step.context_lens_t, t, self.indexer.k_norm,
                          a.inv_freq, a.section, self.cfg.rotary_dim, e.indexer_compress, cache.block_size,
-                         self.indexer.eps)
+                         self.indexer.eps, rope_scale=a.rope_scale)
         top = e.indexer_budget // e.indexer_compress
         ld = cache.num_blocks * cache.block_size // e.indexer_compress
         parts = []
@@ -578,8 +579,8 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         count = t.num_layers if layers is None else layers
         self.layers = [ExpLayer(t, ckpt, i, par, dtype, device, keep_dense, eos) for i in range(count)]
         half = t.rotary_dim // 2
-        self.inv_freq = (1.0 / (t.rope_theta ** (torch.arange(0, half, dtype=torch.float64) * 2 / t.rotary_dim))
-                         ).float().to(device)
+        inv_freq, self.rope_scale = frequencies(t)
+        self.inv_freq = inv_freq.to(device)
         idx = torch.arange(half)
         axis = torch.zeros(half, dtype=torch.long)
         axis[(idx % 3 == 1) & (idx < 3 * t.mrope_section[1])] = 1
@@ -588,6 +589,7 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         for layer in self.layers:
             if layer.kind == "full_attention":
                 layer.mixer.attn.inv_freq = self.inv_freq
+                layer.mixer.attn.rope_scale = self.rope_scale
         self.gdn = [layer.mixer for layer in self.layers if layer.kind != "full_attention"]
         for j, m in enumerate(self.gdn):
             m.gdn_index = j
@@ -620,8 +622,9 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         pos = torch.arange(ctx, device=cache.positions.device)
         flat = step.block_tables[b][pos // bs].long().to(cache.positions.device) * bs + pos % bs
         positions = cache.positions.view(-1, 3)[flat].T.long()
-        return ops.rotary_cos_sin(positions, self.inv_freq.cpu() if positions.device.type == "cpu" else self.inv_freq,
-                                  self.cfg.mrope_section)
+        cos, sin = ops.rotary_cos_sin(positions, self.inv_freq.cpu() if positions.device.type == "cpu" else self.inv_freq,
+                                      self.cfg.mrope_section)
+        return cos * self.rope_scale, sin * self.rope_scale
 
     @torch.inference_mode()
     def forward(self, step: StepInput, cache: ModelCache, capture: tuple[int, ...] = (), stash: dict | None = None,
@@ -637,9 +640,10 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         if h.is_cuda:
             pos = step.positions.to(torch.float32)[self.rope_axis].T
             angles = pos * self.inv_freq
-            rope = (torch.cos(angles), torch.sin(angles))
+            rope = (torch.cos(angles) * self.rope_scale, torch.sin(angles) * self.rope_scale)
         else:
-            rope = ops.rotary_cos_sin(step.positions, self.inv_freq, t.mrope_section)
+            cos, sin = ops.rotary_cos_sin(step.positions, self.inv_freq, t.mrope_section)
+            rope = (cos * self.rope_scale, sin * self.rope_scale)
         if h.is_cuda:
             slots = step.kv_slots_t.long()
         else:

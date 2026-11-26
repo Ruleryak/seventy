@@ -8,7 +8,8 @@
  * A sequence's keys go in blocks of `compress` (c) tokens. The indexer has `heads` query heads and one key head of
  * kIdx values. qsa_pool: for every new token that completes a block (position p with (p + 1) % c == 0), the
  * block's key = RMS norm (weight already 1 + w) of the mean of its c raw indexer keys (FP16), rounded to FP16,
- * rotated (multimodal rotary on the first rotary_dim values) at the block's first position (cache positions), into
+ * rotated (multimodal rotary on the first rotary_dim values, cos and sin times rope_scale) at the block's first
+ * position (cache positions), into
  * the pooled cache [blocks, block_size / c, kIdx] at that position's block and offset. Raw keys are not kept per
  * token: the step's own come from raw [tokens, kIdx], older ones from the sequence's ring (ring [slots, ring_len,
  * kIdx], position p at p % ring_len). After the pooling, the ring takes the step's last ring_len raw keys. With
@@ -52,8 +53,8 @@ __global__ void __launch_bounds__(kIdx) qsa_pool_kernel(half *pooled, const half
                                                         const int *block_tables, int table_width,
                                                         const int *query_start, const int *context_lens,
                                                         int num_seqs, const float *k_norm, const float *inv_freq,
-                                                        int s1, int s2, int rotary_dim, int c, int block_size,
-                                                        float eps) {
+                                                        float rope_scale, int s1, int s2, int rotary_dim, int c,
+                                                        int block_size, float eps) {
   __shared__ float scratch[32];
   __shared__ float vals[kIdx];
   const int t = blockIdx.x, d = threadIdx.x;
@@ -86,6 +87,8 @@ __global__ void __launch_bounds__(kIdx) qsa_pool_kernel(half *pooled, const half
     const float pos = static_cast<float>(positions[slot0 * 3 + axis]);
     float sn, cs;
     sincosf(pos * inv_freq[i], &sn, &cs);
+    sn *= rope_scale;
+    cs *= rope_scale;
     r = d < half_rot ? vals[d] * cs - vals[d + half_rot] * sn : vals[d] * cs + vals[d - half_rot] * sn;
   }
   const int per_block = block_size / c;
@@ -529,8 +532,8 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
 SEVENTY_API int seventy_qsa_pool(void *pooled, const void *raw, void *ring, int ring_len, const int *state_slots,
                                  const int *positions, const int *block_tables, int table_width,
                                  const int *query_start, const int *context_lens, int num_seqs, int tokens,
-                                 const float *k_norm, const float *inv_freq, int s1, int s2, int rotary_dim,
-                                 int compress, int block_size, float eps, cudaStream_t stream) {
+                                 const float *k_norm, const float *inv_freq, float rope_scale, int s1, int s2,
+                                 int rotary_dim, int compress, int block_size, float eps, cudaStream_t stream) {
   using namespace seventy;
   if (pooled == nullptr || raw == nullptr || ring == nullptr || positions == nullptr || state_slots == nullptr ||
       tokens < 0 || num_seqs < 1 || compress < 1 || block_size % compress || rotary_dim > kIdx ||
@@ -540,7 +543,8 @@ SEVENTY_API int seventy_qsa_pool(void *pooled, const void *raw, void *ring, int 
   qsa_pool_kernel<<<tokens, kIdx, 0, stream>>>(static_cast<half *>(pooled), static_cast<const half *>(raw),
                                                static_cast<const half *>(ring), ring_len, state_slots, positions,
                                                block_tables, table_width, query_start, context_lens, num_seqs,
-                                               k_norm, inv_freq, s1, s2, rotary_dim, compress, block_size, eps);
+                                               k_norm, inv_freq, rope_scale, s1, s2, rotary_dim, compress, block_size,
+                                               eps);
   qsa_ring_kernel<<<dim3(8, num_seqs), kIdx, 0, stream>>>(static_cast<half *>(ring), ring_len,
                                                           static_cast<const half *>(raw), state_slots, query_start,
                                                           context_lens);

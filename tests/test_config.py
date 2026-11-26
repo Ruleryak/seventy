@@ -77,7 +77,7 @@ def test_generation_config_adds_eos():
         (lambda c: c.update(architectures=["LlamaForCausalLM"]), "architecture"),
         (lambda c: c["text_config"].update(attn_output_gate=False), "output gate"),
         (lambda c: c["text_config"].update(layer_types=["linear_attention"] * 3 + ["sliding"]), "unknown layer"),
-        (lambda c: c["text_config"]["rope_parameters"].update(rope_type="yarn"), "rope type"),
+        (lambda c: c["text_config"]["rope_parameters"].update(rope_type="longrope"), "rope type"),
         (lambda c: c["text_config"]["rope_parameters"].update(mrope_section=[2, 2, 2]), "mrope_section"),
         (lambda c: c["text_config"]["rope_parameters"].update(mrope_interleaved=False), "interleaved"),
         (lambda c: c["text_config"].update(linear_num_value_heads=3), "multiple"),

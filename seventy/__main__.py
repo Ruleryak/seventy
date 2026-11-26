@@ -121,7 +121,7 @@ def cmd_engine(args: argparse.Namespace) -> int:
         print(f"seventy: {e}", file=sys.stderr)
         return 1
     try:
-        cfg = load_config(model)
+        cfg = load_config(model, yarn_factor=args.yarn_factor)
         reasons = kernel_problems(cfg)
     except UnsupportedModel as e:
         reasons = e.reasons
@@ -140,12 +140,12 @@ def cmd_engine(args: argparse.Namespace) -> int:
         return 1
     engine = EngineConfig(
         model=model, max_num_seqs=args.max_num_seqs,
-        max_model_len=min(args.max_model_len or cfg.text.max_position_embeddings, cfg.text.max_position_embeddings),
+        max_model_len=min(args.max_model_len or cfg.text.max_context, cfg.text.max_context),
         gpu_memory_utilization=args.gpu_memory_utilization, prefill_budget=args.prefill_budget,
         activation_reserve_gib=args.activation_reserve,
         kv_dtype=args.kv_cache_dtype, tensor_parallel=tp, cuda_graphs=not args.no_cuda_graphs,
         draft_model=draft_model, mtp_tokens=args.mtp_tokens, prefix_cache=not args.no_prefix_cache,
-        cache_entries=args.cache_entries,
+        cache_entries=args.cache_entries, yarn_factor=args.yarn_factor,
     )
     server = ServerConfig(
         engine=engine, served_model_name=args.served_model_name or served_name(args.model, model),
@@ -188,7 +188,11 @@ def main(argv: list[str] | None = None) -> int:
     eng.add_argument("--api-key", help="require this key (also SEVENTY_API_KEY)")
     eng.add_argument("--gpus", help="GPU ids to use, for example 0,1,2,3 (default: all visible)")
     eng.add_argument("--tensor-parallel", type=int, help="GPUs to split the model over (default: the number of --gpus)")
-    eng.add_argument("--max-model-len", type=int)
+    eng.add_argument("--max-model-len", type=int,
+                     help="longest context (default and limit: the model's, times --yarn-factor with it)")
+    eng.add_argument("--yarn-factor", type=float,
+                     help="extend the context with YaRN by this factor over the checkpoint's trained length "
+                          "(for example 2: 262,144 -> 524,288 tokens); a checkpoint whose config has YaRN needs none")
     eng.add_argument("--max-num-seqs", type=int, default=8)
     eng.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     eng.add_argument("--prefill-budget", type=int, default=8192, help="prompt tokens per engine step")
