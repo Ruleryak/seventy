@@ -27,14 +27,6 @@ namespace {
 constexpr int kStepK = 64;
 constexpr int kRowStride = 9;
 
-__device__ __forceinline__ void mma_8x8x4(float (&c)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
-      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
-      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
-}
-
 template <int MT, int W>
 __global__ void __launch_bounds__(W * 32) dense_gemm_kernel(void *out, int out_fp32, float *ws, const half *x,
                                                              const uint4 *wpk, int m, int n, int n_tiles, int k,
@@ -102,8 +94,8 @@ __global__ void __launch_bounds__(W * 32) dense_gemm_kernel(void *out, int out_f
 #pragma unroll
         for (int t = 0; t < MT; ++t) {
           const uint4 a = stage[(t * 8 + idx) * kRowStride + i];
-          mma_8x8x4(acc[t], a.x, a.y, cur[i].x, cur[i].y);
-          mma_8x8x4(acc[t], a.z, a.w, cur[i].z, cur[i].w);
+          mma_m8n8k4(acc[t], a.x, a.y, cur[i].x, cur[i].y);
+          mma_m8n8k4(acc[t], a.z, a.w, cur[i].z, cur[i].w);
         }
       }
     }
@@ -218,8 +210,8 @@ __global__ void __launch_bounds__(W * 32) dense_gemm_fp8_kernel(void *out, int o
 #pragma unroll
         for (int t = 0; t < MT; ++t) {
           const uint4 a = stage[(t * 8 + idx) * kRowStride + i];
-          mma_8x8x4(acc[t], a.x, a.y, b0, b1);
-          mma_8x8x4(acc[t], a.z, a.w, b2, b3);
+          mma_m8n8k4(acc[t], a.x, a.y, b0, b1);
+          mma_m8n8k4(acc[t], a.z, a.w, b2, b3);
         }
       }
     }
@@ -348,8 +340,8 @@ __global__ void __launch_bounds__(W * 32) dense_gemm_wk_kernel(void *out, int ou
 #pragma unroll
       for (int t = 0; t < MT; ++t) {
         const uint4 a = mine[(t * 8 + idx) * kRowStride + i];
-        mma_8x8x4(acc[t], a.x, a.y, cur[i].x, cur[i].y);
-        mma_8x8x4(acc[t], a.z, a.w, cur[i].z, cur[i].w);
+        mma_m8n8k4(acc[t], a.x, a.y, cur[i].x, cur[i].y);
+        mma_m8n8k4(acc[t], a.z, a.w, cur[i].z, cur[i].w);
       }
     }
     __syncwarp();
@@ -465,8 +457,8 @@ __global__ void __launch_bounds__(W * 32) dense_gemm_fp8_wk_kernel(void *out, in
 #pragma unroll
       for (int t = 0; t < MT; ++t) {
         const uint4 a = mine[(t * 8 + idx) * kRowStride + i];
-        mma_8x8x4(acc[t], a.x, a.y, b0, b1);
-        mma_8x8x4(acc[t], a.z, a.w, b2, b3);
+        mma_m8n8k4(acc[t], a.x, a.y, b0, b1);
+        mma_m8n8k4(acc[t], a.z, a.w, b2, b3);
       }
     }
     __syncwarp();

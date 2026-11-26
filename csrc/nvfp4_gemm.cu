@@ -58,14 +58,6 @@ __device__ __forceinline__ uint32_t hmul2_bits(uint32_t a, __half2 s) {
   return *reinterpret_cast<uint32_t *>(&h);
 }
 
-__device__ __forceinline__ void mma_8x8x4(float (&c)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
-      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
-      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
-}
-
 template <int MT, int W>
 struct Stage {
   static constexpr int kRows = MT * 8;
@@ -124,8 +116,8 @@ __device__ __forceinline__ void step_mma(float (&acc)[MT][8], const uint4 *stage
 #pragma unroll
       for (int t = 0; t < MT; ++t) {
         const uint4 a = stage[(t * 8 + idx) * kRowStride + j];
-        mma_8x8x4(acc[t], a.x, a.y, b0, b1);
-        mma_8x8x4(acc[t], a.z, a.w, b2, b3);
+        mma_m8n8k4(acc[t], a.x, a.y, b0, b1);
+        mma_m8n8k4(acc[t], a.z, a.w, b2, b3);
       }
     }
     return;
@@ -148,8 +140,8 @@ __device__ __forceinline__ void step_mma(float (&acc)[MT][8], const uint4 *stage
 #pragma unroll
       for (int t = 0; t < MT; ++t) {
         const uint4 a = st[(t * 8 + idx) * kRowStride + jj];
-        mma_8x8x4(acc[t], a.x, a.y, b0, b1);
-        mma_8x8x4(acc[t], a.z, a.w, b2, b3);
+        mma_m8n8k4(acc[t], a.x, a.y, b0, b1);
+        mma_m8n8k4(acc[t], a.z, a.w, b2, b3);
       }
     }
   }

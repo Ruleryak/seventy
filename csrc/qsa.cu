@@ -1,6 +1,8 @@
 #include "common.cuh"
 
 #include <cfloat>
+#include <cstdlib>
+#include <cstring>
 
 /*
  * Qwen Sparse Attention (Qwen4-Exp) for the attention layers of a step, all on the GPU (CUDA graphs).
@@ -526,6 +528,234 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
   }
 }
 
+/*
+ * qsa_attention_mma_kernel: qsa_attention_kernel on the tensor cores, for INT8 caches and up to 16 query heads per KV
+ * head (kMT m-tiles of 8). One block of 4 warps per (split, query row, KV head), chunks of 32 positions.
+ * - The chunk's keys stay INT8 in shared memory (rows of 260 bytes) and its values INT8 transposed (vt[dim][pos],
+ *   rows of 36 bytes); the key scale multiplies the scores after the products and the value scale the
+ *   probabilities before them. INT8 values are exact in FP16.
+ * - Scores: mma.m8n8k4 (fragment layout in csrc/nvfp4_gemm.cu), quad-pair p and index i take position 4 i + p, so
+ *   the lanes of a half-warp read consecutive positions (no bank conflicts); warp w adds dims 64 w .. 64 w + 63 and
+ *   the four partial scores meet in shared memory. Then the online softmax per row (one warp per row).
+ * - Output: warp w keeps dims 64 w .. 64 w + 63 (two tiles of 32; quad-pair p, index i: dim 4 i + p of a tile) of
+ *   every row in its accumulators, scaled by each row's correction per chunk; the probabilities go to the tensor
+ *   cores in FP16.
+ * - Each thread loads the next chunk's keys, values and scales into registers while the block computes the current
+ *   one. The values load one position per lane, so that their transposed stores do not conflict.
+ */
+constexpr int kMmaChunk = 32;
+constexpr int kMmaKStride = 260;
+constexpr int kMmaVStride = 36;
+constexpr int kMmaQStride = 260;
+constexpr int kMmaPStride = 36;
+
+__device__ __forceinline__ void i8x4_to_half2x2(uint32_t w, uint32_t &lo, uint32_t &hi) {
+  const uint32_t u = w ^ 0x80808080u;
+  uint32_t a = __byte_perm(u, 0x64646464u, 0x4140);
+  uint32_t b = __byte_perm(u, 0x64646464u, 0x4342);
+  const __half2 bias = __float2half2_rn(1152.0f);
+  __half2 ha = __hsub2(*reinterpret_cast<__half2 *>(&a), bias);
+  __half2 hb = __hsub2(*reinterpret_cast<__half2 *>(&b), bias);
+  lo = *reinterpret_cast<uint32_t *>(&ha);
+  hi = *reinterpret_cast<uint32_t *>(&hb);
+}
+
+template <int kMT>
+__global__ void __launch_bounds__(kAttnThreads) qsa_attention_mma_kernel(
+    float *partial_o, float *partial_ml, const half *q, const int8_t *k_cache, const int8_t *v_cache,
+    const float *k_scale, const float *v_scale, const int *sel, int width, const int *block_tables, int table_width,
+    const int *query_start, int num_seqs, int block_size, int hq, int hkv, int splits, float scale, int row0) {
+  constexpr int kR = kMT * 8;
+  __shared__ __align__(16) half qs[kR][kMmaQStride];
+  __shared__ __align__(16) int8_t ks[kMmaChunk][kMmaKStride];
+  __shared__ __align__(16) int8_t vt[kHeadD][kMmaVStride];
+  __shared__ float spart[4][kR][kMmaChunk + 1];
+  __shared__ __align__(16) half p16[kR][kMmaPStride];
+  __shared__ float kscl[kMmaChunk], vscl[kMmaChunk];
+  __shared__ float row_m[kR], row_l[kR], row_scale[kR];
+  __shared__ int pos_list[2][kMmaChunk];
+  __shared__ int64_t slot_list[2][kMmaChunk];
+  const int split = blockIdx.x, t = blockIdx.y, kh = blockIdx.z, tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int qp = (lane >> 2) & 3, idx = (lane & 3) + ((lane >> 4) << 2);
+  const int rows = hq / hkv;
+  const int b = seq_of(query_start, num_seqs, row0 + t);
+  const int *row_sel = sel + static_cast<int64_t>(t) * width;
+  const int per = (width + splits - 1) / splits;
+  const int first = split * per, last = min(width, first + per);
+  auto pidx = [&](int r) { return (static_cast<int64_t>(t) * hq + kh * rows + r) * splits + split; };
+  for (int e = tid; e < kR * (kHeadD / 8); e += kAttnThreads) {
+    const int r = e / (kHeadD / 8), part = e % (kHeadD / 8);
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (r < rows)
+      v = *reinterpret_cast<const uint4 *>(q + (static_cast<int64_t>(t) * hq + kh * rows + r) * kHeadD + part * 8);
+    uint32_t *dst = reinterpret_cast<uint32_t *>(&qs[r][part * 8]);
+    dst[0] = v.x;
+    dst[1] = v.y;
+    dst[2] = v.z;
+    dst[3] = v.w;
+  }
+  if (tid < kR) {
+    row_m[tid] = -FLT_MAX;
+    row_l[tid] = 0.0f;
+  }
+  const int *table = block_tables + static_cast<int64_t>(b) * table_width;
+  auto prepare = [&](int c, int buf) {
+    if (tid < kMmaChunk) {
+      const int pos = c + tid < last ? row_sel[c + tid] : -1;
+      pos_list[buf][tid] = pos;
+      slot_list[buf][tid] =
+          pos < 0 ? -1 : static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
+    }
+  };
+  constexpr int kIter = kMmaChunk * 16 / kAttnThreads;
+  uint4 kr[kIter], vr[kIter];
+  float ksr = 0.0f, vsr = 0.0f;
+  auto fetch = [&](int buf) {
+#pragma unroll
+    for (int i = 0; i < kIter; ++i) {
+      const int e = tid + i * kAttnThreads;
+      const int64_t ks_slot = slot_list[buf][e / 16];
+      kr[i] = ks_slot >= 0 ? *reinterpret_cast<const uint4 *>(k_cache + (ks_slot * hkv + kh) * kHeadD + (e % 16) * 16)
+                           : make_uint4(0, 0, 0, 0);
+      const int64_t vs_slot = slot_list[buf][e % kMmaChunk];
+      vr[i] = vs_slot >= 0
+                  ? *reinterpret_cast<const uint4 *>(v_cache + (vs_slot * hkv + kh) * kHeadD + (e / kMmaChunk) * 16)
+                  : make_uint4(0, 0, 0, 0);
+    }
+    if (tid < kMmaChunk) {
+      const int64_t slot = slot_list[buf][tid];
+      ksr = slot >= 0 ? k_scale[slot * hkv + kh] : 0.0f;
+      vsr = slot >= 0 ? v_scale[slot * hkv + kh] : 0.0f;
+    }
+  };
+  float acc[kMT][2][8];
+#pragma unroll
+  for (int m = 0; m < kMT; ++m)
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[m][nt][j] = 0.0f;
+  prepare(first, 0);
+  __syncthreads();
+  if (first < last) fetch(0);
+  int buf = 0;
+  for (int c0 = first; c0 < last; c0 += kMmaChunk, buf ^= 1) {
+#pragma unroll
+    for (int i = 0; i < kIter; ++i) {
+      const int e = tid + i * kAttnThreads;
+      uint32_t *kd = reinterpret_cast<uint32_t *>(&ks[e / 16][(e % 16) * 16]);
+      kd[0] = kr[i].x;
+      kd[1] = kr[i].y;
+      kd[2] = kr[i].z;
+      kd[3] = kr[i].w;
+      const int pos = e % kMmaChunk, d0 = (e / kMmaChunk) * 16;
+      const uint32_t w[4] = {vr[i].x, vr[i].y, vr[i].z, vr[i].w};
+#pragma unroll
+      for (int q4 = 0; q4 < 16; ++q4) vt[d0 + q4][pos] = static_cast<int8_t>((w[q4 >> 2] >> (8 * (q4 & 3))) & 0xff);
+    }
+    if (tid < kMmaChunk) {
+      kscl[tid] = ksr;
+      vscl[tid] = vsr;
+    }
+    prepare(c0 + kMmaChunk, buf ^ 1);
+    __syncthreads();
+    if (c0 + kMmaChunk < last) fetch(buf ^ 1);
+    {
+      float sc[kMT][8];
+#pragma unroll
+      for (int m = 0; m < kMT; ++m)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sc[m][j] = 0.0f;
+      const int pos = 4 * idx + qp;
+#pragma unroll 4
+      for (int s4 = 0; s4 < 16; ++s4) {
+        const int d0 = warp * 64 + s4 * 4;
+        uint32_t b0, b1;
+        i8x4_to_half2x2(*reinterpret_cast<const uint32_t *>(&ks[pos][d0]), b0, b1);
+#pragma unroll
+        for (int m = 0; m < kMT; ++m) {
+          const uint2 a = *reinterpret_cast<const uint2 *>(&qs[m * 8 + idx][d0]);
+          mma_m8n8k4(sc[m], a.x, a.y, b0, b1);
+        }
+      }
+#pragma unroll
+      for (int m = 0; m < kMT; ++m)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int r = m * 8 + (idx & 1) + 2 * ((j >> 1) & 1) + 4 * (idx >> 2);
+          const int col = (j & 1) + 2 * ((idx >> 1) & 1) + 4 * (j >> 2);
+          spart[warp][r][4 * col + qp] = sc[m][j];
+        }
+    }
+    __syncthreads();
+    const int *pos_now = pos_list[buf];
+    for (int r = warp; r < rows; r += 4) {
+      const float raw = spart[0][r][lane] + spart[1][r][lane] + spart[2][r][lane] + spart[3][r][lane];
+      const bool ok = pos_now[lane] >= 0;
+      const float sv = ok ? raw * kscl[lane] * scale : -FLT_MAX;
+      float m = sv;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+      const float m_old = row_m[r];
+      const float m_new = fmaxf(m_old, m);
+      const float e = ok ? expf(sv - m_new) : 0.0f;
+      float l = e;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+      p16[r][lane] = __float2half_rn(e * vscl[lane]);
+      if (lane == 0) {
+        const float corr = m_old == -FLT_MAX ? 0.0f : expf(m_old - m_new);
+        row_scale[r] = corr;
+        row_l[r] = row_l[r] * corr + l;
+        row_m[r] = m_new;
+      }
+    }
+    for (int r = rows + warp; r < kR; r += 4) {
+      p16[r][lane] = __float2half_rn(0.0f);
+      if (lane == 0) row_scale[r] = 0.0f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int m = 0; m < kMT; ++m)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float cr = row_scale[m * 8 + (idx & 1) + 2 * ((j >> 1) & 1) + 4 * (idx >> 2)];
+        acc[m][0][j] *= cr;
+        acc[m][1][j] *= cr;
+      }
+#pragma unroll
+    for (int s4 = 0; s4 < kMmaChunk / 4; ++s4) {
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt) {
+        const int dim = warp * 64 + nt * 32 + 4 * idx + qp;
+        uint32_t b0, b1;
+        i8x4_to_half2x2(*reinterpret_cast<const uint32_t *>(&vt[dim][s4 * 4]), b0, b1);
+#pragma unroll
+        for (int m = 0; m < kMT; ++m) {
+          const uint2 a = *reinterpret_cast<const uint2 *>(&p16[m * 8 + idx][s4 * 4]);
+          mma_m8n8k4(acc[m][nt], a.x, a.y, b0, b1);
+        }
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int m = 0; m < kMT; ++m)
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int r = m * 8 + (idx & 1) + 2 * ((j >> 1) & 1) + 4 * (idx >> 2);
+        const int col = (j & 1) + 2 * ((idx >> 1) & 1) + 4 * (j >> 2);
+        if (r < rows) partial_o[pidx(r) * kHeadD + warp * 64 + nt * 32 + 4 * col + qp] = acc[m][nt][j];
+      }
+  if (tid < rows) {
+    partial_ml[pidx(tid) * 2] = row_m[tid];
+    partial_ml[pidx(tid) * 2 + 1] = row_l[tid];
+  }
+}
+
 }  // namespace
 }  // namespace seventy
 
@@ -613,6 +843,20 @@ SEVENTY_API int seventy_qsa_attention(float *partial_o, float *partial_ml, const
   qsa_attention_kernel<T, R, C><<<grid, kAttnThreads, 0, stream>>>(                                                \
       partial_o, partial_ml, static_cast<const half *>(q), static_cast<const T *>(K), static_cast<const T *>(V), KS, \
       VS, sel, width, block_tables, table_width, query_start, num_seqs, block_size, hq, hkv, splits, scale, row0)
+  static const bool mma = getenv("SEVENTY_QSA_MMA") == nullptr || strcmp(getenv("SEVENTY_QSA_MMA"), "0") != 0;
+  if (k_scale != nullptr && mma && rows <= 16) {
+    if (rows <= 8)
+      qsa_attention_mma_kernel<1><<<grid, kAttnThreads, 0, stream>>>(
+          partial_o, partial_ml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
+          static_cast<const int8_t *>(v_cache), k_scale, v_scale, sel, width, block_tables, table_width, query_start,
+          num_seqs, block_size, hq, hkv, splits, scale, row0);
+    else
+      qsa_attention_mma_kernel<2><<<grid, kAttnThreads, 0, stream>>>(
+          partial_o, partial_ml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
+          static_cast<const int8_t *>(v_cache), k_scale, v_scale, sel, width, block_tables, table_width, query_start,
+          num_seqs, block_size, hq, hkv, splits, scale, row0);
+    return launch_status();
+  }
   if (k_scale != nullptr) {
     if (rows <= 8)
       SEVENTY_QSA_ATTN(int8_t, 8, 32, k_cache, v_cache, k_scale, v_scale);

@@ -19,6 +19,18 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 /*
+ * One Volta tensor-core product (mma.m8n8k4.row.col, FP16 inputs, FP32 accumulators): each quad-pair of the warp adds
+ * its 8 x 4 A (a0, a1) times its 4 x 8 B (b0, b1) into its 8 x 8 accumulators c (layout in csrc/nvfp4_gemm.cu).
+ */
+__device__ __forceinline__ void mma_m8n8k4(float (&c)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+
+/*
  * Sum of v over the block. Every thread gets the result. scratch needs 32 floats of shared memory.
  */
 __device__ __forceinline__ float block_sum(float v, float *scratch) {
