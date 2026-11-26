@@ -15,6 +15,7 @@ import torch
 
 from ..config import TextConfig
 from ..parallel import SINGLE, Parallel
+from ..split import kv_groups
 
 IDX_RING = 32
 
@@ -31,6 +32,7 @@ class ModelCache:
         par: Parallel = SINGLE,
         kv_dtype: torch.dtype | None = None,
         extra_attention_layers: tuple[int, ...] = (),
+        kv_split: int = 1,
     ):
         """kv_dtype: the attention KV cache format, torch.int8 (with per-token, per-head FP32 scales) or the activation
         dtype. Default: int8 on CUDA, the activation dtype elsewhere.
@@ -39,7 +41,12 @@ class ModelCache:
         rows in CUDA-graph steps.
 
         extra_attention_layers: layer indices past the model's layers with a KV cache of their own (the MTP
-        drafter's attention layer), in the same blocks as the model's attention layers."""
+        drafter's attention layer), in the same blocks as the model's attention layers.
+
+        kv_split: the ranks of each group that shares a KV head (split.kv_groups, memory.kv_split) keep one share of
+        its tokens each: this rank, index kv_part of its group, keeps the keys and values of slots s with
+        s % kv_split == kv_part, at row s // kv_split (blocks of block_size // kv_split rows). The pooled indexer
+        keys and the positions stay per token on every rank."""
         device = torch.device(device)
         self.block_size = block_size
         self.num_blocks = num_blocks
@@ -48,12 +55,19 @@ class ModelCache:
         self.scratch_slot = num_slots
         self.kv_dtype = kv_dtype or (torch.int8 if device.type == "cuda" else dtype)
         kv_heads = par.heads(cfg.num_heads, cfg.num_kv_heads).num_kv
+        self.kv_split, self.kv_part = kv_split, 0
+        if kv_split > 1:
+            groups = kv_groups(cfg.num_heads, cfg.num_kv_heads, par.size)
+            group = next(g for g in groups if par.rank in g)
+            if len(group) != kv_split or block_size % kv_split:
+                raise ValueError(f"a KV split of {kv_split} does not fit groups {groups} and blocks of {block_size}")
+            self.kv_part = group.index(par.rank)
         gdn = par.heads(cfg.gdn_v_heads, cfg.gdn_k_heads)
         hk, hv = gdn.num_kv, gdn.num_heads
         conv_dim = 2 * hk * cfg.gdn_k_dim + hv * cfg.gdn_v_dim
         attn = tuple(cfg.attention_layers) + tuple(extra_attention_layers)
         na, nl = len(attn), len(cfg.linear_layers)
-        kv_shape = (na, num_blocks + 1, block_size, kv_heads, cfg.head_dim)
+        kv_shape = (na, num_blocks + 1, block_size // kv_split, kv_heads, cfg.head_dim)
         self.k_all = torch.zeros(kv_shape, dtype=self.kv_dtype, device=device)
         self.v_all = torch.zeros(kv_shape, dtype=self.kv_dtype, device=device)
         self.k_scale_all = self.v_scale_all = None

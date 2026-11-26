@@ -35,7 +35,11 @@
  * qsa_attention: attention of each query row over its selected positions (one block per split, row and KV head; the
  * group's query heads, at most 32, share the row's positions; split s takes the entries s * ceil(width / splits)
  * onward of the row's sel), with partial outputs for attention_combine in csrc/attention.cu
- * (seventy_decode_attention's workspace layout with one token per row).
+ * (seventy_decode_attention's workspace layout with one token per row). With a split KV cache (kv_split ranks share
+ * the KV head, seventy_attn_prep_split), the rank takes the entries e with e % kv_split == kv_part (sel entry e
+ * holds a position p with p % compress == e % compress, so with compress % kv_split == 0 these are the positions of
+ * its tokens) and reads them at row slot / kv_split; the parts of the ranks then merge (seventy_attention_partial,
+ * seventy_attention_merge, or seventy_ar_attn_merge over peer-to-peer memory).
  */
 
 namespace seventy {
@@ -397,7 +401,8 @@ template <typename T, int kRows, int kChunk>
 __global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
     float *partial_o, float *partial_ml, const half *q, const T *k_cache, const T *v_cache, const float *k_scale,
     const float *v_scale, const int *sel, int width, const int *block_tables, int table_width,
-    const int *query_start, int num_seqs, int block_size, int hq, int hkv, int splits, float scale, int row0) {
+    const int *query_start, int num_seqs, int block_size, int hq, int hkv, int splits, float scale, int row0,
+    int kv_split, int kv_part) {
   __shared__ __align__(16) half qs[kRows][kHeadD];
   __shared__ half ks[kChunk][kKStride];
   __shared__ half vs[kChunk][kKStride];
@@ -409,9 +414,10 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
   const int lane = tid & 31, warp = tid >> 5;
   const int rows = hq / hkv;
   const int b = seq_of(query_start, num_seqs, row0 + t);
-  const int *row_sel = sel + static_cast<int64_t>(t) * width;
-  const int per = (width + splits - 1) / splits;
-  const int first = split * per, last = min(width, first + per);
+  const int *row_sel = sel + static_cast<int64_t>(t) * width + kv_part;
+  const int entries = (width - kv_part + kv_split - 1) / kv_split;
+  const int per = (entries + splits - 1) / splits;
+  const int first = split * per, last = min(entries, first + per);
   auto pidx = [&](int r) { return (static_cast<int64_t>(t) * hq + kh * rows + r) * splits + split; };
   for (int e = tid; e < rows * (kHeadD / 8); e += kAttnThreads) {
     const int r = e / (kHeadD / 8), part = e % (kHeadD / 8);
@@ -428,10 +434,11 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
   const int *table = block_tables + static_cast<int64_t>(b) * table_width;
   auto prepare = [&](int c, int buf) {
     if (tid < kChunk) {
-      const int pos = c + tid < last ? row_sel[c + tid] : -1;
+      const int pos = c + tid < last ? row_sel[(c + tid) * kv_split] : -1;
       pos_list[buf][tid] = pos;
       slot_list[buf][tid] =
-          pos < 0 ? -1 : static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
+          pos < 0 ? -1
+                  : (static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size) / kv_split;
     }
   };
   typename ChunkLoad<T>::template Regs<kChunk> regs;
@@ -564,7 +571,8 @@ template <int kMT>
 __global__ void __launch_bounds__(kAttnThreads) qsa_attention_mma_kernel(
     float *partial_o, float *partial_ml, const half *q, const int8_t *k_cache, const int8_t *v_cache,
     const float *k_scale, const float *v_scale, const int *sel, int width, const int *block_tables, int table_width,
-    const int *query_start, int num_seqs, int block_size, int hq, int hkv, int splits, float scale, int row0) {
+    const int *query_start, int num_seqs, int block_size, int hq, int hkv, int splits, float scale, int row0,
+    int kv_split, int kv_part) {
   constexpr int kR = kMT * 8;
   __shared__ __align__(16) half qs[kR][kMmaQStride];
   __shared__ __align__(16) int8_t ks[kMmaChunk][kMmaKStride];
@@ -580,9 +588,10 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_mma_kernel(
   const int qp = (lane >> 2) & 3, idx = (lane & 3) + ((lane >> 4) << 2);
   const int rows = hq / hkv;
   const int b = seq_of(query_start, num_seqs, row0 + t);
-  const int *row_sel = sel + static_cast<int64_t>(t) * width;
-  const int per = (width + splits - 1) / splits;
-  const int first = split * per, last = min(width, first + per);
+  const int *row_sel = sel + static_cast<int64_t>(t) * width + kv_part;
+  const int entries = (width - kv_part + kv_split - 1) / kv_split;
+  const int per = (entries + splits - 1) / splits;
+  const int first = split * per, last = min(entries, first + per);
   auto pidx = [&](int r) { return (static_cast<int64_t>(t) * hq + kh * rows + r) * splits + split; };
   for (int e = tid; e < kR * (kHeadD / 8); e += kAttnThreads) {
     const int r = e / (kHeadD / 8), part = e % (kHeadD / 8);
@@ -602,10 +611,11 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_mma_kernel(
   const int *table = block_tables + static_cast<int64_t>(b) * table_width;
   auto prepare = [&](int c, int buf) {
     if (tid < kMmaChunk) {
-      const int pos = c + tid < last ? row_sel[c + tid] : -1;
+      const int pos = c + tid < last ? row_sel[(c + tid) * kv_split] : -1;
       pos_list[buf][tid] = pos;
       slot_list[buf][tid] =
-          pos < 0 ? -1 : static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
+          pos < 0 ? -1
+                  : (static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size) / kv_split;
     }
   };
   constexpr int kIter = kMmaChunk * 16 / kAttnThreads;
@@ -831,10 +841,12 @@ SEVENTY_API int seventy_qsa_attention(float *partial_o, float *partial_ml, const
                                       const void *v_cache, const float *k_scale, const float *v_scale,
                                       const int *sel, int width, const int *block_tables, int table_width,
                                       const int *query_start, int num_seqs, int row0, int tokens, int block_size,
-                                      int hq, int hkv, int splits, float scale, cudaStream_t stream) {
+                                      int hq, int hkv, int splits, float scale, int kv_split, int kv_part,
+                                      cudaStream_t stream) {
   using namespace seventy;
   if (partial_o == nullptr || partial_ml == nullptr || q == nullptr || sel == nullptr || tokens < 0 || hkv < 1 ||
-      hq % hkv || hq / hkv > 32 || splits < 1)
+      hq % hkv || hq / hkv > 32 || splits < 1 || kv_split < 1 || kv_part < 0 || kv_part >= kv_split ||
+      block_size % kv_split)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (tokens == 0) return SEVENTY_OK;
   const dim3 grid(splits, tokens, hkv);
@@ -842,19 +854,20 @@ SEVENTY_API int seventy_qsa_attention(float *partial_o, float *partial_ml, const
 #define SEVENTY_QSA_ATTN(T, R, C, K, V, KS, VS)                                                                    \
   qsa_attention_kernel<T, R, C><<<grid, kAttnThreads, 0, stream>>>(                                                \
       partial_o, partial_ml, static_cast<const half *>(q), static_cast<const T *>(K), static_cast<const T *>(V), KS, \
-      VS, sel, width, block_tables, table_width, query_start, num_seqs, block_size, hq, hkv, splits, scale, row0)
+      VS, sel, width, block_tables, table_width, query_start, num_seqs, block_size, hq, hkv, splits, scale, row0,   \
+      kv_split, kv_part)
   static const bool mma = getenv("SEVENTY_QSA_MMA") == nullptr || strcmp(getenv("SEVENTY_QSA_MMA"), "0") != 0;
   if (k_scale != nullptr && mma && rows <= 16) {
     if (rows <= 8)
       qsa_attention_mma_kernel<1><<<grid, kAttnThreads, 0, stream>>>(
           partial_o, partial_ml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
           static_cast<const int8_t *>(v_cache), k_scale, v_scale, sel, width, block_tables, table_width, query_start,
-          num_seqs, block_size, hq, hkv, splits, scale, row0);
+          num_seqs, block_size, hq, hkv, splits, scale, row0, kv_split, kv_part);
     else
       qsa_attention_mma_kernel<2><<<grid, kAttnThreads, 0, stream>>>(
           partial_o, partial_ml, static_cast<const half *>(q), static_cast<const int8_t *>(k_cache),
           static_cast<const int8_t *>(v_cache), k_scale, v_scale, sel, width, block_tables, table_width, query_start,
-          num_seqs, block_size, hq, hkv, splits, scale, row0);
+          num_seqs, block_size, hq, hkv, splits, scale, row0, kv_split, kv_part);
     return launch_status();
   }
   if (k_scale != nullptr) {

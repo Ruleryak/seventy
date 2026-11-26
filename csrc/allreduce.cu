@@ -1,5 +1,6 @@
 #include "common.cuh"
 
+#include <cfloat>
 #include <cstdlib>
 #include <cstring>
 
@@ -868,18 +869,120 @@ __global__ void __launch_bounds__(kThreads) ar_sum_f32_kernel(ArContext ctx, flo
   }
 }
 
+/*
+ * Split attention merge over peer-to-peer memory (seventy_ar_attn_merge). The two ranks that share a KV head (KV
+ * cache split 2, seventy_attn_prep_split) each attended over their share of its tokens for all its query heads (the
+ * workspace of seventy_qsa_attention). One block of kPairDim threads per unit (row, own head j):
+ *   1. merges the splits of the peer's own head j into one part (the output sums relative to the part's maximum,
+ *      the maximum and the sum of the exponentials: kPairWords FP32 words) and writes it straight into the peer's
+ *      pair area at the unit;
+ *   2. merges the splits of its own head j, waits for the peer's part of that head in its own pair area (every word
+ *      is its own flag, as in ar_sum_push_kernel), merges the two parts, rounds and multiplies by sigmoid(gate) as
+ *      seventy_attention_combine does, and empties its area.
+ * The pair area (two halves after the push areas) and one epoch per unit (after the guard) are separate from the
+ * all-reduce's: a pair call only waits for the peer, so it must not use slots that a call with other ranks could
+ * still read. A sender writes half e % 2 of a unit in call e only after it read the peer's part of call e - 1, which
+ * the peer wrote after it had emptied the unit in call e - 2. Calls with more than kPairUnits units go in parts of
+ * whole rows.
+ */
+constexpr int kPairDim = 256;
+constexpr int kPairWords = kPairDim + 4;
+constexpr int kPairUnits = 512;
+constexpr int64_t kPairBytes = 2 * static_cast<int64_t>(kPairUnits) * kPairWords * sizeof(float);
+
+__host__ __device__ inline int64_t pair_offset(int world, int64_t slot_bytes) { return push_end(world, slot_bytes); }
+
+__device__ __forceinline__ void st_vol32(uint32_t *p, uint32_t v) {
+  asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(v), "l"(p));
+}
+
+__device__ __forceinline__ uint32_t ld_vol32(const uint32_t *p) {
+  uint32_t v;
+  asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+
+__device__ __forceinline__ uint32_t send_word(float v) {
+  const uint32_t u = __float_as_uint(v);
+  return u == kEmpty ? kEmpty - 1 : u;
+}
+
+__device__ __forceinline__ float wait_word(const uint32_t *p, const ArContext &ctx) {
+  uint32_t v;
+  Spin spin;
+  do {
+    v = ld_vol32(p);
+  } while (v == kEmpty && spin.more(ctx, 7));
+  return __uint_as_float(v);
+}
+
+__device__ __forceinline__ void merge_splits(const float *po, const float *pml, int64_t base, int splits, int d,
+                                             float &m, float &l, float &o) {
+  m = -FLT_MAX;
+  for (int s = 0; s < splits; ++s) m = fmaxf(m, pml[(base + s) * 2]);
+  l = 0.0f;
+  o = 0.0f;
+  for (int s = 0; s < splits; ++s) {
+    const float ms = pml[(base + s) * 2];
+    if (ms == -FLT_MAX) continue;
+    const float w = expf(ms - m);
+    l += pml[(base + s) * 2 + 1] * w;
+    o += po[(base + s) * kPairDim + d] * w;
+  }
+}
+
+__global__ void __launch_bounds__(kPairDim) ar_attn_merge_kernel(ArContext ctx, half *out, const float *po,
+                                                                 const float *pml, const half *qkv, int ld, int row0,
+                                                                 int hq, int splits, int own0, int own, int peer,
+                                                                 int peer_own0) {
+  const int lt = blockIdx.x, j = blockIdx.y, d = threadIdx.x;
+  const int t = row0 + lt;
+  const int unit = lt * own + j;
+  uint32_t *epochs = reinterpret_cast<uint32_t *>(reinterpret_cast<char *>(ctx.counters) + kCounterBytes +
+                                                  sizeof(Guard));
+  const uint32_t parity = epochs[unit] & 1u;
+  const int64_t off = pair_offset(ctx.world, ctx.slot_bytes) +
+                      (static_cast<int64_t>(parity) * kPairUnits + unit) * kPairWords * sizeof(float);
+  float m, l, o;
+  merge_splits(po, pml, (static_cast<int64_t>(t) * hq + peer_own0 + j) * splits, splits, d, m, l, o);
+  uint32_t *dst = reinterpret_cast<uint32_t *>(ctx.buffers[peer] + off);
+  st_vol32(dst + d, send_word(o));
+  if (d == 0) {
+    st_vol32(dst + kPairDim, send_word(m));
+    st_vol32(dst + kPairDim + 1, send_word(l));
+  }
+  merge_splits(po, pml, (static_cast<int64_t>(t) * hq + own0 + j) * splits, splits, d, m, l, o);
+  uint32_t *mine = reinterpret_cast<uint32_t *>(ctx.buffers[ctx.rank] + off);
+  const float o1 = wait_word(mine + d, ctx);
+  const float m1 = wait_word(mine + kPairDim, ctx);
+  const float l1 = wait_word(mine + kPairDim + 1, ctx);
+  st_vol32(mine + d, kEmpty);
+  const float mx = fmaxf(m, m1);
+  const float w0 = m == -FLT_MAX ? 0.0f : expf(m - mx);
+  const float w1 = m1 == -FLT_MAX ? 0.0f : expf(m1 - mx);
+  const float a = __half2float(__float2half_rn((o * w0 + o1 * w1) / (l * w0 + l1 * w1)));
+  const float g = __half2float(qkv[static_cast<int64_t>(t) * ld + (own0 + j) * 2 * kPairDim + kPairDim + d]);
+  out[(static_cast<int64_t>(t) * own + j) * kPairDim + d] = __float2half_rn(a / (1.0f + expf(-g)));
+  __syncthreads();
+  if (d == 0) {
+    st_vol32(mine + kPairDim, kEmpty);
+    st_vol32(mine + kPairDim + 1, kEmpty);
+    epochs[unit] += 1;
+  }
+}
+
 }  // namespace
 }  // namespace seventy
 
 SEVENTY_API int64_t seventy_ar_buffer_bytes(int world, int64_t slot_bytes) {
   using namespace seventy;
-  return push_end(world, slot_bytes);
+  return pair_offset(world, slot_bytes) + kPairBytes;
 }
 
 SEVENTY_API int seventy_ar_alloc(int world, int64_t slot_bytes, void **ptr, void *handle) {
   using namespace seventy;
   if (world < 2 || world > kMaxRanks || slot_bytes <= 0 || slot_bytes % 32) return SEVENTY_ERR_INVALID_ARGUMENT;
-  const int64_t bytes = push_end(world, slot_bytes);
+  const int64_t bytes = pair_offset(world, slot_bytes) + kPairBytes;
   cudaError_t e = cudaMalloc(ptr, bytes);
   if (e != cudaSuccess) return static_cast<int>(e);
   const int64_t p1 = push_p1_offset(world, slot_bytes);
@@ -906,8 +1009,11 @@ SEVENTY_API int seventy_ar_context(int rank, int world, void *const *buffers, in
   ctx->rank = rank;
   ctx->world = world;
   ctx->slot_bytes = slot_bytes;
-  cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&ctx->counters), kCounterBytes + sizeof(Guard));
+  const int64_t pair_epochs = kPairUnits * static_cast<int64_t>(sizeof(uint32_t));
+  cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&ctx->counters), kCounterBytes + sizeof(Guard) + pair_epochs);
   if (e == cudaSuccess) e = cudaMemset(ctx->counters, 0, kCounterBytes);
+  if (e == cudaSuccess)
+    e = cudaMemset(reinterpret_cast<char *>(ctx->counters) + kCounterBytes + sizeof(Guard), 0, pair_epochs);
   const Guard guard{nullptr, kDefaultTimeoutUnits, 0};
   if (e == cudaSuccess)
     e = cudaMemcpy(reinterpret_cast<char *>(ctx->counters) + kCounterBytes, &guard, sizeof(guard),
@@ -1026,6 +1132,28 @@ SEVENTY_API int seventy_ar_norm_2shot(void *ctx_ptr, void *out, void *residual, 
       ar_norm_push_all_kernel<<<rows, threads, 0, stream>>>(*ctx, static_cast<half *>(out),
                                                             static_cast<half *>(residual),
                                                             static_cast<const half *>(x), weight, rows, dim, eps);
+  }
+  return launch_status();
+}
+
+SEVENTY_API int seventy_ar_attn_merge(void *ctx_ptr, void *out, const float *workspace, const void *qkv, int ld,
+                                      int tokens, int hq, int splits, int own0, int own, int peer, int peer_own0,
+                                      cudaStream_t stream) {
+  using namespace seventy;
+  auto *ctx = static_cast<ArContext *>(ctx_ptr);
+  if (ctx == nullptr || out == nullptr || workspace == nullptr || qkv == nullptr || tokens < 0 || hq < 1 ||
+      splits < 1 || own < 1 || own > kPairUnits || own0 < 0 || own0 + own > hq || peer_own0 < 0 ||
+      peer_own0 + own > hq || peer < 0 || peer >= ctx->world || peer == ctx->rank)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (tokens == 0) return SEVENTY_OK;
+  const float *po = workspace;
+  const float *pml = po + static_cast<int64_t>(tokens) * hq * splits * kPairDim;
+  const int per = kPairUnits / own;
+  for (int r0 = 0; r0 < tokens; r0 += per) {
+    const int rows = tokens - r0 < per ? tokens - r0 : per;
+    ar_attn_merge_kernel<<<dim3(rows, own), kPairDim, 0, stream>>>(*ctx, static_cast<half *>(out), po, pml,
+                                                                   static_cast<const half *>(qkv), ld, r0, hq, splits,
+                                                                   own0, own, peer, peer_own0);
   }
   return launch_status();
 }

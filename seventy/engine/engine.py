@@ -45,6 +45,7 @@ class EngineConfig:
     mtp_tokens: int = 4
     yarn_factor: float | None = None
     expert_offload: float = 0.0
+    expert_profile: str | None = None
 
 
 @dataclass
@@ -116,14 +117,16 @@ def _check_weights_fit(config: EngineConfig, devices: list[int], cfg) -> None:
     """Stop before loading when the checkpoint files divided over the GPUs are larger than the smallest GPU: the
     load would end in a CUDA out-of-memory error. The weights take about the size of the checkpoint files, less the
     experts kept in host memory (--expert-offload), plus the copy of the output head of a model with tied
-    embeddings."""
+    embeddings. With offload, host memory holds the offloaded experts and the ones that take turns in the GPU slots
+    (memory.expert_host_share), and each GPU keeps two banks of its host experts for prefill (moe.PrefillStage)."""
     offload = getattr(config, "expert_offload", 0.0)
     if not 0.0 <= offload <= 1.0:
         raise RuntimeError(f"--expert-offload is a share of the experts from 0 to 1, not {offload}")
     need = memory.checkpoint_bytes(config.model)
     if offload > 0:
-        host = int(memory.routed_expert_bytes(config.model) * offload)
-        need -= host
+        routed = memory.routed_expert_bytes(config.model)
+        host = int(routed * memory.expert_host_share(cfg, len(devices), offload))
+        need += 2 * host - int(routed * offload)
         table = memory.host_table_bytes(config.model)
         free = _available_host_memory()
         if free and host + table > free:
@@ -180,17 +183,19 @@ class Engine:
                 p = ctx.Process(target=_worker_entry, daemon=True,
                                 args=(rank, tp, port, "nccl", f"cuda:{rank}", str(path), "float16",
                                       config.gpu_memory_utilization, reserve, child, None, self._draft_spec(config),
-                                      config.yarn_factor, config.expert_offload))
+                                      config.yarn_factor, config.expert_offload, config.expert_profile))
                 p.start()
                 child.close()
                 self.workers.append(p)
                 peers.append(parent)
             distributed.init(0, tp, port, "nccl", self._store)
+        if self.device.type == "cuda":
+            distributed.bind_numa(self.device, tp)
         from .worker import load_shard
 
         _stage("weights", f"loading {display_name(path)} on {tp} GPU(s)")
         _, self.model = load_shard(str(path), 0, tp, self.device, torch.float16, yarn_factor=config.yarn_factor,
-                                   expert_offload=config.expert_offload)
+                                   expert_offload=config.expert_offload, expert_profile=config.expert_profile)
         torch.cuda.synchronize()
         weights = torch.cuda.memory_allocated(self.device)
         self.drafter = None
@@ -211,7 +216,9 @@ class Engine:
         total_slots = slots + entries
         kv_name = "int8" if kv_dtype == torch.int8 else "fp16"
         mtp = config.draft_model == "mtp"
-        per_block = memory.kv_bytes_per_block(self.model_config, config.block_size, kv_name, tp, extra_layers=int(mtp))
+        split = memory.kv_split(self.model_config, tp, config.block_size)
+        per_block = memory.kv_bytes_per_block(self.model_config, config.block_size, kv_name, tp, extra_layers=int(mtp),
+                                              split=split)
         ring = self.drafter.ring_bytes_per_slot() if self.drafter is not None else 0
         state = (total_slots + 1) * (memory.state_bytes_per_slot(self.model_config, tp, extra_layers=int(mtp)) + ring)
         num_blocks = (budget_min - state) // per_block
@@ -224,7 +231,8 @@ class Engine:
             conn.send(("init", num_blocks, config.block_size, total_slots, "int8" if kv_dtype == torch.int8 else "float16"))
         self.cache = ModelCache(self.model_config.text, num_blocks, config.block_size, total_slots, torch.float16,
                                 self.device, par=Parallel(0, tp), kv_dtype=kv_dtype,
-                                extra_attention_layers=(self.model_config.text.num_layers,) if mtp else ())
+                                extra_attention_layers=(self.model_config.text.num_layers,) if mtp else (),
+                                kv_split=split)
         if self.drafter is not None:
             self.drafter.allocate(total_slots)
             self.cache.slot_peers.append(self.drafter)
@@ -647,8 +655,15 @@ class Engine:
                                       [r.rope_delta for r in rs], [r.slot for r in rs])
 
     def close(self) -> None:
-        """Stop the workers. Every rank tears its process group down at the same time (NCCL needs that)."""
+        """Stop the workers. Every rank tears its process group down at the same time (NCCL needs that). With
+        --expert-profile, every rank first adds its expert counts to the profile file."""
         self._closing = True
+        if self.config.expert_profile:
+            from ..model import moe
+
+            torch.cuda.synchronize(self.device)
+            moe.save_profile(self.config.expert_profile, self.model_config.text,
+                             [layer.mlp for layer in self.model.layers])
         self.runner.close()
         self.runner.graphs = None
         self.runner.spec_graphs = None

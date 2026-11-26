@@ -231,3 +231,89 @@ def test_pool_after_rejected_drafts_uses_the_real_keys():
     starts = torch.arange(nb, device=dev) * C
     idx = (table[starts // BS].long() * (BS // C) + (starts % BS) // C)
     assert torch.equal(got.view(-1, DIM)[idx], want.view(-1, DIM)[idx])
+
+
+def _block_selection(rows, width, total, gen):
+    """Selections with the layout of qsa_select: entries 4 j .. 4 j + 3 hold the positions of one block of C tokens
+    (or -1), the last C - 1 entries the unfinished last block (so entry e holds a position p with p % C == e % C)."""
+    top = (width - (C - 1)) // C
+    sel = torch.full((rows, width), -1, dtype=torch.int32)
+    for i in range(rows):
+        n = (top, top - 30, 40)[i % 3]
+        blocks = torch.randperm(total // C - 1, generator=gen)[:n].int()
+        at = torch.randperm(top, generator=gen)[:n]
+        for c in range(C):
+            sel[i, at * C + c] = blocks * C + c
+        last = total // C - 1
+        sel[i, top * C : top * C + 2] = torch.tensor([last * C, last * C + 1], dtype=torch.int32)
+    return sel
+
+
+@pytest.mark.parametrize("int8", [False, True])
+@pytest.mark.parametrize("rows", [1, 3, 90])
+def test_split_kv_halves_merge_to_the_whole(int8, rows):
+    """Two ranks that share a KV head, each with the keys and values of one parity of the slots (seventy_attn_prep
+    split rows), attend over their entries for all 12 query heads; their parts merge (seventy_attention_partial,
+    seventy_attention_merge) to the attention over the whole cache for each rank's 6 own heads. Also: the split
+    prep writes each slot of its parity at row slot // 2 with the whole prep's values."""
+    from seventy.ops import kernels
+
+    g = torch.Generator().manual_seed(rows * 3 + int8)
+    dev = "cuda"
+    hq, width, total = 12, 2051, 2400
+    blocks = -(-total // BS)
+    table = torch.randperm(blocks + 5, generator=g)[:blocks].int().to(dev)
+    nblk = blocks + 6
+    sel = _block_selection(rows, width, total, g).to(dev)
+    if int8:
+        k_cache = torch.randint(-127, 128, (nblk, BS, 1, D), generator=g, dtype=torch.int8).to(dev)
+        v_cache = torch.randint(-127, 128, (nblk, BS, 1, D), generator=g, dtype=torch.int8).to(dev)
+        k_scale = (torch.rand(nblk, BS, 1, generator=g) * 0.02 + 0.005).to(dev)
+        v_scale = (torch.rand(nblk, BS, 1, generator=g) * 0.02 + 0.005).to(dev)
+    else:
+        k_cache = torch.randn(nblk, BS, 1, D, generator=g).half().to(dev)
+        v_cache = torch.randn(nblk, BS, 1, D, generator=g).half().to(dev)
+        k_scale = v_scale = None
+    qa = torch.randn(rows, hq, D, generator=g).half().to(dev)
+    qkv = torch.randn(rows, hq * 2 * D, generator=g).half().to(dev)
+    qs_t = torch.tensor([0, rows], dtype=torch.int32, device=dev)
+    whole = kernels.qsa_attention(qa, qkv, k_cache, v_cache, k_scale, v_scale, sel, table[None], qs_t, 1 / 16)
+    parts = []
+    for p in range(2):
+        kp, vp = k_cache[:, p::2].contiguous(), v_cache[:, p::2].contiguous()
+        ksp = k_scale[:, p::2].contiguous() if int8 else None
+        vsp = v_scale[:, p::2].contiguous() if int8 else None
+        got = {}
+
+        def keep(ws, qkv_, rows_, hq_, splits):
+            got["part"] = kernels.attention_partial(ws, rows_, hq_, splits)
+            return None
+
+        kernels.qsa_attention(qa, qkv, kp, vp, ksp, vsp, sel, table[None], qs_t, 1 / 16, kv_split=2, kv_part=p,
+                              merge=keep)
+        parts.append(got["part"])
+    stacked = torch.stack(parts)
+    for own0 in (0, 6):
+        out = kernels.attention_merge(stacked, qkv, own0, 6)
+        torch.testing.assert_close(out.float(), whole[:, own0 * D : (own0 + 6) * D].float(), rtol=2e-3, atol=2e-3)
+
+    t = 37
+    x = torch.randn(t, (hq * 2 + 2) * D, generator=g).half().to(dev)
+    pos = torch.arange(100, 100 + t, dtype=torch.int64, device=dev).expand(3, t).contiguous()
+    inv = (1.0 / (10000 ** (torch.arange(0, 64, 2).float() / 64))).to(dev)
+    qn, kn = (torch.rand(D, generator=g) + 0.5).to(dev), (torch.rand(D, generator=g) + 0.5).to(dev)
+    slots = torch.randperm(nblk * BS, generator=g)[:t].int().to(dev)
+    kc, vc = torch.zeros_like(k_cache), torch.zeros_like(v_cache)
+    kcs = torch.zeros_like(k_scale) if int8 else None
+    vcs = torch.zeros_like(v_scale) if int8 else None
+    q_whole = kernels.attn_prep(x, qn, kn, pos, inv, (11, 11, 10), slots, kc, vc, hq, 1, 1e-6, kcs, vcs)
+    for p in range(2):
+        kp, vp = torch.zeros_like(kc[:, p::2]), torch.zeros_like(vc[:, p::2])
+        ksp = torch.zeros_like(kcs[:, p::2]) if int8 else None
+        vsp = torch.zeros_like(vcs[:, p::2]) if int8 else None
+        qp = kernels.attn_prep(x, qn, kn, pos, inv, (11, 11, 10), slots, kp, vp, hq, 1, 1e-6, ksp, vsp, kv_split=2,
+                               kv_part=p)
+        assert torch.equal(qp, q_whole)
+        assert torch.equal(kp, kc[:, p::2]) and torch.equal(vp, vc[:, p::2])
+        if int8:
+            assert torch.equal(ksp, kcs[:, p::2]) and torch.equal(vsp, vcs[:, p::2])

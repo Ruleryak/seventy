@@ -37,8 +37,8 @@ from ..parallel import SINGLE, VOCAB_ALIGN, Parallel
 from ..rope import frequencies
 from ..upload import to_device
 from .layers import Linear, Source, _to_dtype
-from ..split import balanced
-from .moe import MoE
+from ..split import balanced, head_split, kv_groups
+from .moe import MoE, link_prefill_stage
 from .qwen3_5 import FINAL, GDN_COMMIT_LAYERS, AttentionLayer, GatedDeltaNetLayer, Qwen35TextModel
 
 
@@ -424,28 +424,59 @@ class Indexer:
 
 
 class ExpAttention:
-    """Gated full attention with the QSA indexer. While every sequence of a step fits in the budget (dense()), QSA is
-    causal attention, and the GPU runs the attention kernels of AttentionLayer. Otherwise each query attends to the
-    tokens Indexer.selected gives, in chunks of QUERY_CHUNK queries over the gathered keys and values (PyTorch, on
-    the CPU and the GPU; the QSA kernels are not written yet). The indexer keys go into the cache in both cases."""
+    """Gated full attention with the QSA indexer. On the GPU (head size 256), the QSA kernels (_kernels). Elsewhere
+    (the reference path), each query attends to the tokens Indexer.selected gives, in chunks of QUERY_CHUNK queries
+    over the gathered keys and values (PyTorch), with the raw indexer keys per token in the cache."""
 
     def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense):
         self.attn = AttentionLayer(cfg, ckpt, p, par, dtype, device, keep_dense)
         self.indexer = Indexer(cfg, ckpt, f"{p}.indexer", device)
         self.cfg = cfg
+        self.peer = None
+        groups = kv_groups(cfg.num_heads, cfg.num_kv_heads, par.size)
+        if groups is not None:
+            group = next(g for g in groups if par.rank in g)
+            if len(group) == 2:
+                peer = group[1 - group.index(par.rank)]
+                self.peer = (peer, head_split(cfg.num_heads, cfg.num_kv_heads, peer, par.size).local_own[0])
 
-    def _kernels(self, x, step: StepInput, cache: ModelCache, layer: int, cos, sin) -> torch.Tensor:
+    def _merge(self, par: Parallel, split: int):
+        """The merge of the shares of a KV split group for kernels.qsa_attention: with the peer-to-peer all-reduce
+        and two ranks per group, seventy_ar_attn_merge; else the parts of every rank of the group through NCCL
+        (attention_partial, all_gather on par.kv_group, attention_merge)."""
+        from ..ops import kernels
+
+        own0, own1 = self.attn.own
+        own = own1 - own0
+
+        def merge(ws, qkv, rows, hq, splits):
+            if par.custom is not None and self.peer is not None:
+                out = torch.empty(rows, own * 256, dtype=torch.float16, device=ws.device)
+                return par.custom.attn_merge(out, ws, qkv, rows, hq, splits, own0, own, *self.peer)
+            part = kernels.attention_partial(ws, rows, hq, splits)
+            parts = torch.empty(split, *part.shape, dtype=part.dtype, device=part.device)
+            torch.distributed.all_gather_into_tensor(parts, part, group=par.kv_group)
+            return kernels.attention_merge(parts, qkv, own0, own)
+
+        return merge
+
+    def _kernels(self, x, step: StepInput, cache: ModelCache, layer: int, cos, sin, par: Parallel) -> torch.Tensor:
         """The GPU path: attn_prep (queries, keys and values into the cache), the indexer queries and raw keys, then
         csrc/qsa.cu (pooled block keys from the raw keys and the slot's ring, selected positions in chunks of
-        SELECT_ROWS rows (prefill: block scores from cuBLAS), sparse attention with the output gate)."""
+        SELECT_ROWS rows (prefill: block scores from cuBLAS), sparse attention with the output gate). With a split
+        KV cache (cache.kv_split > 1) the rank keeps and attends over its share of the tokens for all query heads of
+        its KV head, and the shares merge into the output of its own heads (_merge)."""
         from ..ops import kernels
 
         a, e = self.attn, self.cfg.exp
         t = x.shape[0]
         qkv = a.qkv(x)
         ks, vs = cache.k_scale.get(layer), cache.v_scale.get(layer)
+        g, part = cache.kv_split, cache.kv_part
+        merge = self._merge(par, g) if g > 1 else None
         q = kernels.attn_prep(qkv, a.q_norm, a.k_norm, step.positions, a.inv_freq, a.section, step.kv_slots_t,
-                              cache.k[layer], cache.v[layer], a.heads, a.kv_heads, a.eps, ks, vs, rope_scale=a.rope_scale)
+                              cache.k[layer], cache.v[layer], a.heads, a.kv_heads, a.eps, ks, vs, rope_scale=a.rope_scale,
+                              kv_split=g, kv_part=part)
         iq16, raw = self.indexer.prep(x, cos, sin)
         kernels.qsa_pool(cache.pooled[layer], raw, cache.idx_ring[layer], step.state_slots_t, cache.positions,
                          step.block_tables, step.query_start_t, step.context_lens_t, t, self.indexer.k_norm,
@@ -465,16 +496,18 @@ class ExpAttention:
                     sel = kernels.qsa_select_prefill(iq16[r0:r1], keys, step.query_start_t, step.context_lens_t,
                                                      e.indexer_compress, top, r0)
                     parts.append(kernels.qsa_attention(q[r0:r1], qkv[r0:r1], cache.k[layer], cache.v[layer], ks, vs,
-                                                       sel, step.block_tables, step.query_start_t, a.scale, row0=r0))
+                                                       sel, step.block_tables, step.query_start_t, a.scale, row0=r0,
+                                                       kv_split=g, kv_part=part, merge=merge))
         else:
             for r0 in range(0, t, SELECT_ROWS):
                 r1 = min(t, r0 + SELECT_ROWS)
                 sel = kernels.qsa_select(iq16[r0:r1], cache.pooled[layer], step.block_tables, step.query_start_t,
                                          step.context_lens_t, e.indexer_compress, top, ld, cache.block_size, row0=r0)
                 parts.append(kernels.qsa_attention(q[r0:r1], qkv[r0:r1], cache.k[layer], cache.v[layer], ks, vs, sel,
-                                                   step.block_tables, step.query_start_t, a.scale, row0=r0))
+                                                   step.block_tables, step.query_start_t, a.scale, row0=r0,
+                                                   kv_split=g, kv_part=part, merge=merge))
         o = parts[0] if len(parts) == 1 else torch.cat(parts)
-        return a.o_proj(a._owned(o))
+        return a.o_proj(o if g > 1 else a._owned(o))
 
     def _pooled_keys(self, cache: ModelCache, layer: int, step: StepInput, b: int, blocks: int) -> torch.Tensor:
         """The pooled block keys FP16 [blocks, dim] of blocks 0 .. blocks - 1 of sequence b, from the paged cache."""
@@ -498,7 +531,7 @@ class ExpAttention:
         t, d = x.shape[0], a.head_dim
         cos, sin = rope
         if x.is_cuda and d == 256:
-            return self._kernels(x, step, cache, layer, cos, sin)
+            return self._kernels(x, step, cache, layer, cos, sin, model.par)
         iq, ik = self.indexer.queries_and_keys(x, cos, sin)
         cache.idx_k[layer].view(-1, cache.idx_k[layer].shape[-1])[slots] = ik.to(cache.idx_k[layer].dtype)
         qkv = a.qkv(x)
@@ -588,6 +621,7 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         eos = t.eos_token_ids[0] if t.eos_token_ids else 0
         count = t.num_layers if layers is None else layers
         self.layers = [ExpLayer(t, ckpt, i, par, dtype, device, keep_dense, eos) for i in range(count)]
+        self.prefill_stage = link_prefill_stage([layer.mlp for layer in self.layers])
         half = t.rotary_dim // 2
         inv_freq, self.rope_scale = frequencies(t)
         self.inv_freq = inv_freq.to(device)

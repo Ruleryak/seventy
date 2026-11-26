@@ -157,6 +157,21 @@ def test_plan_counts_the_state_slots_the_engine_allocates(model_path):
         assert planner.plan(s, fake_inventory())["state"] == (slots + 1) * per_slot
 
 
+@pytest.mark.model
+def test_flash_next_splits_its_kv_heads_on_4_gpus(flash_next_path, monkeypatch):
+    """On 4 GPUs the two ranks of each Flash-Next KV head keep half of its tokens each: the K and V part of a block
+    halves; the positions and pooled indexer keys stay whole. SEVENTY_KV_SPLIT=0 turns it off."""
+    cfg = load_config(flash_next_path)
+    assert memory.kv_split(cfg, 4, 16) == 2
+    assert memory.kv_split(cfg, 3, 16) == 1 and memory.kv_split(cfg, 2, 16) == 1
+    whole = memory.kv_bytes_per_block(cfg, 16, "int8", 4, 1)
+    half = memory.kv_bytes_per_block(cfg, 16, "int8", 4, 1, split=2)
+    t = cfg.text
+    assert whole - half == (len(t.attention_layers) + 1) * 2 * 8 * (t.head_dim + 4)
+    monkeypatch.setenv("SEVENTY_KV_SPLIT", "0")
+    assert memory.kv_split(cfg, 4, 16) == 1
+
+
 STUB = r'''
 import http.server, signal, sys, time
 signal.signal(signal.SIGINT, signal.default_int_handler)

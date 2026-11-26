@@ -9,11 +9,13 @@ checkpoint sizes and from what earlier starts measured.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import ModelConfig
-from .split import MLP_ALIGN, VOCAB_ALIGN, balanced, max_head_split
+
+from .split import MLP_ALIGN, VOCAB_ALIGN, balanced, kv_groups, max_head_split
 
 KV_DTYPES = ("int8", "fp16")
 UNEVEN_MAX_GPUS = 4
@@ -21,15 +23,32 @@ UNEVEN_MAX_GPUS = 4
 split evenly."""
 
 
-def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int = 1, extra_layers: int = 0) -> int:
+def kv_split(cfg: ModelConfig, tp: int, block_size: int) -> int:
+    """How many ranks share each KV head and keep one share of its tokens each (1: every rank keeps all tokens of
+    its KV heads). Qwen4-Exp models on more GPUs than KV heads split when the ranks form equal groups per KV head
+    (split.kv_groups) and the group size divides the indexer's block of tokens and the cache block, unless
+    SEVENTY_KV_SPLIT=0. Rank i of a group keeps the tokens at cache slots s with s % group == i."""
+    t = cfg.text
+    if t.exp is None or tp < 2 or os.environ.get("SEVENTY_KV_SPLIT", "1") == "0":
+        return 1
+    groups = kv_groups(t.num_heads, t.num_kv_heads, tp)
+    if groups is None:
+        return 1
+    g = len(groups[0])
+    return g if t.exp.indexer_compress % g == 0 and block_size % g == 0 else 1
+
+
+def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int = 1, extra_layers: int = 0,
+                       split: int = 1) -> int:
     """Bytes of one KV block on one rank: K and V of the local KV heads of every full-attention layer, and of
     extra_layers more (the MTP drafter's attention layer), as INT8 values plus one FP32 scale per token and head,
-    or FP16. Qwen4-Exp models add the token's rotary positions and the FP16 pooled indexer key of every attention
-    layer per block of indexer_compress tokens."""
+    or FP16, for one share of the block's tokens when split ranks share the KV heads (kv_split). Qwen4-Exp models
+    add the token's rotary positions and the FP16 pooled indexer key of every attention layer per block of
+    indexer_compress tokens (on every rank)."""
     t = cfg.text
     per_vec = t.head_dim + 4 if kv_dtype == "int8" else 2 * t.head_dim
     kv_heads = max_head_split(t.num_heads, t.num_kv_heads, tp)[0]
-    kv = (len(t.attention_layers) + extra_layers) * 2 * block_size * kv_heads * per_vec
+    kv = (len(t.attention_layers) + extra_layers) * 2 * (block_size // split) * kv_heads * per_vec
     if t.exp is not None:
         e = t.exp
         per_layer = e.indexer_head_dim * 2
@@ -166,6 +185,24 @@ def host_table_bytes(path: str | Path) -> int:
     return _tensor_bytes(path, lambda name: ".ngram_embedding.shard_" in name)
 
 
+def expert_pool() -> int:
+    """GPU slots per MoE layer and GPU for offloaded experts (the expert cache, seventy/model/moe.py), out of the GPU
+    share of --expert-offload: SEVENTY_EXPERT_POOL, default 8."""
+    return int(os.environ.get("SEVENTY_EXPERT_POOL", "8"))
+
+
+def expert_host_share(cfg: ModelConfig, tp: int, offload: float) -> float:
+    """The share of a MoE model's routed experts in host memory with --expert-offload offload: the offloaded ones
+    and those that take turns in the GPU slots of the expert cache (expert_pool)."""
+    t = cfg.text
+    per_gpu = max(1, t.num_experts // tp) if t.is_moe else 1
+    hosted = round(per_gpu * offload)
+    if hosted == 0:
+        return 0.0
+    pool = max(0, min(expert_pool(), per_gpu - hosted - 1))
+    return (hosted + pool) / per_gpu
+
+
 def routed_expert_bytes(path: str | Path) -> int:
     """Bytes of the routed experts of a MoE checkpoint (*.mlp.experts.*, also the MTP layer's), from the headers of
     its files: the part that --expert-offload can keep in host memory."""
@@ -232,7 +269,7 @@ def plan(cfg: ModelConfig, gpu_bytes: int, used: int, tp: int, slots: int, block
     (1 for the MTP drafter)."""
     per_slot = state_bytes_per_slot(cfg, tp) + (drafter_bytes_per_slot(drafter, tp) if drafter else 0)
     state = (slots + 1) * per_slot
-    per_block = kv_bytes_per_block(cfg, block_size, kv_dtype, tp, extra_layers)
+    per_block = kv_bytes_per_block(cfg, block_size, kv_dtype, tp, extra_layers, kv_split(cfg, tp, block_size))
     free = int(gpu_bytes * utilization) - used - reserve - state
     blocks = max(0, free // per_block)
     if max_model_len:

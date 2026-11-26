@@ -114,6 +114,32 @@ SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, flo
                                   float rope_scale, int section1, int section2, int rotary_dim, const int *slots,
                                   int tokens, int hq, int hkv, int head_dim, float eps, cudaStream_t stream);
 
+/*
+ * seventy_attn_prep with a split KV cache: the rank keeps the keys and values of the slots s with
+ * s % kv_split == kv_part, at row s / kv_split of caches [blocks, block_size / kv_split, hkv, 256] (the ranks that
+ * share a KV head each keep one share of its tokens). kv_split 1: seventy_attn_prep.
+ */
+SEVENTY_API int seventy_attn_prep_split(void *q_out, void *k_cache, void *v_cache, float *k_scale, float *v_scale,
+                                        int kv_type, const void *qkv, int ld, const float *q_norm,
+                                        const float *k_norm, const int64_t *positions, int64_t pos_stride,
+                                        const float *inv_freq, float rope_scale, int section1, int section2,
+                                        int rotary_dim, const int *slots, int tokens, int hq, int hkv, int head_dim,
+                                        float eps, int kv_split, int kv_part, cudaStream_t stream);
+
+/*
+ * The split attention parts of a KV head shared by kv_split ranks (each attends over its share of the tokens).
+ * seventy_attention_partial: from the split workspace of seventy_qsa_attention, one part per (row, head) of the
+ * rank's computed heads: part FP32 [tokens, hq, 260] = the output sums over the rank's tokens (256 values, relative
+ * to the row maximum), the maximum and the sum of the exponentials, 2 unused values.
+ * seventy_attention_merge: the output FP16 [tokens, own * 256] of the heads own0 .. own0 + own - 1 from the parts of
+ * every rank of the group (parts FP32 [kv_split, tokens, hq, 260]), times sigmoid(gate) from qkv (rounding as
+ * seventy_attention_combine).
+ */
+SEVENTY_API int seventy_attention_partial(float *part, const float *workspace, int tokens, int hq, int splits,
+                                          cudaStream_t stream);
+SEVENTY_API int seventy_attention_merge(void *out, const float *parts, int kv_split, const void *qkv, int ld,
+                                        int tokens, int hq, int own0, int own, cudaStream_t stream);
+
 SEVENTY_API int64_t seventy_decode_attention_workspace(int tokens, int hq, int splits);
 
 /*
@@ -324,6 +350,17 @@ SEVENTY_API int seventy_ar_norm(void *ctx, void *out, void *residual, const void
 SEVENTY_API int seventy_ar_norm_2shot(void *ctx_ptr, void *out, void *residual, const void *x, const float *weight,
                                       int rows, int dim, float eps, int gather_residual, cudaStream_t stream);
 SEVENTY_API int seventy_ar_sum_f32(void *ctx, float *out, const float *x, int rows, int dim, cudaStream_t stream);
+
+/*
+ * The split attention merge of the two ranks that share a KV head (see csrc/allreduce.cu): from this rank's
+ * seventy_qsa_attention workspace over its share of the tokens (tokens rows, hq computed heads, splits), the output
+ * FP16 [tokens, own * 256] of its heads own0 .. own0 + own - 1, times sigmoid(gate) from qkv. peer: the other rank,
+ * whose own heads are peer_own0 .. peer_own0 + own - 1 of the same computed heads. Every rank of the pair calls it
+ * with the same shapes.
+ */
+SEVENTY_API int seventy_ar_attn_merge(void *ctx, void *out, const float *workspace, const void *qkv, int ld,
+                                      int tokens, int hq, int splits, int own0, int own, int peer, int peer_own0,
+                                      cudaStream_t stream);
 
 /*
  * FP16 weight GEMM for 1 to 64 rows (see csrc/dense_gemm.cu): out[m, n] = x[m, k] w[n, k]^T, FP32 accumulation,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import math
 import os
 
@@ -267,19 +268,21 @@ def _kv_args(k_cache, v_cache, k_scale, v_scale):
 def attn_prep(qkv: torch.Tensor, q_norm: torch.Tensor, k_norm: torch.Tensor, positions: torch.Tensor,
               inv_freq: torch.Tensor, section: tuple[int, int, int], slots: torch.Tensor, k_cache: torch.Tensor,
               v_cache: torch.Tensor, hq: int, hkv: int, eps: float, k_scale: torch.Tensor | None = None,
-              v_scale: torch.Tensor | None = None, rope_scale: float = 1.0) -> torch.Tensor:
+              v_scale: torch.Tensor | None = None, rope_scale: float = 1.0, kv_split: int = 1,
+              kv_part: int = 0) -> torch.Tensor:
     """Normed, rotated queries [T, hq, 256]; keys and values written to the caches at `slots` (int32 [T]).
-    rope_scale multiplies cos and sin (YaRN's attention factor)."""
+    rope_scale multiplies cos and sin (YaRN's attention factor). With kv_split > 1, only the slots s with
+    s % kv_split == kv_part, at row s // kv_split (seventy_attn_prep_split)."""
     _expect(qkv, "qkv", torch.float16)
     _expect(positions, "positions", torch.int64)
     _expect(slots, "slots", torch.int32)
     t = qkv.shape[0]
     q = torch.empty(t, hq, 256, dtype=torch.float16, device=qkv.device)
     ks, vs, kind = _kv_args(k_cache, v_cache, k_scale, v_scale)
-    code = lib().seventy_attn_prep(
+    code = lib().seventy_attn_prep_split(
         q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), ks, vs, kind, qkv.data_ptr(), qkv.shape[1], q_norm.data_ptr(),
         k_norm.data_ptr(), positions.data_ptr(), positions.shape[1], inv_freq.data_ptr(), rope_scale, section[1],
-        section[2], 2 * inv_freq.numel(), slots.data_ptr(), t, hq, hkv, 256, eps, _stream(qkv),
+        section[2], 2 * inv_freq.numel(), slots.data_ptr(), t, hq, hkv, 256, eps, kv_split, kv_part, _stream(qkv),
     )
     check("attn_prep", code)
     return q
@@ -921,9 +924,39 @@ def moe_finish(y: torch.Tensor, ids: torch.Tensor, k: int, e0: int, e1: int, sha
     return out
 
 
-def moe_plan(ids: torch.Tensor, e0: int, e1: int, per: int | None = None) -> tuple:
+class _ExpertCacheDev(ctypes.Structure):
+    _fields_ = [("slot_of", ctypes.c_void_p), ("owner", ctypes.c_void_p), ("stamp", ctypes.c_void_p),
+                ("clock", ctypes.c_void_p), ("host_index", ctypes.c_void_p), ("uses", ctypes.c_void_p),
+                ("ptrs", ctypes.c_int64 * 4),
+                ("host", ctypes.c_int64 * 4), ("pool", ctypes.c_int64 * 4), ("bytes", ctypes.c_int64 * 4),
+                ("pool_size", ctypes.c_int32), ("pad", ctypes.c_int32)]
+
+
+def expert_cache_struct(slot_of, owner, stamp, clock, host_index, uses, ptrs, hosts, pools, pool: int) -> torch.Tensor:
+    """The device struct of an expert cache (ExpertCacheDev in csrc/moe.cu) as a uint8 GPU tensor: the state tensors
+    (int32; uses may be None), and with pool > 0 the 4 pointer tables (int64 [experts]), the 4 host banks (pinned,
+    [hosted, ...]) and the 4 slot banks ([pool, ...]) of gate_up wpk, gate_up wsc, down wpk, down wsc."""
+    c = _ExpertCacheDev()
+    if ctypes.sizeof(c) != lib().seventy_expert_cache_bytes():
+        raise RuntimeError("the expert cache struct does not match the kernel library")
+    c.slot_of, c.owner, c.stamp, c.clock, c.host_index = (t.data_ptr() for t in (slot_of, owner, stamp, clock,
+                                                                                    host_index))
+    c.uses = uses.data_ptr() if uses is not None else None
+    for a in range(4 if pool else 0):
+        per_expert = hosts[a][0].numel() * hosts[a].element_size()
+        if per_expert % 16 or pools[a][0].numel() * pools[a].element_size() != per_expert:
+            raise ValueError("expert arrays must have the same size in host memory and in the slots, a multiple of 16")
+        c.ptrs[a], c.host[a], c.pool[a], c.bytes[a] = ptrs[a].data_ptr(), hosts[a].data_ptr(), pools[a].data_ptr(), \
+            per_expert
+    c.pool_size = pool
+    raw = bytes(c)
+    return torch.tensor(list(raw), dtype=torch.uint8).to(slot_of.device)
+
+
+def moe_plan(ids: torch.Tensor, e0: int, e1: int, per: int | None = None, cache=None) -> tuple:
     """The pairs of the local experts [e0, e1) in ids (int32 [pairs] expert ids), sorted by expert, and their slots:
-    (order, slot_expert, slot_start, slot_count, num_slots, max_slots), all on the GPU (csrc/moe.cu)."""
+    (order, slot_expert, slot_start, slot_count, num_slots, max_slots), all on the GPU (csrc/moe.cu). cache: the
+    layer's ExpertCache (seventy/model/moe.py), which the same kernel then updates and fills."""
     _expect(ids, "ids", torch.int32)
     pairs = ids.numel()
     per = per or MOE_ROWS_PER_SLOT
@@ -932,9 +965,14 @@ def moe_plan(ids: torch.Tensor, e0: int, e1: int, per: int | None = None) -> tup
     order = torch.empty(max(pairs, 1), dtype=torch.int32, device=dev)
     slots = torch.empty(3, max_slots, dtype=torch.int32, device=dev)
     num = torch.empty(1, dtype=torch.int32, device=dev)
-    check("moe_plan", lib().seventy_moe_plan(ids.contiguous().data_ptr(), pairs, e0, e1, per, max_slots,
-                                             order.data_ptr(), slots[0].data_ptr(), slots[1].data_ptr(),
-                                             slots[2].data_ptr(), num.data_ptr(), _stream(ids)))
+    if cache is not None:
+        check("moe_plan_cached", lib().seventy_moe_plan_cached(
+            ids.contiguous().data_ptr(), pairs, e0, e1, per, max_slots, order.data_ptr(), slots[0].data_ptr(),
+            slots[1].data_ptr(), slots[2].data_ptr(), num.data_ptr(), cache.dev.data_ptr(), cache.pool, _stream(ids)))
+    else:
+        check("moe_plan", lib().seventy_moe_plan(ids.contiguous().data_ptr(), pairs, e0, e1, per, max_slots,
+                                                 order.data_ptr(), slots[0].data_ptr(), slots[1].data_ptr(),
+                                                 slots[2].data_ptr(), num.data_ptr(), _stream(ids)))
     return order, slots[0], slots[1], slots[2], num, max_slots
 
 
@@ -964,17 +1002,18 @@ def moe_gemm(x: torch.Tensor, row_div: int, weight: torch.Tensor, scales: torch.
 
 
 def moe_mma(x: torch.Tensor, row_div: int, stack, plan: tuple, out: torch.Tensor, rows: int, warps: int = 4,
-            pair_weight: torch.Tensor | None = None, compact: int = 0) -> torch.Tensor:
+            pair_weight: torch.Tensor | None = None, compact: int = 0, ptrs=None) -> torch.Tensor:
     """moe_gemm on the tensor cores (seventy_moe_mma): the experts of stack (ExpertStack after to_gemm) for the
     plan's slots of up to rows pairs (8, 16, 32 or 64), into out (FP16 [rows of out, n], or FP32 times pair_weight);
-    compact as in moe_gemm."""
+    compact as in moe_gemm. ptrs: the (wpk, wsc) pointer tables to read the experts through (default the stack's
+    gemm_ptrs)."""
     _expect(x, "x", torch.float16)
     x = x.contiguous()
     g = stack.gemm
     e = stack.gemm_experts
     n_padded = g.alpha.numel() // e
     order, slot_expert, slot_start, slot_count, num, max_slots = plan
-    ptrs = stack.gemm_ptrs
+    ptrs = ptrs if ptrs is not None else stack.gemm_ptrs
     check("moe_mma", lib().seventy_moe_mma(
         out.data_ptr(), x.data_ptr(), row_div, g.wpk.data_ptr() if g.wpk.numel() else None,
         g.wsc.data_ptr() if g.wsc.numel() else None, g.alpha.data_ptr(),
@@ -1146,15 +1185,19 @@ QSA_BLOCKS = 160
 
 def qsa_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache, v_cache, k_scale, v_scale, sel: torch.Tensor,
                   block_tables: torch.Tensor, query_start_t: torch.Tensor, scale: float,
-                  splits: int | None = None, row0: int = 0) -> torch.Tensor:
+                  splits: int | None = None, row0: int = 0, kv_split: int = 1, kv_part: int = 0,
+                  merge=None) -> torch.Tensor:
     """Attention of each query row of q FP16 [rows, hq, 256] over its selected positions sel, times sigmoid of the
     gate in qkv: FP16 [rows, hq * 256] (seventy_qsa_attention, then seventy_attention_combine). By default a row's
-    selection splits into parts of QSA_SPLIT_POSITIONS entries while the launch has fewer than QSA_BLOCKS blocks."""
+    selection splits into parts of QSA_SPLIT_POSITIONS entries while the launch has fewer than QSA_BLOCKS blocks.
+    With a split KV cache (kv_split > 1): attention over the rank's share of the positions only, and the result is
+    merge(workspace, qkv, rows, hq, splits), which merges the shares of the group's ranks."""
     _expect(q, "q", torch.float16)
     rows, hq, d = q.shape
     hkv = k_cache.shape[2]
     if splits is None:
-        splits = max(1, min(-(-sel.shape[1] // QSA_SPLIT_POSITIONS), -(-QSA_BLOCKS // (rows * hkv))))
+        entries = -(-sel.shape[1] // kv_split)
+        splits = max(1, min(-(-entries // QSA_SPLIT_POSITIONS), -(-QSA_BLOCKS // (rows * hkv))))
     ws = torch.empty(rows * hq * splits * (d + 2), dtype=torch.float32, device=q.device)
     po = ws[: rows * hq * splits * d]
     pml = ws[rows * hq * splits * d :]
@@ -1163,11 +1206,32 @@ def qsa_attention(q: torch.Tensor, qkv: torch.Tensor, k_cache, v_cache, k_scale,
     check("qsa_attention", lib().seventy_qsa_attention(
         po.data_ptr(), pml.data_ptr(), q.contiguous().data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
         k_scale.data_ptr() if int8 else None, v_scale.data_ptr() if int8 else None, sel.data_ptr(), sel.shape[1],
-        bt.data_ptr(), bt.shape[1], query_start_t.data_ptr(), query_start_t.numel() - 1, row0, rows, k_cache.shape[1],
-        hq, hkv, splits, scale, _stream(q)))
+        bt.data_ptr(), bt.shape[1], query_start_t.data_ptr(), query_start_t.numel() - 1, row0, rows,
+        k_cache.shape[1] * kv_split, hq, hkv, splits, scale, kv_split, kv_part, _stream(q)))
+    if merge is not None:
+        return merge(ws, qkv, rows, hq, splits)
     out = torch.empty(rows, hq * d, dtype=torch.float16, device=q.device)
     check("attention_combine", lib().seventy_attention_combine(out.data_ptr(), ws.data_ptr(), qkv.data_ptr(),
                                                                qkv.stride(0), rows, hq, splits, _stream(q)))
+    return out
+
+
+def attention_partial(ws: torch.Tensor, rows: int, hq: int, splits: int) -> torch.Tensor:
+    """One part FP32 [rows, hq, 260] per row and head from a split attention workspace (seventy_attention_partial):
+    the output sums relative to the part's maximum, the maximum, the sum of the exponentials, 2 unused values."""
+    part = torch.empty(rows, hq, 260, dtype=torch.float32, device=ws.device)
+    check("attention_partial", lib().seventy_attention_partial(part.data_ptr(), ws.data_ptr(), rows, hq, splits,
+                                                               _stream(ws)))
+    return part
+
+
+def attention_merge(parts: torch.Tensor, qkv: torch.Tensor, own0: int, own: int) -> torch.Tensor:
+    """The output FP16 [rows, own * 256] of the heads own0 .. own0 + own - 1 from the parts of every rank of a KV
+    split group (parts FP32 [group, rows, hq, 260], attention_partial), times sigmoid of the gate in qkv."""
+    g, rows, hq, _ = parts.shape
+    out = torch.empty(rows, own * 256, dtype=torch.float16, device=parts.device)
+    check("attention_merge", lib().seventy_attention_merge(out.data_ptr(), parts.data_ptr(), g, qkv.data_ptr(),
+                                                           qkv.stride(0), rows, hq, own0, own, _stream(parts)))
     return out
 
 

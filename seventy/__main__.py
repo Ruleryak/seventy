@@ -146,6 +146,7 @@ def cmd_engine(args: argparse.Namespace) -> int:
         kv_dtype=args.kv_cache_dtype, tensor_parallel=tp, cuda_graphs=not args.no_cuda_graphs,
         draft_model=draft_model, mtp_tokens=args.mtp_tokens, prefix_cache=not args.no_prefix_cache,
         cache_entries=args.cache_entries, yarn_factor=args.yarn_factor, expert_offload=args.expert_offload,
+        expert_profile=args.expert_profile,
     )
     server = ServerConfig(
         engine=engine, served_model_name=args.served_model_name or served_name(args.model, model),
@@ -196,8 +197,13 @@ def main(argv: list[str] | None = None) -> int:
     eng.add_argument("--max-num-seqs", type=int, default=8)
     eng.add_argument("--expert-offload", type=float, default=0.0,
                      help="share (0 to 1) of each GPU's routed experts (NVFP4 mixture-of-experts models) kept in "
-                          "pinned host memory and read over PCIe: frees GPU memory for the KV cache or for a model "
-                          "that does not fit, and decodes slower")
+                          "pinned host memory: frees GPU memory for the KV cache or for a model that does not fit. "
+                          "The most used experts stay on the GPU, and a few GPU slots per layer take turns holding "
+                          "the others; decoding is slower when the router picks experts that are in host memory")
+    eng.add_argument("--expert-profile", default=None, metavar="FILE",
+                     help="expert use counts: with --expert-offload, the most used experts in FILE stay on the GPU "
+                          "(else the built-in profile of the model, if there is one); the engine adds the counts of "
+                          "this run to FILE when it stops")
     eng.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     eng.add_argument("--prefill-budget", type=int, default=8192, help="prompt tokens per engine step")
     eng.add_argument("--activation-reserve", type=float, default=3.0,

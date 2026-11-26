@@ -204,3 +204,95 @@ def test_failed_check_turns_off_peer_transfers_everywhere(monkeypatch):
         usable, problem, p2p_off, total = results[r]
         assert not usable and problem.endswith("GPU 1: made to fail") and p2p_off == "1" and total == 3.0, results
 
+
+
+def run_merge_rank(rank, world, port, queue):
+    """Rank r and rank r ^ 1 share a KV head: each attends over one parity of the slots for 12 query heads, and
+    seventy_ar_attn_merge gives each its 6 own heads of the attention over the whole cache. 60 calls with changing
+    row counts (more than one launch from 86 rows), between all-reduces of every rank (separate slots). The NCCL
+    merge (all_gather of the parts in the pair's group) gives the same result up to the order of the last sum."""
+    from seventy.engine import distributed
+    from seventy.engine.allreduce import CustomAllReduce
+    from seventy.ops import kernels
+
+    distributed.share_cpus(world)
+    torch.cuda.set_device(rank)
+    distributed.init(rank, world, port, "nccl")
+    dev = torch.device("cuda", rank)
+    ar = CustomAllReduce(rank, world, dev)
+    errors = [] if ar.usable else [f"the start check failed: {ar.problem}"]
+    part, peer = rank % 2, rank ^ 1
+    groups = [torch.distributed.new_group([r, r + 1]) for r in range(0, world, 2)]
+    pair = groups[rank // 2]
+    bs, d, hq, width, total = 16, 256, 12, 2051, 2400
+    nblk = total // bs + 6
+    for it in range(60):
+        rows = (1, 5, 40, 90, 3, 200)[it % 6]
+        g = torch.Generator().manual_seed(1000 * (rank // 2) + it)
+        table = torch.randperm(nblk, generator=g)[: total // bs].int().to(dev)
+        sel = torch.full((rows, width), -1, dtype=torch.int32)
+        for i in range(rows):
+            n = 400 + (i * 37) % 112
+            picks = torch.randperm(total // 4, generator=g)[:n].int()
+            at = torch.randperm(512, generator=g)[:n]
+            for c in range(4):
+                sel[i, at * 4 + c] = picks * 4 + c
+        sel = sel.to(dev)
+        k = torch.randint(-127, 128, (nblk, bs, 1, d), generator=g, dtype=torch.int8).to(dev)
+        v = torch.randint(-127, 128, (nblk, bs, 1, d), generator=g, dtype=torch.int8).to(dev)
+        ks = (torch.rand(nblk, bs, 1, generator=g) * 0.02 + 0.005).to(dev)
+        vs = (torch.rand(nblk, bs, 1, generator=g) * 0.02 + 0.005).to(dev)
+        q = torch.randn(rows, hq, d, generator=g).half().to(dev)
+        qkv = torch.randn(rows, hq * 2 * d, generator=g).half().to(dev)
+        qs_t = torch.tensor([0, rows], dtype=torch.int32, device=dev)
+        whole = kernels.qsa_attention(q, qkv, k, v, ks, vs, sel, table[None], qs_t, 1 / 16)
+        own0 = 6 * part
+
+        def merge(ws, qkv_, rows_, hq_, splits):
+            out = torch.empty(rows_, 6 * d, dtype=torch.float16, device=dev)
+            return ar.attn_merge(out, ws, qkv_, rows_, hq_, splits, own0, 6, peer, 6 * (1 - part))
+
+        got = kernels.qsa_attention(q, qkv, k[:, part::2].contiguous(), v[:, part::2].contiguous(),
+                                    ks[:, part::2].contiguous(), vs[:, part::2].contiguous(), sel, table[None], qs_t,
+                                    1 / 16, kv_split=2, kv_part=part, merge=merge)
+        diff = (got.float() - whole[:, own0 * d : (own0 + 6) * d].float()).abs().max().item()
+        if diff > 2e-3:
+            errors.append(f"call {it} ({rows} rows): max difference {diff}")
+        if it % 6 < 2:
+
+            def nccl(ws, qkv_, rows_, hq_, splits):
+                p = kernels.attention_partial(ws, rows_, hq_, splits)
+                parts = torch.empty(2, *p.shape, dtype=p.dtype, device=dev)
+                torch.distributed.all_gather_into_tensor(parts, p, group=pair)
+                return kernels.attention_merge(parts, qkv_, own0, 6)
+
+            alt = kernels.qsa_attention(q, qkv, k[:, part::2].contiguous(), v[:, part::2].contiguous(),
+                                        ks[:, part::2].contiguous(), vs[:, part::2].contiguous(), sel, table[None],
+                                        qs_t, 1 / 16, kv_split=2, kv_part=part, merge=nccl)
+            if (alt.float() - got.float()).abs().max().item() > 1e-3:
+                errors.append(f"call {it}: the NCCL merge differs from the peer-to-peer merge")
+        if it % 2 == 0:
+            x = torch.randn(rows % 64 + 1, 5120, generator=g).half().to(dev)
+            ar.reduce(x)
+    torch.cuda.synchronize()
+    queue.put((rank, errors))
+    distributed.shutdown()
+
+
+@pytest.mark.skipif(not _peer_gpus(), reason="needs 2 GPUs with peer-to-peer access (NVLink or PCIe P2P)")
+@pytest.mark.parametrize("world", [2, 4])
+def test_split_attention_merge_between_peers(world):
+    from seventy.engine import distributed
+
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"needs {world} GPUs")
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    port = distributed.free_port()
+    procs = [ctx.Process(target=run_merge_rank, args=(r, world, port, queue)) for r in range(world)]
+    for p in procs:
+        p.start()
+    results = dict(queue.get(timeout=300) for _ in range(world))
+    for p in procs:
+        p.join(timeout=60)
+    assert all(not e for e in results.values()), results

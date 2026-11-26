@@ -47,10 +47,126 @@ __device__ __forceinline__ uint32_t code_pair_to_half2(uint32_t x) {
   return (x & 0x80008000u) | ((x >> 3) & 0x0E000E00u);
 }
 
+/*
+ * The GPU expert cache of one MoE layer on one rank (seventy_moe_plan with a cache). The rank's experts are
+ * resident (always in GPU memory), or kept in pinned host memory, and then possibly also in one of the `pool` GPU
+ * slots. Four arrays per expert (gate_up wpk and wsc, down wpk and wsc); ptrs are the pointer tables that the
+ * expert products read (seventy_moe_mma), host and pool the device addresses of the host banks and the slot banks,
+ * bytes the size of each array per expert (multiples of 16). slot_of: the expert's slot, -1 for an expert only in
+ * host memory, -2 for a resident one. A slot's stamp is the clock of the step that last used it.
+ *
+ * uses (optional): each expert's count of (token, expert) pairs over all plan steps, for an expert profile. With
+ * pool 0 the cache only counts.
+ *
+ * Each plan step after the plan: the slots of the step's experts take the stamp clock + 1; each expert of the step
+ * in host memory only takes, in expert order, the least recently used slot that the step does not use (its expert,
+ * if any, goes back to host memory); its pointers move to the slot and the kernel copies its arrays from host
+ * memory into the slot (one block of 1024 threads keeps PCIe busy). Experts that find no free slot stay in host
+ * memory for this step (the products read them over PCIe). The clock then advances.
+ */
+struct ExpertCacheDev {
+  int32_t *slot_of;
+  int32_t *owner;
+  uint32_t *stamp;
+  uint32_t *clock;
+  const int32_t *host_index;
+  int32_t *uses;
+  int64_t *ptrs[4];
+  int64_t host[4];
+  int64_t pool[4];
+  int64_t bytes[4];
+  int32_t pool_size;
+  int32_t pad;
+};
+
+constexpr int kMoeMaxPool = 1024;
+
+__device__ void copy_expert(const ExpertCacheDev &c, int e, int slot) {
+#pragma unroll 1
+  for (int a = 0; a < 4; ++a) {
+    const uint4 *src = reinterpret_cast<const uint4 *>(c.host[a] + static_cast<int64_t>(c.host_index[e]) * c.bytes[a]);
+    uint4 *dst = reinterpret_cast<uint4 *>(c.pool[a] + static_cast<int64_t>(slot) * c.bytes[a]);
+    const int64_t n = c.bytes[a] / 16;
+    constexpr int kU = 8;
+    for (int64_t i = threadIdx.x; i < n; i += static_cast<int64_t>(blockDim.x) * kU) {
+      uint4 r[kU];
+#pragma unroll
+      for (int u = 0; u < kU; ++u) {
+        const int64_t j = i + static_cast<int64_t>(u) * blockDim.x;
+        if (j < n) r[u] = __ldcv(src + j);
+      }
+#pragma unroll
+      for (int u = 0; u < kU; ++u) {
+        const int64_t j = i + static_cast<int64_t>(u) * blockDim.x;
+        if (j < n) dst[j] = r[u];
+      }
+    }
+  }
+}
+
+__device__ void expert_cache_step(const ExpertCacheDev &c, int count, int experts, int *miss_list, uint32_t *snap,
+                                  int *warp_sums, int *n_miss) {
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  if (c.uses != nullptr && tid < experts && count > 0) c.uses[tid] += count;
+  const int pool = c.pool_size;
+  if (pool == 0) return;
+  const uint32_t now = *c.clock + 1;
+  const bool miss = tid < experts && count > 0 && c.slot_of[tid] == -1;
+  if (tid < experts && count > 0 && c.slot_of[tid] >= 0) c.stamp[c.slot_of[tid]] = now;
+  const unsigned ballot = __ballot_sync(0xffffffffu, miss);
+  if (lane == 0) warp_sums[warp] = __popc(ballot);
+  __syncthreads();
+  if (tid == 0) {
+    int acc = 0;
+    for (int w = 0; w < 32; ++w) {
+      const int v = warp_sums[w];
+      warp_sums[w] = acc;
+      acc += v;
+    }
+    *n_miss = acc;
+  }
+  if (tid < pool) snap[tid] = c.stamp[tid];
+  __syncthreads();
+  if (miss) miss_list[warp_sums[warp] + __popc(ballot & ((1u << lane) - 1u))] = tid;
+  __syncthreads();
+  const int misses = *n_miss;
+  int take = -1;
+  if (tid < pool && misses > 0) {
+    const uint32_t mine = snap[tid];
+    if (mine != now) {
+      int rank = 0;
+      for (int s = 0; s < pool; ++s) {
+        const uint32_t o = snap[s];
+        rank += o != now && (o < mine || (o == mine && s < tid));
+      }
+      if (rank < misses) take = miss_list[rank];
+    }
+  }
+  if (take >= 0) {
+    const int v = c.owner[tid];
+    if (v >= 0) {
+      c.slot_of[v] = -1;
+      for (int a = 0; a < 4; ++a) c.ptrs[a][v] = c.host[a] + static_cast<int64_t>(c.host_index[v]) * c.bytes[a];
+    }
+    c.owner[tid] = take;
+    c.slot_of[take] = tid;
+    c.stamp[tid] = now;
+    for (int a = 0; a < 4; ++a) c.ptrs[a][take] = c.pool[a] + static_cast<int64_t>(tid) * c.bytes[a];
+  }
+  __syncthreads();
+  const int copies = misses < pool ? misses : pool;
+  for (int j = 0; j < copies; ++j) {
+    const int e = miss_list[j];
+    const int slot = c.slot_of[e];
+    if (slot >= 0) copy_expert(c, e, slot);
+  }
+  if (tid == 0) *c.clock = now;
+}
+
 __global__ void __launch_bounds__(1024) moe_plan_kernel(const int32_t *ids, int pairs, int e0, int e1, int per,
                                                         int max_slots, int32_t *order, int32_t *slot_expert,
                                                         int32_t *slot_start, int32_t *slot_count,
-                                                        int32_t *num_slots) {
+                                                        int32_t *num_slots, const ExpertCacheDev *cache) {
   __shared__ int counts[kMoeMaxExperts];
   __shared__ int scan_a[kMoeMaxExperts];
   __shared__ int scan_b[kMoeMaxExperts];
@@ -107,6 +223,10 @@ __global__ void __launch_bounds__(1024) moe_plan_kernel(const int32_t *ids, int 
     int rank = 0;
     for (int q = 0; q < p; ++q) rank += pair_ids[q] == e;
     order[counts[e - e0] + rank] = p;
+  }
+  if (cache != nullptr) {
+    __syncthreads();
+    expert_cache_step(*cache, c, experts, scan_a, reinterpret_cast<uint32_t *>(scan_b), counts, pair_ids);
   }
 }
 
@@ -351,7 +471,23 @@ SEVENTY_API int seventy_moe_plan(const int32_t *ids, int pairs, int e0, int e1, 
       max_slots < 1)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   moe_plan_kernel<<<1, 1024, 0, stream>>>(ids, pairs, e0, e1, per, max_slots, order, slot_expert, slot_start,
-                                          slot_count, num_slots);
+                                          slot_count, num_slots, nullptr);
+  return launch_status();
+}
+
+SEVENTY_API int64_t seventy_expert_cache_bytes() { return sizeof(seventy::ExpertCacheDev); }
+
+SEVENTY_API int seventy_moe_plan_cached(const int32_t *ids, int pairs, int e0, int e1, int per, int max_slots,
+                                        int32_t *order, int32_t *slot_expert, int32_t *slot_start,
+                                        int32_t *slot_count, int32_t *num_slots, const void *cache, int pool,
+                                        cudaStream_t stream) {
+  using namespace seventy;
+  if (ids == nullptr || order == nullptr || slot_expert == nullptr || slot_start == nullptr || slot_count == nullptr ||
+      num_slots == nullptr || cache == nullptr || pairs < 0 || pairs > kMoeMaxPairs || e1 < e0 ||
+      e1 - e0 > kMoeMaxExperts || per < 1 || per > kMoeMaxRows || max_slots < 1 || pool < 0 || pool > kMoeMaxPool)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  moe_plan_kernel<<<1, 1024, 0, stream>>>(ids, pairs, e0, e1, per, max_slots, order, slot_expert, slot_start,
+                                          slot_count, num_slots, static_cast<const ExpertCacheDev *>(cache));
   return launch_status();
 }
 

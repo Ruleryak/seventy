@@ -93,5 +93,27 @@ def max_head_split(heads: int, kv: int, size: int) -> tuple[int, int]:
     return max(p.num_kv for p in parts), max(p.num_heads for p in parts)
 
 
+def kv_groups(heads: int, kv: int, size: int) -> list[tuple[int, ...]] | None:
+    """The groups of ranks that share a KV head and can split its tokens, in rank order (None: no split): with
+    fewer KV heads than ranks, size a multiple of kv, and every rank keeping one KV head and computing all its query
+    heads, with its own query heads the balanced part of the group's heads at its index in the group."""
+    if kv >= size or size % kv:
+        return None
+    parts = [head_split(heads, kv, r, size) for r in range(size)]
+    groups: dict[int, list[int]] = {}
+    for r, p in enumerate(parts):
+        if p.num_kv != 1 or p.num_heads != heads // kv:
+            return None
+        groups.setdefault(p.kv[0], []).append(r)
+    out = [tuple(g) for _, g in sorted(groups.items())]
+    if any(len(g) != size // kv for g in out):
+        return None
+    for g in out:
+        for i, r in enumerate(g):
+            if parts[r].local_own != balanced(heads // kv, len(g), i):
+                return None
+    return out
+
+
 VOCAB_ALIGN = 64
 MLP_ALIGN = 64

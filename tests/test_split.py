@@ -4,7 +4,7 @@ whole groups of the KV heads (key heads) that its rank keeps."""
 
 import pytest
 
-from seventy.split import balanced, head_split, max_head_split
+from seventy.split import balanced, head_split, kv_groups, max_head_split
 
 SHAPES = [(24, 4), (48, 16), (32, 8), (16, 2), (24, 2), (16, 4), (8, 8)]
 
@@ -68,3 +68,17 @@ def test_the_27b_and_its_drafter_on_3_gpus():
     assert [(s.kv, s.own) for s in drafter] == [((0, 3), (0, 12)), ((3, 6), (12, 24)), ((6, 8), (24, 32))]
     assert not any(s.partial for s in drafter)
     assert max_head_split(24, 4, 3) == (2, 12) and max_head_split(48, 16, 3) == (6, 18)
+
+
+def test_kv_groups_pair_the_ranks_that_share_a_kv_head():
+    """Groups exist when every rank keeps one KV head and computes all its query heads, and the ranks of a KV head
+    own equal parts of them in rank order; otherwise (each rank its own KV heads, uneven splits) there are none."""
+    assert kv_groups(24, 2, 4) == [(0, 1), (2, 3)]
+    assert kv_groups(16, 2, 4) == [(0, 1), (2, 3)]
+    assert kv_groups(24, 2, 8) == [(0, 1, 2, 3), (4, 5, 6, 7)]
+    for heads, kv, size in ((24, 2, 2), (24, 2, 3), (24, 4, 4), (32, 8, 4), (24, 2, 1)):
+        assert kv_groups(heads, kv, size) is None
+    for g in kv_groups(24, 2, 4):
+        owns = [head_split(24, 2, r, 4) for r in g]
+        assert len({s.kv for s in owns}) == 1 and [s.local_own for s in owns] == [(0, 6), (6, 12)]
+

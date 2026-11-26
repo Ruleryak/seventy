@@ -127,20 +127,21 @@ def test_finish_adds_local_picks_and_the_gated_shared_expert(shared):
     torch.testing.assert_close(out.float().cpu(), want.half().float(), rtol=2e-3, atol=2e-3)
 
 
-@pytest.mark.parametrize("fmt", ["fp16", "nvfp4", "nvfp4-offload"])
+@pytest.mark.parametrize("fmt", ["fp16", "nvfp4", "nvfp4-offload", "nvfp4-cache"])
 def test_gpu_moe_matches_the_per_expert_loop(fmt):
     """MoE._small (one product for the router and the shared gate, warp route, moe_finish) and MoE._large (the
     prefill path: compact rows, the PyTorch plan) against the per-expert loop (MoE._loop) on random experts of a
     small config, FP16 (seventy_moe_gemm) or NVFP4 repacked for the tensor cores (seventy_moe_mma; offload: 6 of
-    the 16 experts in pinned host memory, read over PCIe), with BF16 router weights that need the power-of-two
-    scale."""
+    the 16 experts in pinned host memory, read over PCIe; cache: 8 resident, 3 GPU slots for the other 8, over 40
+    more decode steps), with BF16 router weights that need the power-of-two scale."""
     from types import SimpleNamespace
 
-    from seventy.model.moe import ExpertStack, MoE
+    from seventy.model.moe import ExpertCache, ExpertStack, MoE
 
     g = torch.Generator().manual_seed(3)
     hidden, width, experts, local = 256, 64, 32, 16
     m = MoE.__new__(MoE)
+    m.cache = None
     m.cfg = SimpleNamespace(num_experts=experts, experts_per_token=4, norm_topk_prob=True)
     m.top_k, m.e0, m.e1, m.dtype, m.device = 4, 8, 24, torch.float16, torch.device("cuda")
     router = (torch.randn(experts, hidden, generator=g) * 0.05).bfloat16().float()
@@ -162,21 +163,40 @@ def test_gpu_moe_matches_the_per_expert_loop(fmt):
                                alpha=(torch.rand(local, n, generator=g) * 0.002 + 0.0005).cuda())
 
         m.gate_up, m.down = nv(2 * width, hidden), nv(hidden, width)
-        on_gpu = 10 if fmt == "nvfp4-offload" else None
-        m.gate_up.to_gemm(on_gpu)
-        m.down.to_gemm(on_gpu)
-        if on_gpu:
+        resident = {"nvfp4-offload": list(range(10)), "nvfp4-cache": [1, 3, 5, 7, 9, 11, 13, 15]}.get(fmt)
+        pool = 3 if fmt == "nvfp4-cache" else 0
+        m.gate_up.to_gemm(resident, pool)
+        m.down.to_gemm(resident, pool)
+        if resident:
             assert m.gate_up.host[0].is_pinned() and m.gate_up.gemm_ptrs is not None
+        if pool:
+            m.cache = ExpertCache(m.gate_up, m.down, [0, 2, 4, 6, 8, 10, 12, 14])
+            assert m.cache.residents() == [0, 2, 4]
     wgu = (torch.randn(2 * width, hidden, generator=g) * 0.05).half().cuda()
     wd = (torch.randn(hidden, width, generator=g) * 0.05).half().cuda()
     m.shared_gate_up = lambda x: x @ wgu.T
     m.shared_down = lambda x: x @ wd.T
-    for tokens in (1, 7, 64, 300):
+    steps = (1, 7, 64, 300) + ((1, 2, 5, 1, 3) * 8 if fmt == "nvfp4-cache" else ())
+    for tokens in steps:
         x = torch.randn(tokens, hidden, generator=g).half().cuda()
         got = m(x)
         ids, weights = m.route(x)
         want = m._loop(x, ids, weights, m._shared(x)).to(torch.float16)
         torch.testing.assert_close(got.float(), want.float(), rtol=3e-3, atol=3e-3)
+    if fmt == "nvfp4-cache":
+        owners = m.cache.residents()
+        assert sorted(e for e in owners if e >= 0) == sorted(set(e for e in owners if e >= 0))
+        assert all(e in m.gate_up.host_index for e in owners if e >= 0)
+        for stack in (m.gate_up, m.down):
+            ptrs = stack.gemm_ptrs[0].tolist()
+            for e in range(local):
+                if e in stack.bank_index:
+                    assert ptrs[e] == stack.gemm.wpk[stack.bank_index[e]].data_ptr()
+                elif e in owners:
+                    slot = stack.gemm.wpk[stack.on_gpu + owners.index(e)]
+                    assert ptrs[e] == slot.data_ptr() and torch.equal(slot.cpu(), stack.host[0][stack.host_index[e]])
+                else:
+                    assert ptrs[e] == stack.host[0][stack.host_index[e]].data_ptr()
 
 
 @pytest.mark.parametrize("pairs,per", [(30, 8), (3000, 8), (40960, 8)])
@@ -198,3 +218,76 @@ def test_large_plan_slots_cover_each_local_pair_once(pairs, per):
             assert e0 + int(se[s]) == int(ids[p]) and int(rows[p]) == r
             seen.append(p)
     assert sorted(seen) == sorted(((ids >= e0) & (ids < e1)).nonzero().view(-1).tolist())
+
+
+def _offloaded_moe(g, resident, pool):
+    """A small MoE (32 experts, ranks' local experts 8 .. 23, NVFP4 repacked) with the local experts outside
+    resident in pinned host memory and pool GPU slots."""
+    from types import SimpleNamespace
+
+    from seventy.model.moe import ExpertCache, ExpertStack, MoE
+
+    hidden, width, experts, local = 256, 64, 32, 16
+    m = MoE.__new__(MoE)
+    m.cache = None
+    m.cfg = SimpleNamespace(num_experts=experts, experts_per_token=4, norm_topk_prob=True)
+    m.top_k, m.e0, m.e1, m.dtype, m.device = 4, 8, 24, torch.float16, torch.device("cuda")
+    m.router = (torch.randn(experts, hidden, generator=g) * 0.05).bfloat16().float().cuda()
+    m.shared_gate = (torch.randn(1, hidden, generator=g) * 0.05).bfloat16().float().cuda()
+    m.gates, m.gate_scale = None, 1.0
+    m.use_fp16_gates()
+
+    def nv(n, k):
+        return ExpertStack(packed=torch.randint(0, 256, (local, n, k // 2), generator=g, dtype=torch.uint8).cuda(),
+                           scales=torch.randint(0x30, 0x40, (local, n, k // 16), generator=g, dtype=torch.uint8).cuda(),
+                           alpha=(torch.rand(local, n, generator=g) * 0.002 + 0.0005).cuda())
+
+    m.gate_up, m.down = nv(2 * width, hidden), nv(hidden, width)
+    m.gate_up.to_gemm(resident, pool)
+    m.down.to_gemm(resident, pool)
+    if pool:
+        m.cache = ExpertCache(m.gate_up, m.down, [e for e in range(local) if e not in resident])
+    wgu = (torch.randn(2 * width, hidden, generator=g) * 0.05).half().cuda()
+    wd = (torch.randn(hidden, width, generator=g) * 0.05).half().cuda()
+    m.shared_gate_up = lambda x: x @ wgu.T
+    m.shared_down = lambda x: x @ wd.T
+    return m
+
+
+def test_prefill_stage_feeds_each_layer_its_experts():
+    """Three MoE layers with offloaded experts share a PrefillStage: prefill steps (MoE._large) read each layer's
+    host experts from the bank the stage copied them into (one layer ahead, on its copy stream), in layer order over
+    several passes and mixed with decode steps that move experts between the slots, and match the per-expert loop."""
+    from seventy.model.moe import PrefillStage
+
+    g = torch.Generator().manual_seed(11)
+    layers = [_offloaded_moe(g, list(range(0, 16, 3)), pool) for pool in (0, 2, 4)]
+    stage = PrefillStage(layers)
+    assert [m.stage_index for m in layers] == [0, 1, 2]
+    for rnd in range(3):
+        for m in layers:
+            tokens = (300, 90, 5)[(rnd + m.stage_index) % 3]
+            x = torch.randn(tokens, 256, generator=g).half().cuda()
+            got = m(x)
+            ids, weights = m.route(x)
+            want = m._loop(x, ids, weights, m._shared(x)).to(torch.float16)
+            torch.testing.assert_close(got.float(), want.float(), rtol=3e-3, atol=3e-3)
+    assert stage.held[0] in (0, 2) and stage.held[1] == 1
+
+
+def test_cache_counts_every_local_pair():
+    """With counting on, the expert cache adds each local (token, expert) pair of decode steps (in the plan kernel)
+    and of prefill steps (count_prefill) to uses."""
+    from seventy.model.moe import ExpertCache
+
+    g = torch.Generator().manual_seed(5)
+    m = _offloaded_moe(g, list(range(0, 16, 2)), 3)
+    m.cache = ExpertCache(m.gate_up, m.down, [e for e in range(16) if e % 2], count=True)
+    want = torch.zeros(16, dtype=torch.int64)
+    for tokens in (1, 3, 200, 7, 64, 90, 2):
+        x = torch.randn(tokens, 256, generator=g).half().cuda()
+        ids, _ = m.route(x)
+        local = ids.reshape(-1).long().cpu() - m.e0
+        want += torch.bincount(local[(local >= 0) & (local < 16)], minlength=16)
+        m(x)
+    assert torch.equal(m.cache.uses.cpu().long(), want)

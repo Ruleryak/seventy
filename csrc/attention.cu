@@ -63,7 +63,7 @@ __global__ void __launch_bounds__(kHead) attn_prep_kernel(half *q_out, T *k_cach
                                                           const int64_t *positions, int64_t pos_stride,
                                                           const float *inv_freq, float rope_scale, int s1, int s2,
                                                           int rotary_dim, const int *slots, int hq, int hkv,
-                                                          float eps) {
+                                                          float eps, int kv_split, int kv_part) {
   __shared__ float scratch[32];
   __shared__ float vals[kHead];
   const int t = blockIdx.x;
@@ -71,6 +71,11 @@ __global__ void __launch_bounds__(kHead) attn_prep_kernel(half *q_out, T *k_cach
   const int d = threadIdx.x;
   const bool is_q = head < hq;
   const int kv = head - hq;
+  int64_t slot = slots[t];
+  if (!is_q && kv_split > 1) {
+    if (slot % kv_split != kv_part) return;
+    slot /= kv_split;
+  }
   const half *row = qkv + static_cast<int64_t>(t) * ld;
   const float x = __half2float(is_q ? row[head * 2 * kHead + d] : row[2 * hq * kHead + kv * kHead + d]);
   const float ss = block_sum(x * x, scratch);
@@ -95,7 +100,7 @@ __global__ void __launch_bounds__(kHead) attn_prep_kernel(half *q_out, T *k_cach
   if (is_q) {
     q_out[(static_cast<int64_t>(t) * hq + head) * kHead + d] = out;
   } else {
-    const int64_t vec = static_cast<int64_t>(slots[t]) * hkv + kv;
+    const int64_t vec = slot * hkv + kv;
     store_kv<T>(k_cache, k_scale, vec, __half2float(out), scratch);
     store_kv<T>(v_cache, v_scale, vec, __half2float(row[2 * hq * kHead + hkv * kHead + kv * kHead + d]), scratch);
   }
@@ -278,17 +283,101 @@ __global__ void __launch_bounds__(kHead) attention_combine_kernel(half *out, con
   out[(static_cast<int64_t>(t) * hq + head) * kHead + d] = __float2half_rn(a / (1.0f + expf(-g)));
 }
 
+__global__ void __launch_bounds__(kHead) attention_partial_kernel(float *part, const float *partial_o,
+                                                                  const float *partial_ml, int hq, int splits) {
+  const int t = blockIdx.x;
+  const int head = blockIdx.y;
+  const int d = threadIdx.x;
+  const int64_t base = (static_cast<int64_t>(t) * hq + head) * splits;
+  float m = -FLT_MAX;
+  for (int s = 0; s < splits; ++s) m = fmaxf(m, partial_ml[(base + s) * 2]);
+  float l = 0.0f, o = 0.0f;
+  for (int s = 0; s < splits; ++s) {
+    const float ms = partial_ml[(base + s) * 2];
+    if (ms == -FLT_MAX) continue;
+    const float w = expf(ms - m);
+    l += partial_ml[(base + s) * 2 + 1] * w;
+    o += partial_o[(base + s) * kHead + d] * w;
+  }
+  float *dst = part + (static_cast<int64_t>(t) * hq + head) * (kHead + 4);
+  dst[d] = o;
+  if (d == 0) {
+    dst[kHead] = m;
+    dst[kHead + 1] = l;
+    dst[kHead + 2] = 0.0f;
+    dst[kHead + 3] = 0.0f;
+  }
+}
+
+__global__ void __launch_bounds__(kHead) attention_merge_kernel(half *out, const float *parts, int groups, int tokens,
+                                                                int hq, int own0, int own, const half *qkv, int ld) {
+  const int t = blockIdx.x;
+  const int j = blockIdx.y;
+  const int d = threadIdx.x;
+  const int head = own0 + j;
+  const int64_t stride = static_cast<int64_t>(tokens) * hq * (kHead + 4);
+  const float *src = parts + (static_cast<int64_t>(t) * hq + head) * (kHead + 4);
+  float m = -FLT_MAX;
+  for (int g = 0; g < groups; ++g) m = fmaxf(m, src[g * stride + kHead]);
+  float l = 0.0f, o = 0.0f;
+  for (int g = 0; g < groups; ++g) {
+    const float mg = src[g * stride + kHead];
+    if (mg == -FLT_MAX) continue;
+    const float w = expf(mg - m);
+    l += src[g * stride + kHead + 1] * w;
+    o += src[g * stride + d] * w;
+  }
+  const float a = __half2float(__float2half_rn(o / l));
+  const float gt = __half2float(qkv[static_cast<int64_t>(t) * ld + head * 2 * kHead + kHead + d]);
+  out[(static_cast<int64_t>(t) * own + j) * kHead + d] = __float2half_rn(a / (1.0f + expf(-gt)));
+}
+
 }  // namespace
 }  // namespace seventy
+
+SEVENTY_API int seventy_attention_partial(float *part, const float *workspace, int tokens, int hq, int splits,
+                                          cudaStream_t stream) {
+  using namespace seventy;
+  if (part == nullptr || workspace == nullptr || tokens < 0 || hq < 1 || splits < 1) return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (tokens == 0) return SEVENTY_OK;
+  const float *po = workspace;
+  const float *pml = po + static_cast<int64_t>(tokens) * hq * splits * kHead;
+  attention_partial_kernel<<<dim3(tokens, hq), kHead, 0, stream>>>(part, po, pml, hq, splits);
+  return launch_status();
+}
+
+SEVENTY_API int seventy_attention_merge(void *out, const float *parts, int kv_split, const void *qkv, int ld,
+                                        int tokens, int hq, int own0, int own, cudaStream_t stream) {
+  using namespace seventy;
+  if (out == nullptr || parts == nullptr || qkv == nullptr || kv_split < 1 || tokens < 0 || hq < 1 || own < 1 ||
+      own0 < 0 || own0 + own > hq)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (tokens == 0) return SEVENTY_OK;
+  attention_merge_kernel<<<dim3(tokens, own), kHead, 0, stream>>>(static_cast<half *>(out), parts, kv_split, tokens,
+                                                                  hq, own0, own, static_cast<const half *>(qkv), ld);
+  return launch_status();
+}
 
 SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, float *k_scale, float *v_scale,
                                   int kv_type, const void *qkv, int ld, const float *q_norm, const float *k_norm,
                                   const int64_t *positions, int64_t pos_stride, const float *inv_freq,
                                   float rope_scale, int section1, int section2, int rotary_dim, const int *slots,
                                   int tokens, int hq, int hkv, int head_dim, float eps, cudaStream_t stream) {
+  return seventy_attn_prep_split(q_out, k_cache, v_cache, k_scale, v_scale, kv_type, qkv, ld, q_norm, k_norm,
+                                 positions, pos_stride, inv_freq, rope_scale, section1, section2, rotary_dim, slots,
+                                 tokens, hq, hkv, head_dim, eps, 1, 0, stream);
+}
+
+SEVENTY_API int seventy_attn_prep_split(void *q_out, void *k_cache, void *v_cache, float *k_scale, float *v_scale,
+                                        int kv_type, const void *qkv, int ld, const float *q_norm,
+                                        const float *k_norm, const int64_t *positions, int64_t pos_stride,
+                                        const float *inv_freq, float rope_scale, int section1, int section2,
+                                        int rotary_dim, const int *slots, int tokens, int hq, int hkv, int head_dim,
+                                        float eps, int kv_split, int kv_part, cudaStream_t stream) {
   using namespace seventy;
   if (q_out == nullptr || k_cache == nullptr || v_cache == nullptr || qkv == nullptr || q_norm == nullptr ||
-      k_norm == nullptr || positions == nullptr || inv_freq == nullptr || slots == nullptr)
+      k_norm == nullptr || positions == nullptr || inv_freq == nullptr || slots == nullptr || kv_split < 1 ||
+      kv_part < 0 || kv_part >= kv_split)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (kv_type != 0 && (kv_type != 1 || k_scale == nullptr || v_scale == nullptr)) return SEVENTY_ERR_INVALID_ARGUMENT;
   if (head_dim != kHead || rotary_dim <= 0 || rotary_dim > kHead || rotary_dim % 2 || hq <= 0 || hkv <= 0 ||
@@ -299,12 +388,12 @@ SEVENTY_API int seventy_attn_prep(void *q_out, void *k_cache, void *v_cache, flo
     attn_prep_kernel<int8_t><<<dim3(tokens, hq + hkv), kHead, 0, stream>>>(
         static_cast<half *>(q_out), static_cast<int8_t *>(k_cache), static_cast<int8_t *>(v_cache), k_scale, v_scale,
         static_cast<const half *>(qkv), ld, q_norm, k_norm, positions, pos_stride, inv_freq, rope_scale, section1,
-        section2, rotary_dim, slots, hq, hkv, eps);
+        section2, rotary_dim, slots, hq, hkv, eps, kv_split, kv_part);
   } else {
     attn_prep_kernel<half><<<dim3(tokens, hq + hkv), kHead, 0, stream>>>(
         static_cast<half *>(q_out), static_cast<half *>(k_cache), static_cast<half *>(v_cache), nullptr, nullptr,
         static_cast<const half *>(qkv), ld, q_norm, k_norm, positions, pos_stride, inv_freq, rope_scale, section1,
-        section2, rotary_dim, slots, hq, hkv, eps);
+        section2, rotary_dim, slots, hq, hkv, eps, kv_split, kv_part);
   }
   return launch_status();
 }

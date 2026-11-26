@@ -13,8 +13,9 @@ from pathlib import Path
 import torch
 
 from ..checkpoint import Checkpoint
-from .. import upload
+from .. import memory, upload
 from ..config import load_config
+from ..model import moe
 from ..model.qwen3_5 import Qwen35TextModel
 from ..parallel import Parallel
 from . import distributed
@@ -24,15 +25,22 @@ from .runner import ModelRunner, build_step
 
 
 def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None, yarn_factor: float | None = None,
-               expert_offload: float = 0.0):
+               expert_offload: float = 0.0, expert_profile: str | None = None):
     """This rank's shard of the model, with the peer-to-peer all-reduce when the start check passes on every rank.
-    expert_offload: the share of each rank's routed NVFP4 experts kept in pinned host memory (moe.EXPERT_OFFLOAD).
+    expert_offload: the share of each rank's routed NVFP4 experts kept in pinned host memory (moe.EXPERT_OFFLOAD),
+    the most used first in GPU memory by expert_profile (a file of moe.save_profile; the ranks count the experts'
+    use for it) or by the built-in profile of the model, else by index.
     With tensor parallel, it ends with a first NCCL all-reduce: NCCL then makes its communicator (and its buffers
-    in GPU memory) before the caller measures the memory that is left for the KV cache."""
+    in GPU memory) before the caller measures the memory that is left for the KV cache. Ranks that may split a KV
+    head's tokens (memory.kv_split) without the peer-to-peer merge also get an NCCL group per KV head."""
     cfg = load_config(Path(model_path), yarn_factor=yarn_factor)
-    from ..model import moe
-
     moe.EXPERT_OFFLOAD = expert_offload
+    moe.EXPERT_POOL = memory.expert_pool()
+    moe.EXPERT_COUNT = bool(expert_profile)
+    moe.EXPERT_PROFILE = None
+    if expert_offload > 0:
+        moe.EXPERT_PROFILE = (moe.load_profile(expert_profile, cfg.text) if expert_profile else None) or \
+            moe.builtin_profile(cfg.text)
     with Checkpoint(Path(model_path)) as ckpt:
         if cfg.text.exp is not None:
             from ..model.qwen4_exp import Qwen4ExpTextModel
@@ -60,6 +68,17 @@ def load_shard(model_path: str, rank: int, size: int, device, dtype, layers=None
                   f"({custom.problem}); every all-reduce uses NCCL without peer-to-peer transfers "
                   f"(NCCL_P2P_DISABLE={os.environ.get('NCCL_P2P_DISABLE')}), which is slower", flush=True)
     if size > 1 and torch.device(device).type == "cuda":
+        from ..split import kv_groups
+
+        groups = kv_groups(cfg.text.num_heads, cfg.text.num_kv_heads, size) if cfg.text.exp is not None else None
+        if (groups is not None and os.environ.get("SEVENTY_KV_SPLIT", "1") != "0"
+                and (model.par.custom is None or len(groups[0]) > 2)):
+            import dataclasses
+
+            made = [torch.distributed.new_group(list(g)) for g in groups]
+            mine = next(m for g, m in zip(groups, made) if rank in g)
+            model.par = dataclasses.replace(model.par, kv_group=mine)
+            torch.distributed.all_reduce(torch.zeros(1, device=device), group=mine)
         torch.distributed.all_reduce(torch.zeros(1, device=device))
     return cfg, model
 
@@ -82,7 +101,8 @@ def _watch_parent() -> None:
 
 def worker_main(rank: int, size: int, port: int, backend: str, device_name: str, model_path: str, dtype_name: str,
                 utilization: float, reserve_bytes: int, conn, layers=None, draft_path: str | None = None,
-                yarn_factor: float | None = None, expert_offload: float = 0.0) -> None:
+                yarn_factor: float | None = None, expert_offload: float = 0.0,
+                expert_profile: str | None = None) -> None:
     faulthandler.register(signal.SIGUSR1, all_threads=True)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     _watch_parent()
@@ -92,10 +112,11 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
         device = torch.device(device_name)
         if device.type == "cuda":
             torch.cuda.set_device(device)
+            distributed.bind_numa(device, size)
         distributed.init(rank, size, port, backend)
         dtype = getattr(torch, dtype_name)
         cfg, model = load_shard(model_path, rank, size, device, dtype, layers, yarn_factor=yarn_factor,
-                                expert_offload=expert_offload)
+                                expert_offload=expert_offload, expert_profile=expert_profile)
         drafter = None
         if draft_path:
             from .engine import make_drafter
@@ -109,7 +130,8 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
         kind, num_blocks, block_size, slots, kv_name = conn.recv()
         kv_dtype = getattr(torch, kv_name)
         cache = ModelCache(cfg.text, num_blocks, block_size, slots, dtype, device, par=Parallel(rank, size),
-                           kv_dtype=kv_dtype, extra_attention_layers=(cfg.text.num_layers,) if mtp else ())
+                           kv_dtype=kv_dtype, extra_attention_layers=(cfg.text.num_layers,) if mtp else (),
+                           kv_split=memory.kv_split(cfg, size, block_size))
         if drafter is not None:
             drafter.allocate(slots)
             cache.slot_peers.append(drafter)
@@ -121,6 +143,9 @@ def worker_main(rank: int, size: int, port: int, backend: str, device_name: str,
             if msg[0] == "exit":
                 graphs = None
                 runner.spec_graphs = None
+                if expert_profile:
+                    torch.cuda.synchronize()
+                    moe.save_profile(expert_profile, cfg.text, [layer.mlp for layer in model.layers])
                 break
             if msg[0] == "step":
                 runner.run_payload(msg[1], msg[2])

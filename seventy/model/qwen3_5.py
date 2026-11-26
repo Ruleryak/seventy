@@ -247,6 +247,9 @@ class Qwen35TextModel:
         self.embed = to_device(_to_dtype(ckpt.rows(f"{p}embed_tokens.weight", v0, v1), dtype), device)
         count = t.num_layers if layers is None else layers
         self.layers = [Layer(t, ckpt, i, par, dtype, device, keep_dense) for i in range(count)]
+        from .moe import link_prefill_stage
+
+        self.prefill_stage = link_prefill_stage([layer.mlp for layer in self.layers])
         inv_freq, self.rope_scale = frequencies(t)
         for layer in self.layers:
             if layer.kind == "full_attention":

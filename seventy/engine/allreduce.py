@@ -24,7 +24,7 @@ from . import distributed
 CHECK_TIMEOUT_NS = 5 * 10**9
 RUN_TIMEOUT_NS = 30 * 10**9
 SITES = {1: "FP16 push data", 2: "FP32 push data", 3: "one-shot flags", 4: "two-shot flags", 5: "two-shot gather",
-         6: "FP32 flags"}
+         6: "FP32 flags", 7: "split attention parts"}
 _instances = itertools.count()
 
 
@@ -169,6 +169,16 @@ class CustomAllReduce:
                                      torch.cuda.current_stream(x.device).cuda_stream)
         check("ar_norm", code)
         return out, residual
+
+    def attn_merge(self, out: torch.Tensor, ws: torch.Tensor, qkv: torch.Tensor, rows: int, hq: int, splits: int,
+                   own0: int, own: int, peer: int, peer_own0: int) -> torch.Tensor:
+        """The split attention merge with the peer rank that shares this rank's KV head (seventy_ar_attn_merge):
+        out FP16 [rows, own * 256] of the heads own0 .. own0 + own - 1 from this rank's seventy_qsa_attention
+        workspace ws and the peer's; the peer's own heads start at peer_own0."""
+        check("ar_attn_merge", lib().seventy_ar_attn_merge(
+            self.ctx, out.data_ptr(), ws.data_ptr(), qkv.data_ptr(), qkv.stride(0), rows, hq, splits, own0, own, peer,
+            peer_own0, torch.cuda.current_stream(out.device).cuda_stream))
+        return out
 
     def reduce(self, x: torch.Tensor) -> torch.Tensor:
         """all_reduce(x): FP16 (FP32 sum rounded once) or FP32."""

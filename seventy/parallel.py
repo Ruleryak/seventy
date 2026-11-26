@@ -11,9 +11,13 @@ from .split import MLP_ALIGN, VOCAB_ALIGN, HeadSplit, balanced, head_split
 
 @dataclass(frozen=True)
 class Parallel:
+    """rank of size ranks; custom: the peer-to-peer all-reduce (engine.allreduce.CustomAllReduce) or None for NCCL;
+    kv_group: the NCCL group of the ranks that share this rank's KV head (split.kv_groups), when they exist."""
+
     rank: int = 0
     size: int = 1
     custom: object = None
+    kv_group: object = None
 
     def span(self, total: int, align: int = 1) -> tuple[int, int]:
         """This rank's [start, stop) of total items: an even split when there is one, else parts of whole

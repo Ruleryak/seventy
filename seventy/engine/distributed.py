@@ -95,6 +95,57 @@ def share_cpus(size: int) -> None:
         torch.set_num_threads(max(1, usable_cpus() // size))
 
 
+def _cpu_list(text: str) -> set[int]:
+    cpus = set()
+    for part in text.strip().split(","):
+        if part:
+            a, _, b = part.partition("-")
+            cpus.update(range(int(a), int(b or a) + 1))
+    return cpus
+
+
+def gpu_numa_node(index: int) -> int | None:
+    """The NUMA node of CUDA device index (from its PCI address in sysfs), or None when unknown."""
+    p = torch.cuda.get_device_properties(index)
+    path = f"/sys/bus/pci/devices/{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0/numa_node"
+    try:
+        with open(path) as f:
+            node = int(f.read())
+    except (OSError, ValueError):
+        return None
+    return node if node >= 0 else None
+
+
+def bind_numa(device: torch.device, size: int) -> int | None:
+    """Run this process on the CPUs of its GPU's NUMA node (on hosts with more than one node), so that its pinned
+    host memory (offloaded experts, the PLE tables) is allocated on the node next to the GPU: with 4 V100s copying
+    from host memory at once, each copy runs at 9.3 GB/s from local memory and at 4.7 to 6.4 GB/s when the memory of
+    all GPUs is on one node. The process's PyTorch CPU threads become an equal share of the node's CPUs among the
+    size GPUs on that node. Call it after starting the other ranks' processes, which would inherit the binding.
+    SEVENTY_NUMA=0 turns it off. Returns the node."""
+    if os.environ.get("SEVENTY_NUMA", "1") == "0" or device.type != "cuda":
+        return None
+    try:
+        nodes = [n for n in os.listdir("/sys/devices/system/node") if n.startswith("node") and n[4:].isdigit()]
+    except OSError:
+        return None
+    node = gpu_numa_node(device.index)
+    if len(nodes) < 2 or node is None:
+        return None
+    try:
+        with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+            cpus = _cpu_list(f.read()) & os.sched_getaffinity(0)
+    except OSError:
+        return None
+    if not cpus:
+        return None
+    os.sched_setaffinity(0, cpus)
+    if "OMP_NUM_THREADS" not in os.environ:
+        peers = sum(1 for i in range(size) if gpu_numa_node(i) == node) or 1
+        torch.set_num_threads(max(1, usable_cpus() // peers))
+    return node
+
+
 def peer_access(size: int) -> bool:
     """Whether each pair of the first size CUDA devices can map the other's memory (NVLink, or PCIe peer-to-peer).
     The custom all-reduce needs it; without it every all-reduce goes through NCCL. All ranks get the same answer."""
