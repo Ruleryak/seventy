@@ -338,7 +338,8 @@ def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 class Indexer:
     """The Qwen Sparse Attention indexer of one attention layer: indexer_heads query heads and one key head of
-    indexer_head_dim, from one projection of the block input. Raw keys go into the cache (cache.idx_k). A block of
+    indexer_head_dim, from one projection of the block input. Raw keys go into the cache (cache.idx_k on the CPU;
+    on the GPU only the pooled block keys stay, see csrc/qsa.cu). A block of
     indexer_compress consecutive tokens has the key k_norm(mean of its raw keys), rotated at the block's first
     position; a query scores a block with sum over heads of relu(q . key) / sqrt(dim) and attends to the tokens of
     its top indexer_budget / indexer_compress complete blocks and of the unfinished last block (selected())."""
@@ -359,20 +360,20 @@ class Indexer:
             self.proj.dense = w.half()
             torch.cuda.empty_cache()
 
-    def prep(self, x: torch.Tensor, cos, sin, idx_cache: torch.Tensor, kv_slots_t: torch.Tensor) -> torch.Tensor:
-        """The GPU path of queries_and_keys for FP16 x: one product with the FP16 weights (exact for the
-        checkpoint's weights; FP32 sums; the dense GEMM kernel up to 64 tokens, else cuBLAS tensor cores), then
-        seventy_qsa_index_prep writes the raw keys into idx_cache and returns the queries in FP16. None when that
-        path does not apply."""
+    def prep(self, x: torch.Tensor, cos, sin) -> tuple[torch.Tensor, torch.Tensor]:
+        """The GPU path of queries_and_keys for FP16 x: (queries FP16 [T, heads, dim], raw keys FP16 [T, dim]). With
+        FP16 weights (exact for the checkpoint's weights): one product with FP32 sums (the dense GEMM kernel up to 64
+        tokens, else cuBLAS tensor cores), then seventy_qsa_index_prep; else queries_and_keys."""
         if self.proj16 is None or x.dtype != torch.float16:
-            return None
+            iq, ik = self.queries_and_keys(x, cos, sin)
+            return iq.to(torch.float16), ik.to(torch.float16)
         from ..ops import kernels
 
         if x.shape[0] <= 64:
             qk = kernels.dense_gemm(x, self.proj16)
         else:
             qk = torch.mm(x, self.proj.dense.T, out_dtype=torch.float32)
-        return kernels.qsa_index_prep(qk, self.q_norm, idx_cache, kv_slots_t, cos, sin, self.heads, self.eps)
+        return kernels.qsa_index_prep(qk, self.q_norm, cos, sin, self.heads, self.eps)
 
     def queries_and_keys(self, x: torch.Tensor, cos, sin) -> tuple[torch.Tensor, torch.Tensor]:
         """(normed, rotated queries [T, heads, dim], raw keys [T, dim]) of the block input x [T, hidden]."""
@@ -427,9 +428,9 @@ class ExpAttention:
         self.cfg = cfg
 
     def _kernels(self, x, step: StepInput, cache: ModelCache, layer: int, cos, sin) -> torch.Tensor:
-        """The GPU path: attn_prep (queries, keys and values into the cache), the indexer keys into the cache,
-        then csrc/qsa.cu (pooled block keys, selected positions in chunks of SELECT_ROWS rows, sparse attention
-        with the output gate)."""
+        """The GPU path: attn_prep (queries, keys and values into the cache), the indexer queries and raw keys, then
+        csrc/qsa.cu (pooled block keys from the raw keys and the slot's ring, selected positions in chunks of
+        SELECT_ROWS rows (prefill: block scores from cuBLAS), sparse attention with the output gate)."""
         from ..ops import kernels
 
         a, e = self.attn, self.cfg.exp
@@ -438,26 +439,44 @@ class ExpAttention:
         ks, vs = cache.k_scale.get(layer), cache.v_scale.get(layer)
         q = kernels.attn_prep(qkv, a.q_norm, a.k_norm, step.positions, a.inv_freq, a.section, step.kv_slots_t,
                               cache.k[layer], cache.v[layer], a.heads, a.kv_heads, a.eps, ks, vs)
-        idx = cache.idx_k[layer]
-        iq16 = self.indexer.prep(x, cos, sin, idx, step.kv_slots_t)
-        if iq16 is None:
-            iq, ik = self.indexer.queries_and_keys(x, cos, sin)
-            idx.view(-1, idx.shape[-1])[step.kv_slots_t.long()] = ik.to(idx.dtype)
-            iq16 = iq.to(torch.float16)
-        kernels.qsa_pool(cache.pooled[layer], idx, cache.positions, step.block_tables, step.query_start_t,
-                         step.context_lens_t, t, self.indexer.k_norm, a.inv_freq, a.section, self.cfg.rotary_dim,
-                         e.indexer_compress, self.indexer.eps)
+        iq16, raw = self.indexer.prep(x, cos, sin)
+        kernels.qsa_pool(cache.pooled[layer], raw, cache.idx_ring[layer], step.state_slots_t, cache.positions,
+                         step.block_tables, step.query_start_t, step.context_lens_t, t, self.indexer.k_norm,
+                         a.inv_freq, a.section, self.cfg.rotary_dim, e.indexer_compress, cache.block_size,
+                         self.indexer.eps)
         top = e.indexer_budget // e.indexer_compress
         ld = cache.num_blocks * cache.block_size // e.indexer_compress
         parts = []
-        for r0 in range(0, t, SELECT_ROWS):
-            r1 = min(t, r0 + SELECT_ROWS)
-            sel = kernels.qsa_select(iq16[r0:r1], cache.pooled[layer], step.block_tables, step.query_start_t,
-                                     step.context_lens_t, e.indexer_compress, top, ld, cache.block_size, row0=r0)
-            parts.append(kernels.qsa_attention(q[r0:r1], qkv[r0:r1], cache.k[layer], cache.v[layer], ks, vs, sel,
-                                               step.block_tables, step.query_start_t, a.scale, row0=r0))
+        if t > PREFILL_ROWS and step.query_start and len(step.query_start) == len(step.context_lens) + 1:
+            for b in range(len(step.context_lens)):
+                q0, q1 = step.query_start[b], step.query_start[b + 1]
+                if q1 == q0:
+                    continue
+                keys = self._pooled_keys(cache, layer, step, b, (step.context_lens[b] + q1 - q0) // e.indexer_compress)
+                for r0 in range(q0, q1, SELECT_ROWS):
+                    r1 = min(q1, r0 + SELECT_ROWS)
+                    sel = kernels.qsa_select_prefill(iq16[r0:r1], keys, step.query_start_t, step.context_lens_t,
+                                                     e.indexer_compress, top, r0)
+                    parts.append(kernels.qsa_attention(q[r0:r1], qkv[r0:r1], cache.k[layer], cache.v[layer], ks, vs,
+                                                       sel, step.block_tables, step.query_start_t, a.scale, row0=r0))
+        else:
+            for r0 in range(0, t, SELECT_ROWS):
+                r1 = min(t, r0 + SELECT_ROWS)
+                sel = kernels.qsa_select(iq16[r0:r1], cache.pooled[layer], step.block_tables, step.query_start_t,
+                                         step.context_lens_t, e.indexer_compress, top, ld, cache.block_size, row0=r0)
+                parts.append(kernels.qsa_attention(q[r0:r1], qkv[r0:r1], cache.k[layer], cache.v[layer], ks, vs, sel,
+                                                   step.block_tables, step.query_start_t, a.scale, row0=r0))
         o = parts[0] if len(parts) == 1 else torch.cat(parts)
         return a.o_proj(a._owned(o))
+
+    def _pooled_keys(self, cache: ModelCache, layer: int, step: StepInput, b: int, blocks: int) -> torch.Tensor:
+        """The pooled block keys FP16 [blocks, dim] of blocks 0 .. blocks - 1 of sequence b, from the paged cache."""
+        c, bs = self.cfg.exp.indexer_compress, cache.block_size
+        pooled = cache.pooled[layer]
+        pos = torch.arange(blocks, device=pooled.device) * c
+        table = step.block_tables[b].to(pooled.device).long()
+        idx = table[pos // bs] * (bs // c) + (pos % bs) // c
+        return pooled.view(-1, pooled.shape[-1])[idx]
 
     def dense(self, step: StepInput) -> bool:
         """Whether every query of the step attends to all its visible tokens (each sequence has no more than
@@ -519,6 +538,7 @@ class ExpAttention:
 
 QUERY_CHUNK = 64
 SELECT_ROWS = 256
+PREFILL_ROWS = 64
 
 
 def _read_cache(c: torch.Tensor, scale: torch.Tensor | None, flat: torch.Tensor) -> torch.Tensor:

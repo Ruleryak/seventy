@@ -7,12 +7,20 @@
  *
  * A sequence's keys go in blocks of `compress` (c) tokens. The indexer has `heads` query heads and one key head of
  * kIdx values. qsa_pool: for every new token that completes a block (position p with (p + 1) % c == 0), the
- * block's key = RMS norm (weight already 1 + w) of the mean of its c raw indexer keys (cache idx_k, FP16), rounded
- * to FP16, rotated (multimodal rotary on the first rotary_dim values) at the block's first position (cache
- * positions), into the pooled cache [blocks, block_size / c, kIdx] at that position's block and offset.
+ * block's key = RMS norm (weight already 1 + w) of the mean of its c raw indexer keys (FP16), rounded to FP16,
+ * rotated (multimodal rotary on the first rotary_dim values) at the block's first position (cache positions), into
+ * the pooled cache [blocks, block_size / c, kIdx] at that position's block and offset. Raw keys are not kept per
+ * token: the step's own come from raw [tokens, kIdx], older ones from the sequence's ring (ring [slots, ring_len,
+ * kIdx], position p at p % ring_len). After the pooling, the ring takes the step's last ring_len raw keys. With
+ * ring_len >= c + the rows of a verify step, a block that a rejected draft completed is pooled again from the
+ * right keys when its real last token comes.
  *
  * qsa_index_prep: from the indexer projection qk FP32 [tokens, (heads + 1) * kIdx], the normed, rotated queries (FP16
- * [tokens, heads, kIdx]) and the raw keys (FP16, into the indexer cache at each token's slot).
+ * [tokens, heads, kIdx]) and the raw keys (FP16, into idx_cache at each token's slot, or at row t with kv_slots
+ * NULL).
+ *
+ * seventy_qsa_select_scores: qsa_select from scores that the caller computed (row lt of scores for query row row0 + lt,
+ * block j at column j; only the row's visible complete blocks are read).
  *
  * qsa_score, qsa_select and qsa_attention take the rows row0 .. row0 + tokens - 1 of the step (their q, scores,
  * sel and outputs hold only those).
@@ -39,7 +47,8 @@ __device__ __forceinline__ int seq_of(const int *query_start, int num_seqs, int 
   return b;
 }
 
-__global__ void __launch_bounds__(kIdx) qsa_pool_kernel(half *pooled, const half *idx_keys, const int *positions,
+__global__ void __launch_bounds__(kIdx) qsa_pool_kernel(half *pooled, const half *raw, const half *ring, int ring_len,
+                                                        const int *state_slots, const int *positions,
                                                         const int *block_tables, int table_width,
                                                         const int *query_start, const int *context_lens,
                                                         int num_seqs, const float *k_norm, const float *inv_freq,
@@ -49,15 +58,18 @@ __global__ void __launch_bounds__(kIdx) qsa_pool_kernel(half *pooled, const half
   __shared__ float vals[kIdx];
   const int t = blockIdx.x, d = threadIdx.x;
   const int b = seq_of(query_start, num_seqs, t);
-  const int p = context_lens[b] + (t - query_start[b]);
+  const int ctx = context_lens[b];
+  const int p = ctx + (t - query_start[b]);
   if ((p + 1) % c) return;
   const int j0 = p + 1 - c;
   const int *table = block_tables + static_cast<int64_t>(b) * table_width;
+  const half *mine = ring + static_cast<int64_t>(state_slots[b]) * ring_len * kIdx;
   float sum = 0.0f;
   for (int i = 0; i < c; ++i) {
     const int pos = j0 + i;
-    const int64_t slot = static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
-    sum += __half2float(idx_keys[slot * kIdx + d]);
+    const half key = pos >= ctx ? raw[static_cast<int64_t>(query_start[b] + pos - ctx) * kIdx + d]
+                                : mine[static_cast<int64_t>(pos % ring_len) * kIdx + d];
+    sum += __half2float(key);
   }
   const float mean = __half2float(__float2half_rn(sum / c));
   const float ss = block_sum(mean * mean, scratch);
@@ -79,6 +91,20 @@ __global__ void __launch_bounds__(kIdx) qsa_pool_kernel(half *pooled, const half
   const int per_block = block_size / c;
   const int64_t out = (static_cast<int64_t>(table[j0 / block_size]) * per_block + (j0 % block_size) / c) * kIdx;
   pooled[out + d] = __float2half_rn(r);
+}
+
+__global__ void __launch_bounds__(kIdx) qsa_ring_kernel(half *ring, int ring_len, const half *raw,
+                                                        const int *state_slots, const int *query_start,
+                                                        const int *context_lens) {
+  const int b = blockIdx.y, d = threadIdx.x;
+  const int q0 = query_start[b], len = query_start[b + 1] - q0;
+  if (len <= 0) return;
+  const int ctx = context_lens[b];
+  half *mine = ring + static_cast<int64_t>(state_slots[b]) * ring_len * kIdx;
+  for (int i = max(0, len - ring_len) + blockIdx.x; i < len; i += gridDim.x) {
+    const int pos = ctx + i;
+    mine[static_cast<int64_t>(pos % ring_len) * kIdx + d] = raw[static_cast<int64_t>(q0 + i) * kIdx + d];
+  }
 }
 
 __global__ void __launch_bounds__(128) qsa_score_kernel(float *scores, int ld, const half *q, int heads,
@@ -233,7 +259,7 @@ __global__ void __launch_bounds__(kIdx) qsa_index_prep_kernel(half *q_out, half 
   const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
   const float v = qk[static_cast<int64_t>(t) * qk_ld + h * kIdx + d];
   if (h == heads) {
-    idx_cache[static_cast<int64_t>(kv_slots[t]) * kIdx + d] = __float2half_rn(v);
+    idx_cache[static_cast<int64_t>(kv_slots != nullptr ? kv_slots[t] : t) * kIdx + d] = __float2half_rn(v);
     return;
   }
   const float ss = block_sum(v * v, scratch);
@@ -252,8 +278,8 @@ __global__ void __launch_bounds__(kIdx) qsa_index_prep_kernel(half *q_out, half 
 /*
  * qsa_attention_kernel: one block of kAttnThreads threads per (split, query row, KV head). A split takes a fixed
  * range of the row's sel entries (entries < 0 are skipped), in chunks of kChunk positions: the cache slots of the
- * chunk's positions are looked up once, then each thread issues all its key, value and scale loads before it uses
- * one, and the keys and values (dequantized to FP16) go to shared memory with a row stride of kHeadD + 2 halves, so that the 32 lanes of a
+ * chunk's positions are looked up once, each thread loads the next chunk's keys, values and scales into registers
+ * while the block computes the current chunk, and the keys and values (dequantized to FP16) go to shared memory with a row stride of kHeadD + 2 halves, so that the 32 lanes of a
  * warp, one position each, read different banks. Scores: lane = position, warp w takes the rows w, w + 4, ...;
  * online softmax per row with warp shuffles; the outputs: each thread keeps 2 of the 256 values of every row.
  */
@@ -268,31 +294,39 @@ struct ChunkLoad<int8_t> {
   static constexpr int kParts = kHeadD / 16;
 
   template <int kChunk>
-  static __device__ __forceinline__ void run(half (*kd)[kKStride], half (*vd)[kKStride], const int8_t *k_cache,
-                                             const int8_t *v_cache, const float *k_scale, const float *v_scale,
-                                             const int64_t *slots, int hkv, int kh) {
-    constexpr int kIter = kChunk * kParts / kAttnThreads;
+  struct Regs {
+    static constexpr int kIter = kChunk * kParts / kAttnThreads;
     uint4 kr[kIter], vr[kIter];
-    float kscl[kIter], vscl[kIter];
+    float ks[kIter], vs[kIter];
+  };
+
+  template <int kChunk>
+  static __device__ __forceinline__ void fetch(Regs<kChunk> &r, const int8_t *k_cache, const int8_t *v_cache,
+                                               const float *k_scale, const float *v_scale, const int64_t *slots,
+                                               int hkv, int kh) {
 #pragma unroll
-    for (int i = 0; i < kIter; ++i) {
+    for (int i = 0; i < Regs<kChunk>::kIter; ++i) {
       const int e = threadIdx.x + i * kAttnThreads;
       const int64_t slot = slots[e / kParts];
-      kr[i] = vr[i] = make_uint4(0, 0, 0, 0);
-      kscl[i] = vscl[i] = 0.0f;
+      r.kr[i] = r.vr[i] = make_uint4(0, 0, 0, 0);
+      r.ks[i] = r.vs[i] = 0.0f;
       if (slot >= 0) {
         const int64_t vec = slot * hkv + kh;
-        kr[i] = *reinterpret_cast<const uint4 *>(k_cache + vec * kHeadD + (e % kParts) * 16);
-        vr[i] = *reinterpret_cast<const uint4 *>(v_cache + vec * kHeadD + (e % kParts) * 16);
-        kscl[i] = k_scale[vec];
-        vscl[i] = v_scale[vec];
+        r.kr[i] = *reinterpret_cast<const uint4 *>(k_cache + vec * kHeadD + (e % kParts) * 16);
+        r.vr[i] = *reinterpret_cast<const uint4 *>(v_cache + vec * kHeadD + (e % kParts) * 16);
+        r.ks[i] = k_scale[vec];
+        r.vs[i] = v_scale[vec];
       }
     }
+  }
+
+  template <int kChunk>
+  static __device__ __forceinline__ void store(const Regs<kChunk> &r, half (*kd)[kKStride], half (*vd)[kKStride]) {
 #pragma unroll
-    for (int i = 0; i < kIter; ++i) {
+    for (int i = 0; i < Regs<kChunk>::kIter; ++i) {
       const int e = threadIdx.x + i * kAttnThreads;
-      store16(&kd[e / kParts][(e % kParts) * 16], kr[i], kscl[i]);
-      store16(&vd[e / kParts][(e % kParts) * 16], vr[i], vscl[i]);
+      store16(&kd[e / kParts][(e % kParts) * 16], r.kr[i], r.ks[i]);
+      store16(&vd[e / kParts][(e % kParts) * 16], r.vr[i], r.vs[i]);
     }
   }
 
@@ -314,33 +348,41 @@ struct ChunkLoad<half> {
   static constexpr int kParts = kHeadD / 8;
 
   template <int kChunk>
-  static __device__ __forceinline__ void run(half (*kd)[kKStride], half (*vd)[kKStride], const half *k_cache,
-                                             const half *v_cache, const float *, const float *,
-                                             const int64_t *slots, int hkv, int kh) {
-    constexpr int kIter = kChunk * kParts / kAttnThreads;
+  struct Regs {
+    static constexpr int kIter = kChunk * kParts / kAttnThreads;
     uint4 kr[kIter], vr[kIter];
+  };
+
+  template <int kChunk>
+  static __device__ __forceinline__ void fetch(Regs<kChunk> &r, const half *k_cache, const half *v_cache,
+                                               const float *, const float *, const int64_t *slots, int hkv,
+                                               int kh) {
 #pragma unroll
-    for (int i = 0; i < kIter; ++i) {
+    for (int i = 0; i < Regs<kChunk>::kIter; ++i) {
       const int e = threadIdx.x + i * kAttnThreads;
       const int64_t slot = slots[e / kParts];
-      kr[i] = vr[i] = make_uint4(0, 0, 0, 0);
+      r.kr[i] = r.vr[i] = make_uint4(0, 0, 0, 0);
       if (slot >= 0) {
         const int64_t at = (slot * hkv + kh) * kHeadD + (e % kParts) * 8;
-        kr[i] = *reinterpret_cast<const uint4 *>(k_cache + at);
-        vr[i] = *reinterpret_cast<const uint4 *>(v_cache + at);
+        r.kr[i] = *reinterpret_cast<const uint4 *>(k_cache + at);
+        r.vr[i] = *reinterpret_cast<const uint4 *>(v_cache + at);
       }
     }
+  }
+
+  template <int kChunk>
+  static __device__ __forceinline__ void store(const Regs<kChunk> &r, half (*kd)[kKStride], half (*vd)[kKStride]) {
 #pragma unroll
-    for (int i = 0; i < kIter; ++i) {
+    for (int i = 0; i < Regs<kChunk>::kIter; ++i) {
       const int e = threadIdx.x + i * kAttnThreads;
       half2 *kw = reinterpret_cast<half2 *>(&kd[e / kParts][(e % kParts) * 8]);
       half2 *vw = reinterpret_cast<half2 *>(&vd[e / kParts][(e % kParts) * 8]);
-      const half2 *kh2 = reinterpret_cast<const half2 *>(&kr[i]);
-      const half2 *vh2 = reinterpret_cast<const half2 *>(&vr[i]);
+      const half2 *k2 = reinterpret_cast<const half2 *>(&r.kr[i]);
+      const half2 *v2 = reinterpret_cast<const half2 *>(&r.vr[i]);
 #pragma unroll
       for (int x = 0; x < 4; ++x) {
-        kw[x] = kh2[x];
-        vw[x] = vh2[x];
+        kw[x] = k2[x];
+        vw[x] = v2[x];
       }
     }
   }
@@ -356,8 +398,8 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
   __shared__ half vs[kChunk][kKStride];
   __shared__ float p[kRows][kChunk + 1];
   __shared__ float row_m[kRows], row_l[kRows], row_scale[kRows];
-  __shared__ int pos_list[kChunk];
-  __shared__ int64_t slot_list[kChunk];
+  __shared__ int pos_list[2][kChunk];
+  __shared__ int64_t slot_list[2][kChunk];
   const int split = blockIdx.x, t = blockIdx.y, kh = blockIdx.z, tid = threadIdx.x;
   const int lane = tid & 31, warp = tid >> 5;
   const int rows = hq / hkv;
@@ -379,17 +421,27 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
 #pragma unroll
   for (int r = 0; r < kRows; ++r) acc[r][0] = acc[r][1] = 0.0f;
   const int *table = block_tables + static_cast<int64_t>(b) * table_width;
-  for (int c0 = first; c0 < last; c0 += kChunk) {
-    const int n = min(kChunk, last - c0);
-    __syncthreads();
+  auto prepare = [&](int c, int buf) {
     if (tid < kChunk) {
-      const int pos = tid < n ? row_sel[c0 + tid] : -1;
-      pos_list[tid] = pos;
-      slot_list[tid] = pos < 0 ? -1 : static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
+      const int pos = c + tid < last ? row_sel[c + tid] : -1;
+      pos_list[buf][tid] = pos;
+      slot_list[buf][tid] =
+          pos < 0 ? -1 : static_cast<int64_t>(table[pos / block_size]) * block_size + pos % block_size;
     }
+  };
+  typename ChunkLoad<T>::template Regs<kChunk> regs;
+  prepare(first, 0);
+  __syncthreads();
+  if (first < last) ChunkLoad<T>::template fetch<kChunk>(regs, k_cache, v_cache, k_scale, v_scale, slot_list[0], hkv, kh);
+  int buf = 0;
+  for (int c0 = first; c0 < last; c0 += kChunk, buf ^= 1) {
+    const int n = min(kChunk, last - c0);
+    ChunkLoad<T>::template store<kChunk>(regs, ks, vs);
+    prepare(c0 + kChunk, buf ^ 1);
     __syncthreads();
-    ChunkLoad<T>::template run<kChunk>(ks, vs, k_cache, v_cache, k_scale, v_scale, slot_list, hkv, kh);
-    __syncthreads();
+    if (c0 + kChunk < last)
+      ChunkLoad<T>::template fetch<kChunk>(regs, k_cache, v_cache, k_scale, v_scale, slot_list[buf ^ 1], hkv, kh);
+    const int *pos_now = pos_list[buf];
     for (int j = lane; j < kChunk; j += 32) {
       float dot[kRows / 4 > 0 ? kRows / 4 : 1];
 #pragma unroll
@@ -407,7 +459,7 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
           }
         }
       }
-      const bool ok = pos_list[j] >= 0;
+      const bool ok = pos_now[j] >= 0;
 #pragma unroll
       for (int i = 0; i < (kRows / 4 > 0 ? kRows / 4 : 1); ++i) {
         const int r = warp + 4 * i;
@@ -454,8 +506,8 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
         acc[r][1] = a1;
       }
     }
+    __syncthreads();
   }
-  __syncthreads();
 #pragma unroll
   for (int r = 0; r < kRows; ++r) {
     if (r < rows) {
@@ -474,19 +526,24 @@ __global__ void __launch_bounds__(kAttnThreads) qsa_attention_kernel(
 }  // namespace
 }  // namespace seventy
 
-SEVENTY_API int seventy_qsa_pool(void *pooled, const void *idx_keys, const int *positions, const int *block_tables,
-                                 int table_width, const int *query_start, const int *context_lens, int num_seqs,
-                                 int tokens, const float *k_norm, const float *inv_freq, int s1, int s2,
-                                 int rotary_dim, int compress, int block_size, float eps, cudaStream_t stream) {
+SEVENTY_API int seventy_qsa_pool(void *pooled, const void *raw, void *ring, int ring_len, const int *state_slots,
+                                 const int *positions, const int *block_tables, int table_width,
+                                 const int *query_start, const int *context_lens, int num_seqs, int tokens,
+                                 const float *k_norm, const float *inv_freq, int s1, int s2, int rotary_dim,
+                                 int compress, int block_size, float eps, cudaStream_t stream) {
   using namespace seventy;
-  if (pooled == nullptr || idx_keys == nullptr || positions == nullptr || tokens < 0 || num_seqs < 1 ||
-      compress < 1 || block_size % compress || rotary_dim > kIdx)
+  if (pooled == nullptr || raw == nullptr || ring == nullptr || positions == nullptr || state_slots == nullptr ||
+      tokens < 0 || num_seqs < 1 || compress < 1 || block_size % compress || rotary_dim > kIdx ||
+      ring_len < compress)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   if (tokens == 0) return SEVENTY_OK;
-  qsa_pool_kernel<<<tokens, kIdx, 0, stream>>>(static_cast<half *>(pooled), static_cast<const half *>(idx_keys),
-                                               positions, block_tables, table_width, query_start, context_lens,
-                                               num_seqs, k_norm, inv_freq, s1, s2, rotary_dim, compress, block_size,
-                                               eps);
+  qsa_pool_kernel<<<tokens, kIdx, 0, stream>>>(static_cast<half *>(pooled), static_cast<const half *>(raw),
+                                               static_cast<const half *>(ring), ring_len, state_slots, positions,
+                                               block_tables, table_width, query_start, context_lens, num_seqs,
+                                               k_norm, inv_freq, s1, s2, rotary_dim, compress, block_size, eps);
+  qsa_ring_kernel<<<dim3(8, num_seqs), kIdx, 0, stream>>>(static_cast<half *>(ring), ring_len,
+                                                          static_cast<const half *>(raw), state_slots, query_start,
+                                                          context_lens);
   return launch_status();
 }
 
@@ -495,7 +552,7 @@ SEVENTY_API int seventy_qsa_index_prep(void *q_out, void *idx_cache, const float
                                        int tokens, int heads, int dim, int half_rot, float eps,
                                        cudaStream_t stream) {
   using namespace seventy;
-  if (q_out == nullptr || idx_cache == nullptr || qk == nullptr || q_norm == nullptr || kv_slots == nullptr ||
+  if (q_out == nullptr || idx_cache == nullptr || qk == nullptr || q_norm == nullptr ||
       tokens < 0 || heads < 1 || dim != kIdx || half_rot < 0 || 2 * half_rot > kIdx || qk_ld < (heads + 1) * kIdx ||
       (half_rot > 0 && (cos == nullptr || sin == nullptr)))
     return SEVENTY_ERR_INVALID_ARGUMENT;
@@ -503,6 +560,19 @@ SEVENTY_API int seventy_qsa_index_prep(void *q_out, void *idx_cache, const float
   qsa_index_prep_kernel<<<dim3(tokens, heads + 1), kIdx, 0, stream>>>(
       static_cast<half *>(q_out), static_cast<half *>(idx_cache), qk, qk_ld, q_norm, kv_slots, cos, sin, heads,
       half_rot, eps);
+  return launch_status();
+}
+
+SEVENTY_API int seventy_qsa_select_scores(int *sel, int width, const float *scores, int ld, const int *query_start,
+                                          const int *context_lens, int num_seqs, int row0, int tokens, int compress,
+                                          int top, cudaStream_t stream) {
+  using namespace seventy;
+  if (sel == nullptr || scores == nullptr || tokens < 0 || width != top * compress + compress - 1 || num_seqs < 1 ||
+      ld < 1)
+    return SEVENTY_ERR_INVALID_ARGUMENT;
+  if (tokens == 0) return SEVENTY_OK;
+  qsa_select_kernel<<<tokens, 1024, 0, stream>>>(sel, width, scores, ld, query_start, context_lens, num_seqs,
+                                                 compress, top, row0);
   return launch_status();
 }
 

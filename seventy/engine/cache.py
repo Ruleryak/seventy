@@ -1,7 +1,9 @@
 """The model's per-sequence memory: a paged KV cache for the attention layers, and a slot of Gated DeltaNet
 convolution and recurrent state per sequence for the linear-attention layers. Qwen4-Exp models also keep, per KV
-cache token, the QSA indexer key of each attention layer and the token's rotary positions, and per slot the
-last tokens and convolution inputs of each PLE layer.
+cache token, the token's rotary positions and per block of indexer_compress tokens the pooled QSA indexer key of
+each attention layer, and per slot the last tokens and convolution inputs of each PLE layer and the last IDX_RING
+raw indexer keys of each attention layer (csrc/qsa.cu, qsa_pool). On the CPU the raw indexer keys stay per token
+(idx_k), for the reference path.
 
 Each kind of memory is one stacked tensor over its layers, so copying a state slot or a KV block (for the prefix
 cache) is one copy for all layers. The per-layer dictionaries are views into the stacks.
@@ -13,6 +15,8 @@ import torch
 
 from ..config import TextConfig
 from ..parallel import SINGLE, Parallel
+
+IDX_RING = 32
 
 
 class ModelCache:
@@ -69,17 +73,24 @@ class ModelCache:
         self.conv = {layer: self.conv_all[i] for i, layer in enumerate(cfg.linear_layers)}
         self.state = {layer: self.state_all[i] for i, layer in enumerate(cfg.linear_layers)}
         self.slot_peers: list = []
-        self.idx_all = self.pooled_all = self.positions = self.ple_tokens = self.ple_conv = None
+        self.idx_all = self.pooled_all = self.positions = self.ple_tokens = self.ple_conv = self.idx_ring_all = None
         self.idx_k: dict[int, torch.Tensor] = {}
+        self.idx_ring: dict[int, torch.Tensor] = {}
         self.pooled: dict[int, torch.Tensor] = {}
         e = cfg.exp
         if e is not None:
             na_model = len(cfg.attention_layers)
-            self.idx_all = torch.zeros(na_model, num_blocks + 1, block_size, e.indexer_head_dim,
-                                       dtype=torch.float16 if device.type == "cuda" else dtype, device=device)
-            self.idx_k = {layer: self.idx_all[i] for i, layer in enumerate(cfg.attention_layers)}
+            kdt = torch.float16 if device.type == "cuda" else dtype
+            if device.type == "cuda":
+                self.idx_ring_all = torch.zeros(na_model, num_slots + 1, IDX_RING, e.indexer_head_dim, dtype=kdt,
+                                                device=device)
+                self.idx_ring = {layer: self.idx_ring_all[i] for i, layer in enumerate(cfg.attention_layers)}
+            else:
+                self.idx_all = torch.zeros(na_model, num_blocks + 1, block_size, e.indexer_head_dim, dtype=kdt,
+                                           device=device)
+                self.idx_k = {layer: self.idx_all[i] for i, layer in enumerate(cfg.attention_layers)}
             self.pooled_all = torch.zeros(na_model, num_blocks + 1, block_size // e.indexer_compress,
-                                          e.indexer_head_dim, dtype=self.idx_all.dtype, device=device)
+                                          e.indexer_head_dim, dtype=kdt, device=device)
             self.pooled = {layer: self.pooled_all[i] for i, layer in enumerate(cfg.attention_layers)}
             self.positions = torch.zeros(num_blocks + 1, block_size, 3, dtype=torch.int32, device=device)
             self.ple_tokens = torch.zeros(num_slots + 1, e.ngram_size - 1, dtype=torch.long, device=device)
@@ -94,6 +105,8 @@ class ModelCache:
         if self.ple_tokens is not None:
             self.ple_tokens[dst].copy_(self.ple_tokens[src])
             self.ple_conv[:, dst].copy_(self.ple_conv[:, src])
+        if self.idx_ring_all is not None:
+            self.idx_ring_all[:, dst].copy_(self.idx_ring_all[:, src])
         for peer in self.slot_peers:
             peer.copy_slot(src, dst)
 
@@ -106,6 +119,7 @@ class ModelCache:
             self.v_scale_all[:, dst].copy_(self.v_scale_all[:, src])
         if self.idx_all is not None:
             self.idx_all[:, dst].copy_(self.idx_all[:, src])
+        if self.pooled_all is not None:
             self.pooled_all[:, dst].copy_(self.pooled_all[:, src])
             self.positions[dst].copy_(self.positions[src])
 
@@ -120,6 +134,6 @@ class ModelCache:
         tensors = [self.k_all, self.v_all, self.conv_all, self.state_all]
         if self.k_scale_all is not None:
             tensors += [self.k_scale_all, self.v_scale_all]
-        tensors += [t for t in (self.idx_all, self.pooled_all, self.positions, self.ple_tokens, self.ple_conv)
-                    if t is not None]
+        tensors += [t for t in (self.idx_all, self.idx_ring_all, self.pooled_all, self.positions, self.ple_tokens,
+                                self.ple_conv) if t is not None]
         return sum(t.numel() * t.element_size() for t in tensors)

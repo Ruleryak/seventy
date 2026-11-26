@@ -24,7 +24,8 @@ split evenly."""
 def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int = 1, extra_layers: int = 0) -> int:
     """Bytes of one KV block on one rank: K and V of the local KV heads of every full-attention layer, and of
     extra_layers more (the MTP drafter's attention layer), as INT8 values plus one FP32 scale per token and head,
-    or FP16. Qwen4-Exp models add the FP16 indexer key of every attention layer and the token's rotary positions."""
+    or FP16. Qwen4-Exp models add the token's rotary positions and the FP16 pooled indexer key of every attention
+    layer per block of indexer_compress tokens."""
     t = cfg.text
     per_vec = t.head_dim + 4 if kv_dtype == "int8" else 2 * t.head_dim
     kv_heads = max_head_split(t.num_heads, t.num_kv_heads, tp)[0]
@@ -32,8 +33,7 @@ def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int
     if t.exp is not None:
         e = t.exp
         per_layer = e.indexer_head_dim * 2
-        kv += block_size * (len(t.attention_layers) * per_layer + 3 * 4) + len(t.attention_layers) * per_layer * (
-            block_size // e.indexer_compress)
+        kv += block_size * 3 * 4 + len(t.attention_layers) * per_layer * (block_size // e.indexer_compress)
     return kv
 
 
@@ -44,14 +44,18 @@ def prefix_entries(max_num_seqs: int, prefix_cache: bool, cache_entries: int = 0
 
 def state_bytes_per_slot(cfg: ModelConfig, tp: int = 1) -> int:
     """Bytes of one Gated DeltaNet state slot on one rank: the FP32 recurrent state and the FP16 convolution
-    state of every linear-attention layer (Qwen4-Exp: also the PLE tokens and convolution inputs) (of the fullest rank when the heads do not split evenly)."""
+    state of every linear-attention layer (Qwen4-Exp: also the PLE tokens and convolution inputs and the ring of raw
+    indexer keys) (of the fullest rank when the heads do not split evenly)."""
     t = cfg.text
     hk, hv = max_head_split(t.gdn_v_heads, t.gdn_k_heads, tp)
     conv = 2 * hk * t.gdn_k_dim + hv * t.gdn_v_dim
     state = len(t.linear_layers) * (hv * t.gdn_k_dim * t.gdn_v_dim * 4 + conv * (t.conv_kernel - 1) * 2)
     if t.exp is not None:
+        from .engine.cache import IDX_RING
+
         e = t.exp
         state += (e.ngram_size - 1) * 8 + len(e.ple_layers) * (e.ple_conv_kernel - 1) * e.ngram_size * e.hc_count * t.hidden_size * 4
+        state += len(t.attention_layers) * IDX_RING * e.indexer_head_dim * 2
     return state
 
 

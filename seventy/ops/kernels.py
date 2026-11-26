@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -1053,34 +1054,64 @@ def hc_inject(h: torch.Tensor, y: torch.Tensor, w: torch.Tensor, hc: int) -> tor
     return h
 
 
-def qsa_pool(pooled: torch.Tensor, idx_keys: torch.Tensor, positions: torch.Tensor, block_tables: torch.Tensor,
-             query_start_t: torch.Tensor, context_lens_t: torch.Tensor, tokens: int, k_norm: torch.Tensor,
-             inv_freq: torch.Tensor, section: tuple[int, int, int], rotary_dim: int, compress: int,
-             eps: float) -> None:
-    """The pooled keys of the blocks that the step's new tokens complete (seventy_qsa_pool)."""
+def qsa_pool(pooled: torch.Tensor, raw: torch.Tensor, ring: torch.Tensor, state_slots_t: torch.Tensor,
+             positions: torch.Tensor, block_tables: torch.Tensor, query_start_t: torch.Tensor,
+             context_lens_t: torch.Tensor, tokens: int, k_norm: torch.Tensor, inv_freq: torch.Tensor,
+             section: tuple[int, int, int], rotary_dim: int, compress: int, block_size: int, eps: float) -> None:
+    """The pooled keys of the blocks that the step's new tokens complete, from the step's raw keys FP16 [tokens,
+    128] and the sequences' rings FP16 [slots, ring_len, 128]; then the rings take the step's raw keys
+    (seventy_qsa_pool)."""
+    _expect(raw, "raw", torch.float16)
     bt = block_tables.contiguous()
+    raw = raw.contiguous()
     check("qsa_pool", lib().seventy_qsa_pool(
-        pooled.data_ptr(), idx_keys.data_ptr(), positions.data_ptr(), bt.data_ptr(), bt.shape[1],
-        query_start_t.data_ptr(), context_lens_t.data_ptr(), context_lens_t.numel(), tokens, k_norm.data_ptr(),
-        inv_freq.data_ptr(), section[1], section[2], rotary_dim, compress, idx_keys.shape[1], eps,
-        _stream(idx_keys)))
+        pooled.data_ptr(), raw.data_ptr(), ring.data_ptr(), ring.shape[1], state_slots_t.data_ptr(),
+        positions.data_ptr(), bt.data_ptr(), bt.shape[1], query_start_t.data_ptr(), context_lens_t.data_ptr(),
+        context_lens_t.numel(), tokens, k_norm.data_ptr(), inv_freq.data_ptr(), section[1], section[2], rotary_dim,
+        compress, block_size, eps, _stream(raw)))
 
 
-def qsa_index_prep(qk: torch.Tensor, q_norm: torch.Tensor, idx_cache: torch.Tensor, kv_slots_t: torch.Tensor,
-                   cos: torch.Tensor, sin: torch.Tensor, heads: int, eps: float) -> torch.Tensor:
-    """Indexer queries FP16 [tokens, heads, 128] (RMS norm times q_norm, rotated with cos/sin [tokens, half]) from
-    the projection qk FP32 [tokens, (heads + 1) * 128]; writes the raw keys (the last 128 values) as FP16 into
-    idx_cache at kv_slots_t (seventy_qsa_index_prep)."""
+def qsa_index_prep(qk: torch.Tensor, q_norm: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, heads: int,
+                   eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """(indexer queries FP16 [tokens, heads, 128] (RMS norm times q_norm, rotated with cos/sin [tokens, half]), raw
+    keys FP16 [tokens, 128] (the last 128 values)) from the projection qk FP32 [tokens, (heads + 1) * 128]
+    (seventy_qsa_index_prep)."""
     _expect(qk, "qk", torch.float32)
     t = qk.shape[0]
-    dim = idx_cache.shape[-1]
+    dim = qk.shape[1] // (heads + 1)
     out = torch.empty(t, heads, dim, dtype=torch.float16, device=qk.device)
+    raw = torch.empty(t, dim, dtype=torch.float16, device=qk.device)
     half = cos.shape[-1]
     cos, sin = cos.float().contiguous(), sin.float().contiguous()
     check("qsa_index_prep", lib().seventy_qsa_index_prep(
-        out.data_ptr(), idx_cache.data_ptr(), qk.data_ptr(), qk.stride(0), q_norm.data_ptr(), kv_slots_t.data_ptr(),
-        cos.data_ptr(), sin.data_ptr(), t, heads, dim, half, eps, _stream(qk)))
-    return out
+        out.data_ptr(), raw.data_ptr(), qk.data_ptr(), qk.stride(0), q_norm.data_ptr(), None, cos.data_ptr(),
+        sin.data_ptr(), t, heads, dim, half, eps, _stream(qk)))
+    return out, raw
+
+
+def qsa_select_prefill(q: torch.Tensor, keys: torch.Tensor, query_start_t: torch.Tensor, context_lens_t: torch.Tensor,
+                       compress: int, top: int, row0: int) -> torch.Tensor:
+    """qsa_select for the rows row0 .. row0 + rows - 1 of one sequence (prefill), with the scores from cuBLAS:
+    keys FP16 [blocks, dim] are the sequence's pooled block keys (all blocks the rows can see), and each block's
+    score is sum over heads of relu(q_h . key) / sqrt(dim) from FP16 tensor-core products with FP32 sums."""
+    _expect(q, "q", torch.float16)
+    rows, heads, dim = q.shape
+    width = top * compress + compress - 1
+    sel = torch.empty(rows, width, dtype=torch.int32, device=q.device)
+    nb = keys.shape[0]
+    if nb > top:
+        scores = torch.zeros(rows, nb, dtype=torch.float32, device=q.device)
+        for h in range(heads):
+            scores.add_(torch.relu(torch.mm(q[:, h], keys.T, out_dtype=torch.float32)))
+        scores.mul_(1.0 / math.sqrt(dim))
+        ld = nb
+    else:
+        scores = torch.zeros(1, dtype=torch.float32, device=q.device)
+        ld = 1
+    check("qsa_select_scores", lib().seventy_qsa_select_scores(
+        sel.data_ptr(), width, scores.data_ptr(), ld, query_start_t.data_ptr(), context_lens_t.data_ptr(),
+        context_lens_t.numel(), row0, rows, compress, top, _stream(q)))
+    return sel
 
 
 def qsa_select(q: torch.Tensor, pooled: torch.Tensor, block_tables: torch.Tensor, query_start_t: torch.Tensor,
