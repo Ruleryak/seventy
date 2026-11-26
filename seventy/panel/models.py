@@ -17,7 +17,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from ..config import UnsupportedModel, has_mtp, kernel_problems, parse_config
+from ..config import UnsupportedModel, has_mtp, is_gguf_folder, kernel_problems, parse_config
 from ..memory import checkpoint_bytes, plan, prefix_entries, split_problems, tied_head_bytes
 
 
@@ -106,7 +106,13 @@ def check(path: str | Path) -> ModelInfo:
         generation = json.loads(gen_file.read_text()) if gen_file.is_file() else None
     except (OSError, ValueError) as e:
         return ModelInfo(str(p), name, "unknown", False, 0, [f"config.json cannot be read: {e}"])
-    return classify(raw, str(p), name, checkpoint_bytes(p), (p / "tokenizer.json").is_file(), has_mtp(p), generation)
+    gguf = is_gguf_folder(p)
+    if gguf:
+        raw = {k: v for k, v in raw.items() if k != "quantization_config"}
+    info = classify(raw, str(p), name, checkpoint_bytes(p), (p / "tokenizer.json").is_file(), has_mtp(p), generation)
+    if gguf and info.details:
+        info.details.update(weights="gguf", vision=False)
+    return info
 
 
 def check_remote(repo: str, revision: str | None = None, endpoint: str | None = None,

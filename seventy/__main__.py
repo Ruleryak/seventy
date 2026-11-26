@@ -52,7 +52,7 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 
 def cmd_check_model(args: argparse.Namespace) -> int:
-    from .config import UnsupportedModel, kernel_problems, load_config
+    from .config import UnsupportedModel, is_gguf_folder, kernel_problems, load_config
 
     try:
         cfg = load_config(args.path)
@@ -65,9 +65,21 @@ def cmd_check_model(args: argparse.Namespace) -> int:
             print(f"  - {reason}")
         return 1
     t = cfg.text
+    weights, vision = cfg.quant.method, "yes" if cfg.vision else "no"
+    if is_gguf_folder(args.path):
+        from collections import Counter
+        from pathlib import Path
+
+        from .gguf import GGUFFile
+
+        kinds = Counter()
+        for f in sorted(Path(args.path).glob("*.gguf")):
+            for tensor in GGUFFile(f).tensors.values():
+                kinds[tensor.type] += tensor.data.nbytes
+        weights = "GGUF (most bytes in " + ", ".join(k for k, _ in kinds.most_common(3)) + ")"
+        vision = "no (GGUF files have no vision tower)"
     print(f"{cfg.architecture}: {t.num_layers} layers ({len(t.linear_layers)} Gated DeltaNet, "
-          f"{len(t.attention_layers)} attention), hidden {t.hidden_size}, weights {cfg.quant.method}, "
-          f"vision {'yes' if cfg.vision else 'no'}")
+          f"{len(t.attention_layers)} attention), hidden {t.hidden_size}, weights {weights}, vision {vision}")
     return 0
 
 

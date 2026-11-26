@@ -233,3 +233,30 @@ def test_checkpoint_reads_a_separate_mtp_file(tmp_path):
     np.testing.assert_array_equal(ckpt.rows("mtp.fc_embedding.weight", 2, 5).numpy(), eh[2:5, :h])
     assert ckpt.experts("mtp.layers.0.mlp.experts")["gate"].type == "Q8_0"
     assert not any(n.startswith("model.") and "lm_head" in n for n in ckpt.names("mtp."))
+
+
+def test_gguf_folder_in_check_model_and_the_panel(tmp_path, capsys):
+    """check-model and the panel's model check name a GGUF folder's weights GGUF (by bytes) and give no vision
+    tower, though the Hugging Face config.json has a vision config and an NVFP4 quantization_config."""
+    import argparse
+    import json
+
+    from test_config import nvfp4_quant, small_config
+
+    from seventy.__main__ import cmd_check_model
+    from seventy.panel import models
+
+    raw = small_config()
+    raw["text_config"].update(head_dim=256, linear_key_head_dim=128, linear_value_head_dim=128)
+    raw["text_config"]["rope_parameters"]["mrope_section"] = [11, 11, 10]
+    raw["quantization_config"] = nvfp4_quant()
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    (tmp_path / "tokenizer.json").write_text("{}")
+    q = random_blocks("Q8_0", 4, 1)
+    write_gguf(tmp_path / "m.gguf", {"general.architecture": "qwen4exp"},
+               [("a.weight", (32, 4), "Q8_0", q.tobytes()), ("b.weight", (4,), "F32", np.zeros(4, np.float32).tobytes())])
+    assert cmd_check_model(argparse.Namespace(path=str(tmp_path))) == 0
+    out = capsys.readouterr().out
+    assert "weights GGUF (most bytes in Q8_0, F32)" in out and "vision no" in out
+    info = models.check(tmp_path)
+    assert info.details["weights"] == "gguf" and info.details["vision"] is False
