@@ -82,13 +82,24 @@ Other Flash-Next checkpoints that were compared:
   1 + w, A_log as -exp(A_log), the Gated DeltaNet value heads in tile-major order, the indexer projection in two
   parts.
 
+  The ISTA files have no MTP layer. llama.cpp keeps the MTP layer of Flash-Next in a separate file (its `nextn`
+  layer), for example `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` from `ggml-org/Qwen3.8-Flash-Next-GGUF` (4.1 GB). Put
+  that file in the same folder, then use `--draft-model mtp`. The loader uses the MTP file's layer only (the
+  drafter uses the main file's embedding and output head):
+
+  ```bash
+  hf download ggml-org/Qwen3.8-Flash-Next-GGUF mtp-Qwen3.8-Flash-Next-Q8_0.gguf --local-dir ./flash-next-gguf
+  seventy engine --model ./flash-next-gguf --draft-model mtp
+  ```
+
 ## Results on 4 x V100-SXM2-32GB (local, 250 W)
 
 The smoke checks: greedy and sampled answers, needles at 8K and 30K or 100K tokens, an image, 8 identical greedy
 requests at the same time, one stream of 512 tokens. All pass, except where noted: the image check is
-case-sensitive, and some runs read the image text correctly in lowercase. The GGUF file has no vision tower and no MTP layer, so its runs skip the image check
-and run without a drafter; it decodes slower than the NVFP4 checkpoint: its dense weights are FP16 (twice the bytes
-of the NVFP4 checkpoint's FP8 weights) and the GGUF expert kernel decodes each weight in FP32.
+case-sensitive, and some runs read the image text correctly in lowercase. The GGUF files have no vision tower, so
+their runs skip the image check. The GGUF checkpoint decodes slower than the NVFP4 checkpoint: its dense weights
+are FP16 (twice the bytes of the NVFP4 checkpoint's FP8 weights) and the GGUF expert kernel decodes each weight in
+FP32.
 
 | Model | GPUs | Settings | KV tokens | One stream | 8 identical requests |
 |---|---:|---|---:|---:|---:|
@@ -105,6 +116,7 @@ of the NVFP4 checkpoint's FP8 weights) and the GGUF expert kernel decodes each w
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | `--draft-model mtp --expert-offload 0.1` | 1,405,536 | 120 tok/s | 391 tok/s |
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | `--draft-model mtp --expert-offload 0.25` | 1,982,448 | 95 tok/s | 298 tok/s |
 | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` IQ3_XXS (GGUF) | 4 | defaults | 2,668,272 | 55 tok/s | 251 tok/s |
+| IQ3_XXS (GGUF) with `ggml-org` MTP Q8_0 | 4 | `--draft-model mtp` | 2,241,120 | 95 tok/s | 292 tok/s |
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | `--gpu-memory-utilization 0.97` | 69,392 | 65 tok/s | 362 tok/s |
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | `--draft-model mtp --expert-offload 0.25` | 371,184 | 87 tok/s | 336 tok/s |
 
@@ -189,6 +201,6 @@ graphs; with a smaller prefill budget, less is enough.
   PCIe.
 - Flash-Next's DFlash2 drafter; context past 524,288 tokens (1,000,000 with `--yarn-factor 4` needs more KV cache
   than 4 GPUs have without offload).
-- GGUF: the routed experts on the CPU for decoding with offload (only the GPU kernels exist), the MTP layer from a
-  separate GGUF file, and native GGUF kernels for the dense weights (dequantized to FP16 now).
+- GGUF: the routed experts on the CPU for decoding with offload (only the GPU kernels exist), and native GGUF
+  kernels for the dense weights (dequantized to FP16 now).
 - The panel's checks for MoE checkpoints (sizes of the expert weights per GPU).

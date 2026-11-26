@@ -191,3 +191,45 @@ def test_checkpoint_undoes_the_converter(tmp_path):
                                hf["linear_attn.in_proj_qkv.weight"][2:5], rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(ckpt.linear_part(p + "linear_attn.out_proj", rows=(0, h), cols=(4, 20)).numpy(),
                                hf["linear_attn.out_proj.weight"][:, 4:20], rtol=1e-6, atol=1e-6)
+
+
+def test_checkpoint_reads_a_separate_mtp_file(tmp_path):
+    """A separate MTP file (llama.cpp's nextn layer as the last block) in the folder gives the mtp.* tensors: eh_proj
+    as fc_embedding and fc_hidden, the first hyper-connection products as their mix and injection rows, the norms
+    without the + 1, the experts as GGUF blocks. has_mtp sees it; the main file is still the model."""
+    from seventy.config import has_mtp
+
+    rng = np.random.default_rng(2)
+    h, rank, hc = 8, 4, 2
+    main = [("blk.0.ssm_norm.weight", (4,), "F32", np.ones(4, np.float32).tobytes())]
+    meta = {"general.architecture": "qwen4exp", "qwen4exp.ssm.group_count": 2, "qwen4exp.ssm.time_step_rank": 2,
+            "qwen4exp.ssm.state_size": 4, "qwen4exp.ssm.inner_size": 8, "qwen4exp.block_count": 1}
+    _write_meta(tmp_path / "m.gguf", meta, main)
+    assert not has_mtp(tmp_path)
+    eh = rng.standard_normal((h, 2 * h)).astype(np.float32)
+    inject = rng.standard_normal((rank + hc, hc * h)).astype(np.float32)
+    enorm = rng.standard_normal(h).astype(np.float32)
+    q = rng.standard_normal((2 * h, h)).astype(np.float32)
+    experts = random_blocks("Q8_0", 3 * h * 32 // 32, 3)
+    raw = {"nextn.eh_proj.weight": (eh, "F32"), "hc_attn_down_inject.weight": (inject, "F32"),
+           "nextn.enorm.weight": (enorm + 1, "F32"), "attn_q.weight": (q, "F32")}
+    tensors = [(f"blk.1.{k}", tuple(reversed(v.shape)), t, v.tobytes()) for k, (v, t) in raw.items()]
+    tensors.append(("blk.1.ffn_gate_exps.weight", (32, h, 3), "Q8_0", experts.tobytes()))
+    tensors.append(("output.weight", (h, 4), "F32", np.zeros((4, h), np.float32).tobytes()))
+    _write_meta(tmp_path / "mtp-m.gguf", {"general.architecture": "qwen4exp", "qwen4exp.block_count": 2,
+                                          "qwen4exp.nextn_predict_layers": 1, "qwen4exp.embedding_length": h,
+                                          "qwen4exp.hyper_connection.low_rank": rank}, tensors)
+    assert has_mtp(tmp_path)
+    ckpt = gguf.GGUFCheckpoint(tmp_path)
+    assert "model.language_model.layers.0.linear_attn.norm.weight" in ckpt.names()
+    got = {n: ckpt.tensor(n).numpy() for n in ckpt.names("mtp.")}
+    np.testing.assert_array_equal(got["mtp.fc_embedding.weight"], eh[:, :h])
+    np.testing.assert_array_equal(got["mtp.fc_hidden.weight"], eh[:, h:])
+    np.testing.assert_array_equal(got["mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight"], inject[:rank])
+    np.testing.assert_array_equal(got["mtp.layers.0.attn_hyper_connection.block_inject_weight.weight"], inject[rank:])
+    np.testing.assert_allclose(got["mtp.pre_fc_norm_embedding.weight"], enorm, rtol=1e-6, atol=1e-6)
+    np.testing.assert_array_equal(got["mtp.layers.0.self_attn.q_proj.weight"], q)
+    assert ckpt.shape("mtp.fc_hidden.weight") == (h, h)
+    np.testing.assert_array_equal(ckpt.rows("mtp.fc_embedding.weight", 2, 5).numpy(), eh[2:5, :h])
+    assert ckpt.experts("mtp.layers.0.mlp.experts")["gate"].type == "Q8_0"
+    assert not any(n.startswith("model.") and "lm_head" in n for n in ckpt.names("mtp."))

@@ -353,9 +353,15 @@ class GGUFCheckpoint:
 
     def __init__(self, path: str | Path, text_prefix: str = "model.language_model."):
         files = sorted(Path(path).glob("*.gguf")) if Path(path).is_dir() else [Path(path)]
-        first = [f for f in files if "-00001-of-" in f.name] or files
-        if not first:
+        if not files:
             raise ValueError(f"no GGUF file in {path}")
+        heads = {f: GGUFFile(f) for f in files}
+        mtp = [f for f, g in heads.items() if int(g.metadata.get("qwen4exp.nextn_predict_layers", 0) or 0) > 0
+               and int(g.metadata.get("split.count", 1)) == 1 and len(g.tensors) < 100]
+        main = [f for f in files if f not in mtp]
+        first = [f for f in main if "-00001-of-" in f.name] or main
+        if not first:
+            raise ValueError(f"no GGUF model file in {path} (only MTP layers)")
         self.metadata, self.raw = open_model(first[0])
         if self.metadata.get("general.architecture") != "qwen4exp":
             raise ValueError(f"{first[0]}: GGUF architecture {self.metadata.get('general.architecture')!r} is not "
@@ -370,7 +376,10 @@ class GGUFCheckpoint:
         self._cache: dict[str, np.ndarray] = {}
         self.names_map: dict[str, tuple] = {}
         self.expert_map: dict[str, dict[str, Tensor]] = {}
+        self.slices: dict[str, tuple[str, int, int, int]] = {}
         p = text_prefix
+        for f in mtp[:1]:
+            self._add_mtp(heads[f])
         self.names_map[f"{p}embed_tokens.weight"] = ("token_embd.weight",)
         self.names_map["lm_head.weight"] = ("output.weight",)
         for k in ("norm", "down", "up"):
@@ -394,17 +403,58 @@ class GGUFCheckpoint:
                               ("ngram_heads_offsets", "head_offsets")):
                 values = m.get(f"qwen4exp.ple.{key}" if key != "multipliers" else "qwen4exp.ple.layer_multipliers")
                 self.meta_tensors[pe + name] = np.asarray(values, dtype=np.int64)
-        known = {r for v in self.names_map.values() for r in v} | {
-            t.name for e in self.expert_map.values() for t in e.values()} | {"per_layer_token_embd.weight"}
-        unknown = sorted(set(self.raw) - known)
+        known = {r for v in self.names_map.values() for r in v} | {r for r, *_ in self.slices.values()} | {
+            "per_layer_token_embd.weight"}
+        experts = {id(t) for e in self.expert_map.values() for t in e.values()}
+        unknown = sorted(r for r, t in self.raw.items() if r not in known and id(t) not in experts)
         if unknown:
             raise ValueError(f"GGUF tensors that seventy does not map: {unknown[:8]}")
 
+    def _add_mtp(self, f: GGUFFile) -> None:
+        """The MTP layer of a separate GGUF file (llama.cpp's nextn layer, block num_layers) under the checkpoint's
+        mtp.* names. Its own embedding and output head are not used (the drafter uses the model's). eh_proj is
+        fc_embedding and fc_hidden side by side (input columns [embedding | hidden]), hc_*_down_inject the mix rows
+        and the injection rows of a hyper-connection's first product."""
+        block = int(f.metadata["qwen4exp.block_count"]) - 1
+        b = f"blk.{block}."
+        hidden = int(f.metadata["qwen4exp.embedding_length"])
+        rank = int(f.metadata.get("qwen4exp.hyper_connection.low_rank", 0))
+        for name, t in f.tensors.items():
+            if not name.startswith(b):
+                continue
+            raw = "mtp:" + name
+            self.raw[raw] = t
+            suffix = name[len(b):]
+            if suffix == "nextn.eh_proj.weight":
+                self.slices["mtp.fc_embedding.weight"] = (raw, 1, 0, hidden)
+                self.slices["mtp.fc_hidden.weight"] = (raw, 1, hidden, 2 * hidden)
+            elif suffix == "nextn.enorm.weight":
+                self.names_map["mtp.pre_fc_norm_embedding.weight"] = (raw,)
+            elif suffix == "nextn.hnorm.weight":
+                self.names_map["mtp.pre_fc_norm_hidden.weight"] = (raw,)
+            elif suffix.startswith("nextn.hc_head_"):
+                part = suffix[len("nextn.hc_head_") : -len(".weight")]
+                self.names_map[f"mtp.hyper_connection_mixer.{_HC[part]}.weight"] = (raw,)
+            elif suffix.endswith("_down_inject.weight"):
+                branch = "attn_hyper_connection" if suffix.startswith("hc_attn") else "mlp_hyper_connection"
+                rows = t.dims[1]
+                self.slices[f"mtp.layers.0.{branch}.input_mix_weight_down.weight"] = (raw, 0, 0, rank)
+                self.slices[f"mtp.layers.0.{branch}.block_inject_weight.weight"] = (raw, 0, rank, rows)
+            elif suffix in _LAYER:
+                self.names_map["mtp.layers.0." + _LAYER[suffix]] = (raw,)
+            elif suffix in _EXPERTS:
+                self.expert_map.setdefault("mtp.layers.0.mlp.experts", {})[_EXPERTS[suffix]] = t
+            elif suffix in ("indexer.q_proj.weight", "indexer.k_proj.weight"):
+                self.names_map["mtp.layers.0.self_attn.indexer.index_qk_proj.weight"] = (
+                    "mtp:" + b + "indexer.q_proj.weight", "mtp:" + b + "indexer.k_proj.weight")
+            else:
+                raise ValueError(f"GGUF MTP tensor that seventy does not map: {name}")
+
     def __contains__(self, name: str) -> bool:
-        return name in self.names_map or name in self.meta_tensors
+        return name in self.names_map or name in self.meta_tensors or name in self.slices
 
     def names(self, prefix: str = "") -> list[str]:
-        return sorted(n for n in (*self.names_map, *self.meta_tensors) if n.startswith(prefix))
+        return sorted(n for n in (*self.names_map, *self.meta_tensors, *self.slices) if n.startswith(prefix))
 
     @property
     def text_prefix(self) -> str:
@@ -444,6 +494,10 @@ class GGUFCheckpoint:
         return t.dequantize()
 
     def _restore(self, name: str) -> np.ndarray:
+        if name in self.slices:
+            raw, axis, a, b = self.slices[name]
+            x = self._dequantize(self.raw[raw])
+            return np.ascontiguousarray(x[:, a:b] if axis == 1 else x[a:b])
         raws = self.names_map[name]
         x = np.concatenate([self._dequantize(self.raw[r]) for r in raws], axis=0)
         if name.endswith("A_log"):
@@ -457,7 +511,8 @@ class GGUFCheckpoint:
             x = np.concatenate((x[:qk], self._untile(x[qk:], 0, self.value_dim)))
         elif name.endswith("out_proj.weight") and ".linear_attn." in name:
             x = self._untile(x, 1, self.value_dim)
-        if (name.endswith(("norm.weight", "ple.norm_key.weight", "ple.norm_query.weight", "ple.norm_conv.weight"))
+        if (name.endswith(("norm.weight", "ple.norm_key.weight", "ple.norm_query.weight", "ple.norm_conv.weight",
+                           "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight"))
                 and not name.endswith("linear_attn.norm.weight")):
             x = x - 1.0
         if name.endswith("shared_expert_gate.weight") and x.ndim == 1:
@@ -474,6 +529,11 @@ class GGUFCheckpoint:
         return torch.from_numpy(np.array(self._value(name)))
 
     def shape(self, name: str) -> tuple[int, ...]:
+        if name in self.slices:
+            raw, axis, a, b = self.slices[name]
+            full = list(self.raw[raw].shape)
+            full[axis] = b - a
+            return tuple(full)
         raws = self.names_map[name]
         shapes = [self.raw[r].shape for r in raws]
         return (sum(s[0] for s in shapes), *shapes[0][1:])
@@ -483,8 +543,8 @@ class GGUFCheckpoint:
         the current GPU when the kernel library is there (FP16), else on the CPU."""
         import torch
 
-        raws = self.names_map[name]
-        if name.endswith(("embed_tokens.weight", "lm_head.weight")):
+        if name.endswith(("embed_tokens.weight", "lm_head.weight")) and name in self.names_map:
+            raws = self.names_map[name]
             t = self.raw[raws[0]]
             if t.type not in ("F32", "F16", "BF16") and torch.cuda.is_available():
                 from .ops import kernels, kernels_available

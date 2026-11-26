@@ -621,11 +621,18 @@ class DenseWeight:
 _LANES = [8 * ((l >> 2) & 3) + (l & 3) + 4 * (l >= 16) for l in range(32)]
 
 
+_UNPACK_INDEX: dict = {}
+
+
 def dense_unpack(w: DenseWeight) -> torch.Tensor:
-    """The FP16 weight [n, k] of a packed DenseWeight."""
-    inv = torch.empty(32, dtype=torch.long)
-    inv[torch.tensor(_LANES)] = torch.arange(32)
-    rows = w.wpk.permute(0, 2, 1, 3)[:, inv.to(w.wpk.device)].reshape(w.n_padded, w.k)
+    """The FP16 weight [n, k] of a packed DenseWeight. The lane index stays on the device (safe in graph capture
+    once made)."""
+    inv = _UNPACK_INDEX.get(w.wpk.device)
+    if inv is None:
+        cpu = torch.empty(32, dtype=torch.long)
+        cpu[torch.tensor(_LANES)] = torch.arange(32)
+        inv = _UNPACK_INDEX[w.wpk.device] = cpu.to(w.wpk.device)
+    rows = w.wpk.permute(0, 2, 1, 3)[:, inv].reshape(w.n_padded, w.k)
     return rows[: w.n]
 
 

@@ -503,8 +503,19 @@ def kernel_problems(cfg: ModelConfig) -> list[str]:
 
 def has_mtp(path: str | Path) -> bool:
     """Whether a checkpoint folder holds an MTP layer (mtp.fc, or for Qwen4-Exp mtp.fc_hidden, and mtp.layers.0),
-    from the tensor names of its index file, else of the header of its model.safetensors."""
+    from the tensor names of its index file, else of the header of its model.safetensors. A GGUF folder: whether a
+    GGUF file in it holds llama.cpp's nextn layer (qwen4exp.nextn_predict_layers)."""
     p = Path(path)
+    if p.is_dir() and any(p.glob("*.gguf")) and not any(p.glob("*.safetensors")):
+        from .gguf import GGUFFile
+
+        for f in p.glob("*.gguf"):
+            try:
+                if int(GGUFFile(f).metadata.get("qwen4exp.nextn_predict_layers", 0) or 0) > 0:
+                    return True
+            except (OSError, ValueError):
+                continue
+        return False
     try:
         if (p / "model.safetensors.index.json").is_file():
             names = json.loads((p / "model.safetensors.index.json").read_text())["weight_map"]

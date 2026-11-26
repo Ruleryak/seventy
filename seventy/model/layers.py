@@ -36,7 +36,8 @@ class Linear:
     dequantize the weight to FP16 and use cuBLAS. On the CPU (reference runs) the weight is dequantized at each call.
     quantize rounds dense modules to NVFP4 on the GPU (lossy: for drafters), one global scale per source row range.
     Dense FP16 modules of checkpoints that ask for it (pack_dense: GGUF, whose dense tensors arrive dequantized) are
-    kept packed for the dense GEMM kernel, which small batches use instead of cuBLAS; prefill unpacks them.
+    kept packed for the dense GEMM kernel, which batches of up to 4 x SMALL_BATCH rows use (in parts of SMALL_BATCH)
+    instead of cuBLAS; prefill unpacks them.
     """
 
     def __init__(
@@ -143,8 +144,11 @@ class Linear:
         """x W^T, written to out when given (a contiguous [rows, out_features] tensor)."""
         if self.gemm is not None and 0 < x.shape[0] <= SMALL_BATCH and x.is_contiguous():
             return kernels.nvfp4_gemm(x, self.gemm, out=out)
-        if self.packed is not None and 0 < x.shape[0] <= SMALL_BATCH:
-            y = kernels.dense_gemm(x.contiguous(), self.packed, out_fp32=False)
+        if self.packed is not None and 0 < x.shape[0] <= 4 * SMALL_BATCH:
+            x = x.contiguous()
+            parts = [kernels.dense_gemm(x[r : r + SMALL_BATCH], self.packed, out_fp32=False)
+                     for r in range(0, x.shape[0], SMALL_BATCH)]
+            y = parts[0] if len(parts) == 1 else torch.cat(parts)
             return y if out is None else out.copy_(y)
         if self.fp8 is not None and 0 < x.shape[0] <= SMALL_BATCH:
             x = x.contiguous()
