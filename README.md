@@ -218,6 +218,7 @@ seventy uses methods from these projects. Each source file that holds such a met
 |---|---|---|
 | [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), a fork of [vLLM](https://github.com/vllm-project/vllm) | The push protocol of its tensor-parallel all-reduce for sm70: the data in a slot is also its ready flag (`csrc/allreduce.cu`); the split-D structure of its sm70 D256 prefill attention (`flash_attention_splitd` in `csrc/flash_attention.cu`) | Apache-2.0 |
 | [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) | The split of the chunked gated delta rule into a sequential state recurrence and parallel chunk outputs (`csrc/gdn_chunk.cu`) | MIT |
+| [ggml](https://github.com/ggml-org/llama.cpp) (llama.cpp) | The GGUF file format, its block formats, their dequantization and the i-quant lookup tables (`seventy/gguf.py`, `seventy/gguf_tables.py`, `csrc/gguf.cu`, `csrc/gguf_tables.cuh`) | MIT |
 
 ## License
 

@@ -1024,6 +1024,45 @@ def moe_mma(x: torch.Tensor, row_div: int, stack, plan: tuple, out: torch.Tensor
     return out
 
 
+GGUF_TYPE_IDS = {"Q4_0": 2, "Q8_0": 8, "Q4_K": 12, "Q5_K": 13, "Q6_K": 14, "IQ2_XXS": 16, "IQ2_XS": 17,
+                 "IQ3_XXS": 18, "IQ4_NL": 20, "IQ3_S": 21, "IQ2_S": 22, "IQ4_XS": 23, "Q2_0": 42}
+
+
+def gguf_dequant(rows: torch.Tensor, kind: str, k: int) -> torch.Tensor:
+    """FP16 [rows, k] of GGUF blocks rows (uint8 [rows, bytes per row] on the GPU, type kind) (seventy_gguf_dequant)."""
+    out = torch.empty(rows.shape[0], k, dtype=torch.float16, device=rows.device)
+    check("gguf_dequant", lib().seventy_gguf_dequant(out.data_ptr(), rows.data_ptr(), rows.shape[0], k,
+                                                     GGUF_TYPE_IDS[kind], _stream(rows)))
+    return out
+
+
+def gguf_gather(ids: torch.Tensor, h0: int, h1: int, rows: torch.Tensor, row_base: int, dim: int,
+                kind: str) -> torch.Tensor:
+    """FP16 [tokens, (h1 - h0) * dim] rows ids[:, h0:h1] - row_base of a GGUF table rows (uint8 [rows, bytes], for
+    example in pinned host memory) (seventy_gguf_gather)."""
+    t = ids.shape[0]
+    out = torch.empty(t, (h1 - h0) * dim, dtype=torch.float16, device=ids.device)
+    check("gguf_gather", lib().seventy_gguf_gather(out.data_ptr(), ids.data_ptr(), ids.shape[1], h0, h1, t,
+                                                   rows.data_ptr(), row_base, dim, GGUF_TYPE_IDS[kind], _stream(ids)))
+    return out
+
+
+def gguf_moe(x: torch.Tensor, row_div: int, weight: torch.Tensor, kind: str, k: int, plan: tuple, out: torch.Tensor,
+             pair_weight: torch.Tensor | None = None, compact: int = 0, ptrs: torch.Tensor | None = None) -> torch.Tensor:
+    """moe_gemm for experts in a GGUF format (seventy_gguf_moe): weight uint8 [experts, n, bytes per row] (or the
+    pointer table ptrs of each expert's rows), the plan of moe_plan with slots of up to 8 pairs; out FP16 [rows, >= n]
+    (its row stride is kept), or FP32 [pairs, n] times pair_weight."""
+    _expect(x, "x", torch.float16)
+    order, slot_expert, slot_start, slot_count, num, max_slots = plan
+    n = weight.shape[1]
+    check("gguf_moe", lib().seventy_gguf_moe(
+        out.data_ptr(), out.stride(0), x.contiguous().data_ptr(), row_div, k, n, GGUF_TYPE_IDS[kind],
+        ptrs.data_ptr() if ptrs is not None else None, weight.data_ptr(), weight.stride(0), order.data_ptr(),
+        slot_expert.data_ptr(), slot_start.data_ptr(), slot_count.data_ptr(), num.data_ptr(), max_slots,
+        pair_weight.data_ptr() if pair_weight is not None else None, compact, _stream(x)))
+    return out
+
+
 def moe_plan_large(ids: torch.Tensor, e0: int, e1: int, per: int) -> tuple:
     """moe_plan for any number of pairs, with PyTorch on the GPU (no host synchronization): the local pairs in
     order of (local expert, pair), slots of at most per pairs, and rows int32 [pairs] (each local pair's position in

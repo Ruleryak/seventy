@@ -349,6 +349,7 @@ class MoE:
     stage = None
     stage_index = -1
     stage_ptrs = None
+    gguf = None
 
     def __init__(self, cfg: TextConfig, ckpt: Checkpoint, p: str, par: Parallel, dtype, device, keep_dense):
         self.cfg, self.par, self.dtype, self.device = cfg, par, dtype, torch.device(device)
@@ -365,7 +366,10 @@ class MoE:
                                   keep_dense=keep_dense)
         local = range(self.e0, self.e1)
         ep = f"{p}.experts"
-        if f"{ep}.gate_up_proj" in ckpt:
+        self.gguf = None
+        if hasattr(ckpt, "experts"):
+            self._load_gguf(ckpt.experts(ep), device)
+        elif f"{ep}.gate_up_proj" in ckpt:
             gate_up = _to_dtype(ckpt._slice(f"{ep}.gate_up_proj")[self.e0 : self.e1], dtype)
             down = _to_dtype(ckpt._slice(f"{ep}.down_proj")[self.e0 : self.e1], dtype)
             self.gate_up, self.down = ExpertStack(weight=to_device(gate_up, device)), ExpertStack(weight=to_device(down, device))
@@ -381,7 +385,9 @@ class MoE:
             down = torch.stack([_to_dtype(ckpt.linear_part(f"{ep}.{e}.down_proj"), dtype) for e in local])
             self.gate_up, self.down = ExpertStack(weight=to_device(gate_up, device)), ExpertStack(weight=to_device(down, device))
         self.cache = None
-        if keep_dense and self.gate_up.nvfp4:
+        if self.gguf is not None:
+            pass
+        elif keep_dense and self.gate_up.nvfp4:
             n = self.e1 - self.e0
             self.gate_up = ExpertStack(weight=torch.stack([self.gate_up.dense(e, dtype) for e in range(n)]))
             self.down = ExpertStack(weight=torch.stack([self.down.dense(e, dtype) for e in range(n)]))
@@ -409,6 +415,62 @@ class MoE:
         self.gate_scale = 1.0
         if self.device.type == "cuda" and dtype == torch.float16:
             self.use_fp16_gates()
+
+    def _load_gguf(self, experts: dict, device) -> None:
+        """Routed experts in GGUF blocks (gguf.GGUFCheckpoint.experts): this rank's experts e0 .. e1 - 1 of each of
+        gate, up and down as uint8 [experts, rows, bytes per row] on the device, with their GGUF type and k."""
+        import numpy as np
+
+        self.gguf = {}
+        for name, t in experts.items():
+            k, n, total = t.dims
+            rows = t.data.reshape(total, n, -1)[self.e0 : self.e1]
+            self.gguf[name] = (to_device(torch.from_numpy(np.ascontiguousarray(rows)), device), t.type, k)
+        self.gate_up = self.down = ExpertStack()
+
+    def _gguf_call(self, x: torch.Tensor) -> torch.Tensor:
+        """The MoE output with GGUF experts: up to SMALL_TOKENS tokens on the grouped GGUF kernel (csrc/gguf.cu: gate
+        and up into the two halves of one row, SwiGLU, down with the pair weights, moe_finish); prefill one expert
+        at a time, dequantized to FP16, on cuBLAS."""
+        from ..ops import kernels
+
+        t, k, n = x.shape[0], self.top_k, self.cfg.num_experts
+        (gw, gkind, hidden), (uw, ukind, _), (dw, dkind, width) = (self.gguf[m] for m in ("gate", "up", "down"))
+        if t <= SMALL_TOKENS:
+            logits, gate = self._logits(x)
+            ids, weights = kernels.moe_route(logits, k, self.cfg.norm_topk_prob, experts=n)
+            shared = self.shared_down(ops.silu_mul(self.shared_gate_up(x)))
+            ids = ids.reshape(-1)
+            plan = kernels.moe_plan(ids, self.e0, self.e1, 8, cache=self.cache)
+            h = torch.empty(t * k, 2 * gw.shape[1], dtype=torch.float16, device=x.device)
+            kernels.gguf_moe(x, k, gw, gkind, hidden, plan, h[:, : gw.shape[1]])
+            kernels.gguf_moe(x, k, uw, ukind, hidden, plan, h[:, gw.shape[1] :])
+            a = ops.silu_mul(h)
+            y = torch.empty(t * k, dw.shape[1], dtype=torch.float32, device=x.device)
+            kernels.gguf_moe(a, 1, dw, dkind, width, plan, y, pair_weight=weights.reshape(-1))
+            return kernels.moe_finish(y, ids, k, self.e0, self.e1, shared, gate)
+        out = self._shared(x)
+        ids, weights = self.route(x)
+        ids, weights = ids.reshape(-1).long(), weights.reshape(-1)
+        if self.cache is not None:
+            self.cache.count_prefill(ids, self.e0)
+        local = ids - self.e0
+        mine = torch.nonzero((local >= 0) & (local < gw.shape[0])).reshape(-1)
+        order = mine[torch.argsort(local[mine], stable=True)]
+        counts = torch.bincount(local[order], minlength=gw.shape[0]).tolist()
+        start = 0
+        for e, c in enumerate(counts):
+            if not c:
+                continue
+            pairs = order[start : start + c]
+            start += c
+            rows = pairs // k
+            xe = x[rows]
+            g = xe @ kernels.gguf_dequant(gw[e], gkind, hidden).T
+            u = xe @ kernels.gguf_dequant(uw[e], ukind, hidden).T
+            ye = ops.silu_mul(torch.cat((g, u), dim=1)) @ kernels.gguf_dequant(dw[e], dkind, width).T
+            out.index_add_(0, rows, ye.float() * weights[pairs, None])
+        return out.to(x.dtype)
 
     def _preference(self, p: str) -> list[int]:
         """This rank's local experts, the ones to keep in GPU memory first: by EXPERT_PROFILE for layer p (most used
@@ -470,6 +532,8 @@ class MoE:
         t = x.shape[0]
         if not t:
             return x.new_zeros(0, x.shape[1])
+        if self.gguf is not None and x.is_cuda:
+            return self._gguf_call(x)
         if x.is_cuda and x.dtype == torch.float16 and (t <= SMALL_TOKENS or self.gate_up.gemm is not None):
             return self._small(x) if t <= SMALL_TOKENS else self._large(x)
         out = self._shared(x)

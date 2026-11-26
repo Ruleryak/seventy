@@ -162,10 +162,30 @@ def _shard_files(path: Path) -> list[Path]:
     return sorted(path.glob("*.safetensors"))
 
 
+def _gguf_tensors(path: Path) -> list[tuple[str, int, int]]:
+    """(checkpoint-like name, values, bytes) of the tensors of a folder's GGUF files: routed experts as
+    *.mlp.experts.*, the PLE table as *.ngram_embedding.shard_0."""
+    from .gguf import GGUFFile
+
+    out = []
+    for f in sorted(path.glob("*.gguf")):
+        for name, t in GGUFFile(f).tensors.items():
+            like = (f"{name}.mlp.experts." if "_exps" in name
+                    else "per_layer.ngram_embedding.shard_0" if name.startswith("per_layer_token_embd") else name)
+            values = 1
+            for d in t.dims:
+                values *= d
+            out.append((like, values, t.data.size))
+    return out
+
+
 def _tensor_bytes(path: str | Path, keep) -> int:
-    """Bytes of the tensors whose names keep(name) accepts, from the headers of the checkpoint's files."""
+    """Bytes of the tensors whose names keep(name) accepts, from the headers of the checkpoint's files (GGUF files:
+    _gguf_tensors)."""
     import struct
 
+    if any(Path(path).glob("*.gguf")) and not _shard_files(Path(path)):
+        return sum(size for name, _, size in _gguf_tensors(Path(path)) if keep(name))
     total = 0
     for f in _shard_files(Path(path)):
         try:
@@ -211,8 +231,12 @@ def routed_expert_bytes(path: str | Path) -> int:
 
 def checkpoint_bytes(path: str | Path) -> int:
     """Total size of a checkpoint's safetensors files (the files of its index, which may be in a subfolder), less
-    the tensors that stay in host memory (host_table_bytes)."""
+    the tensors that stay in host memory (host_table_bytes). A GGUF folder: its routed experts as stored, every
+    other tensor but the PLE table at FP16 (the engine dequantizes them)."""
     files = _shard_files(Path(path))
+    if not files and any(Path(path).glob("*.gguf")):
+        return sum(size if ".mlp.experts." in name else 0 if ".ngram_embedding." in name else 2 * values
+                   for name, values, size in _gguf_tensors(Path(path)))
     total = sum(f.stat().st_size for f in files if f.is_file())
     return total - host_table_bytes(path) if total else total
 

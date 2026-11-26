@@ -414,3 +414,31 @@ SEVENTY_API int seventy_silu_mul_scale(void *out, float *scale, const float *gat
 
 /* silu(gate) * up for FP16 gate_up [rows, 2 * inter] (csrc/activation.cu). */
 SEVENTY_API int seventy_silu_mul(void *out, const void *gate_up, int64_t rows, int inter, cudaStream_t stream);
+
+/*
+ * Routed experts in GGUF block formats (csrc/gguf.cu; type: the GGML type id: Q4_0 2, Q8_0 8, Q4_K 12, Q5_K 13,
+ * Q6_K 14, IQ2_XXS 16, IQ2_XS 17, IQ3_XXS 18, IQ4_NL 20, IQ3_S 21, IQ2_S 22, IQ4_XS 23, Q2_0 42).
+ * seventy_gguf_row_bytes: bytes of a row of k values (-1: not whole blocks or an unknown type).
+ * seventy_gguf_moe: for every pair of the plan (seventy_moe_plan, slots of up to 8 pairs): x[pair / row_div] (FP16
+ * [*, k]) times its expert's weight rows (n rows of k values; expert e at wptrs[e], else wbase + e * w_stride):
+ * FP16 out (row stride out_ld) or, with pair_weight, FP32 [pairs, n] times pair_weight[pair]; compact as in
+ * seventy_moe_mma.
+ * seventy_gguf_dequant: nrows rows of k values to FP16 [nrows, k].
+ */
+SEVENTY_API int64_t seventy_gguf_row_bytes(int type, int k);
+SEVENTY_API int seventy_gguf_moe(void *out, int out_ld, const void *x, int row_div, int k, int n, int type,
+                                 const void *wptrs, const void *wbase, int64_t w_stride, const int32_t *order,
+                                 const int32_t *slot_expert, const int32_t *slot_start, const int32_t *slot_count,
+                                 const int32_t *num_slots, int max_slots, const float *pair_weight, int compact,
+                                 cudaStream_t stream);
+SEVENTY_API int seventy_gguf_dequant(void *out, const void *rows, int64_t nrows, int k, int type,
+                                     cudaStream_t stream);
+
+/*
+ * seventy_gguf_gather: rows of a GGUF table (the PLE n-gram table): out FP16 [tokens, (h1 - h0) * dim] = the rows
+ * ids[t][h] - row_base (ids int64 [tokens, ids_ld]) for heads h0 .. h1 - 1 of rows (dim values each, type), which
+ * may be in mapped host memory.
+ */
+SEVENTY_API int seventy_gguf_gather(void *out, const int64_t *ids, int ids_ld, int h0, int h1, int tokens,
+                                    const void *rows, int64_t row_base, int dim, int type, cudaStream_t stream);
+

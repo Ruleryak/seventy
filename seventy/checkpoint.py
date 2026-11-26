@@ -33,7 +33,16 @@ def csf_decode(fixed: torch.Tensor, exceptions: torch.Tensor, rows: int, cols: i
 
 
 class Checkpoint:
-    """Lazy access to the tensors of a checkpoint folder. Only the requested tensors or slices are read."""
+    """Lazy access to the tensors of a checkpoint folder. Only the requested tensors or slices are read. A folder
+    with GGUF files (and no safetensors) opens as a gguf.GGUFCheckpoint, which has the same reading methods."""
+
+    def __new__(cls, path: str | Path):
+        p = Path(path)
+        if p.is_dir() and any(p.glob("*.gguf")) and not any(p.glob("*.safetensors")):
+            from .gguf import GGUFCheckpoint
+
+            return GGUFCheckpoint(p)
+        return super().__new__(cls)
 
     def __init__(self, path: str | Path):
         self.path = Path(path)

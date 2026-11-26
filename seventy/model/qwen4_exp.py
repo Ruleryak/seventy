@@ -115,6 +115,10 @@ class NGramTable:
     with one scale). rows(ids) dequantizes the rows of ids [n] to FP32 [n, dim]."""
 
     def __init__(self, ckpt: Checkpoint, p: str):
+        self.gguf = ckpt.ple_table() if hasattr(ckpt, "ple_table") else None
+        if self.gguf is not None:
+            self.nvfp4, self.dim, self.shards, self.starts = False, self.gguf.dims[0], [], [0, self.gguf.data.shape[0]]
+            return
         names = [n for n in ckpt.names(f"{p}.shard_") if n.endswith(".weight")]
         names.sort(key=lambda n: int(n[len(f"{p}.shard_") :].split(".")[0]))
         self.shards, self.starts = [], [0]
@@ -139,6 +143,10 @@ class NGramTable:
 
     def rows(self, ids: torch.Tensor) -> torch.Tensor:
         flat = ids.reshape(-1).cpu().numpy().astype(np.int64)
+        if self.gguf is not None:
+            from .. import gguf
+
+            return torch.from_numpy(gguf.dequantize(self.gguf.data[flat], self.gguf.type)).to(ids.device)
         shard = np.searchsorted(self.starts_np, flat, side="right") - 1
         out = np.empty((flat.size, self.shards[0][0].shape[1]), dtype=self.shards[0][0].dtype)
         sc = np.empty((flat.size, self.shards[0][1].shape[1]), dtype=np.uint8) if self.nvfp4 else None
@@ -211,7 +219,7 @@ class PLE:
         self.history = (self.taps - 1) * self.dilation
         self.par, self.last = par, last
         self.gpu = None
-        if torch.device(device).type == "cuda" and self.table.nvfp4:
+        if torch.device(device).type == "cuda" and (self.table.nvfp4 or self.table.gguf is not None):
             self._to_gpu(ckpt, p, device, dtype)
 
     def _to_gpu(self, ckpt: Checkpoint, p: str, device, dtype) -> None:
@@ -224,6 +232,21 @@ class PLE:
         head_dim = self.key_proj.dense.shape[1] // heads
         r0 = int(self.offsets[h0])
         r1 = int(self.offsets[h1 - 1] + self.vocab_sizes[h1 - 1])
+        key = Linear(ckpt, [Source(f"{p}.key_proj")], torch.float16, device)
+        value = Linear(ckpt, [Source(f"{p}.value_proj")], torch.float16, device)
+        common = dict(h0=h0, h1=h1, row_base=r0, key=key, value=value, mult=self.multipliers.to(device),
+                      sizes=self.vocab_sizes.to(device), offsets=self.offsets.to(device), head_dim=head_dim)
+        if self.table.gguf is not None:
+            src = self.table.gguf
+            rows = torch.empty(r1 - r0, src.data.shape[1], dtype=torch.uint8, pin_memory=True)
+            for a in range(r0, r1, 1 << 22):
+                b = min(r1, a + (1 << 22))
+                rows[a - r0 : b - r0] = torch.from_numpy(np.ascontiguousarray(src.data[a:b]))
+            self.gpu = dict(common, rows=rows, kind=src.type)
+            self.key_proj = self.value_proj = None
+            self.table = None
+            torch.cuda.empty_cache()
+            return
         packed = torch.empty(r1 - r0, dim // 2, dtype=torch.uint8, pin_memory=True)
         scales = torch.empty(r1 - r0, dim // 16, dtype=torch.uint8, pin_memory=True)
         t = self.table
@@ -233,11 +256,7 @@ class PLE:
                 continue
             packed[a - r0 : b - r0] = torch.from_numpy(np.ascontiguousarray(values[a - t.starts[s] : b - t.starts[s]]))
             scales[a - r0 : b - r0] = torch.from_numpy(np.ascontiguousarray(sc[a - t.starts[s] : b - t.starts[s]]))
-        key = Linear(ckpt, [Source(f"{p}.key_proj")], torch.float16, device)
-        value = Linear(ckpt, [Source(f"{p}.value_proj")], torch.float16, device)
-        self.gpu = dict(h0=h0, h1=h1, row_base=r0, packed=packed, scales=scales, key=key, value=value,
-                        mult=self.multipliers.to(device), sizes=self.vocab_sizes.to(device),
-                        offsets=self.offsets.to(device), head_dim=head_dim)
+        self.gpu = dict(common, packed=packed, scales=scales)
         self.key_proj = self.value_proj = None
         self.table = None
         torch.cuda.empty_cache()
@@ -254,8 +273,11 @@ class PLE:
         ids = kernels.ple_ids(step.token_ids, cache.ple_tokens, step.state_slots_t, step.query_start_t,
                               step.context_lens_t, self.n, self.heads_per_ngram, g["mult"], g["sizes"], g["offsets"],
                               self.eos)
-        part = kernels.ple_gather(ids, g["h0"], g["h1"], g["packed"], g["scales"], g["row_base"], g["head_dim"],
-                                  self._global_scale)
+        if "kind" in g:
+            part = kernels.gguf_gather(ids, g["h0"], g["h1"], g["rows"], g["row_base"], g["head_dim"], g["kind"])
+        else:
+            part = kernels.ple_gather(ids, g["h0"], g["h1"], g["packed"], g["scales"], g["row_base"], g["head_dim"],
+                                      self._global_scale)
         if par.size > 1:
             emb = torch.zeros(part.shape[0], ids.shape[1] * g["head_dim"], dtype=part.dtype, device=part.device)
             emb[:, g["h0"] * g["head_dim"] : g["h1"] * g["head_dim"]] = part
