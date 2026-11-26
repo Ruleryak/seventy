@@ -27,38 +27,82 @@ Other Flash-Next checkpoints that were compared:
 - The MoE MLP (`seventy/model/moe.py`): the router (softmax over all experts, top k, the k weights renormalized),
   the routed experts split over the GPUs (expert parallel: each GPU keeps a part of the experts) and the shared
   expert split like a dense MLP. The partial sums meet in the all-reduce after the MLP.
-- Kernels (`csrc/moe.cu`): the router's top k, a plan that sorts the (token, expert) pairs of each GPU's experts on
-  the GPU, and a grouped NVFP4 or FP16 GEMM over the plan. Decode and speculative steps (up to 64 tokens) have no
-  host synchronization and run in CUDA graphs. Prefill runs one product per picked expert.
+- MoE kernels. Up to 64 tokens (decode and speculative verify, in CUDA graphs, no host synchronization): one FP16
+  product gives the router logits and the shared expert's gate logit (BF16 weights times a power of two are exact
+  in FP16), the top k (`csrc/moe.cu`, one warp per token), a plan that sorts each GPU's (token, expert) pairs on the
+  GPU, the grouped expert products, and `moe_finish` (the gated shared expert plus the token's picks). Prefill: the
+  same products over a plan built with PyTorch, on rows for this GPU's pairs only. NVFP4 experts are repacked at
+  load for the tensor cores (`seventy_moe_mma` in `csrc/nvfp4_gemm.cu`: 64-row slots for prefill, warps splitting
+  k for small slots); FP16 experts (BF16 checkpoints) use `seventy_moe_gemm` and, in prefill, cuBLAS per expert.
 - Checkpoint formats (`seventy/checkpoint.py`): ModelOpt NVFP4 (with CSF-coded block scales), FP8 with one scale per
-  tensor or row (kept as FP8 for the FP8 GEMM), MXFP8 (loaded as FP16), and the fused experts of BF16 checkpoints.
+  tensor or row (kept as FP8 for the FP8 GEMM), MXFP8 (kept as FP8 with one scale per row, see below), and the
+  fused experts of BF16 checkpoints.
 - 1, 2, 3 and 4 GPUs. With 2 KV heads and 3 or 4 GPUs, the GPUs share each KV head (`seventy/split.py`).
-- The MTP drafter for MoE models.
-- The Qwen4-Exp text model (`seventy/model/qwen4_exp.py`): hyper-connections (with kernels, `csrc/hyper.cu`), the
-  n-gram embeddings (PLE) from the memory-mapped table in host memory, the QSA indexer and sparse attention (the
-  attention kernels while every sequence fits in the indexer budget, else PyTorch over the selected tokens), the
-  sigmoid gate of its Gated DeltaNet layers. On the GPUs, QSA (`csrc/qsa.cu`: pooled block keys, block scores,
-  top-k selection, sparse attention over the paged cache) and PLE (`csrc/ple.cu`: hashing, the table rows from
-  pinned host memory, the convolution and its state) run in kernels, and decode steps run in CUDA graphs.
+- The MTP drafter (`--draft-model mtp`) for both models (`seventy/model/mtp.py`, and `seventy/model/mtp_exp.py` for
+  Flash-Next's MTP layer, which works on hyper-connection streams).
+- The Qwen4-Exp text model (`seventy/model/qwen4_exp.py`): hyper-connections (`csrc/hyper.cu`), the n-gram
+  embeddings (PLE: `csrc/ple.cu`, hashing, the table rows read from pinned host memory, the convolution and its
+  state), the QSA indexer and sparse attention (`csrc/qsa.cu`), the sigmoid gate of its Gated DeltaNet layers.
+  - QSA: the indexer queries and raw keys come from one product and one kernel; a block of 4 tokens gets its pooled
+    key when it completes. The raw keys are not kept per token: the step's own and a ring of the last 32 per sequence
+    and layer give the pooled keys (a block that rejected drafts completed is pooled again from the right keys).
+    Decode selects with a score kernel and a top-k kernel; prefill scores the blocks with cuBLAS. The sparse
+    attention kernel reads each query's selected positions in chunks from the paged cache.
+  - Speculative verify: the Gated DeltaNet and PLE states wait for the accepted rows (`commit`).
+- YaRN (`seventy/rope.py`): checkpoints whose config has YaRN rope parameters load with their longer context, and
+  `--yarn-factor` applies YaRN to a checkpoint without it. Flash-Next is trained for 262,144 tokens; its model card
+  gives up to 1,000,000 with YaRN. For example:
 
-## Results on 4 x V100-SXM2-32GB (local, 250 W), without speed sweeps
+  ```bash
+  seventy engine --model nvidia/Qwen3.8-Flash-Next-FP4-Local --yarn-factor 2 --max-model-len 524288
+  ```
 
-| Model | GPUs | Drafter | KV tokens | Smoke checks | One stream |
-|---|---:|---|---:|---|---:|
-| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 1 | none | 286,032 | pass (the image text comes back in lowercase) | 103 tok/s |
-| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 2 | none | 2,711,392 | pass (lowercase image text) | 73 tok/s (older kernels) |
-| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 3 | none | 3,419,856 | pass | 77 tok/s (older kernels) |
-| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 4 | none | 3,946,416 | pass, also a 250K-token needle | 108 tok/s |
-| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 4 | MTP | 3,516,528 | pass | 168 tok/s |
-| `Qwen/Qwen3.6-35B-A3B` (BF16) | 3 | none | 408,816 | pass (lowercase image text) | 95 tok/s |
-| `Qwen/Qwen3.6-35B-A3B` (BF16) | 4 | none | 1,614,544 | pass (lowercase image text) | 102 tok/s |
-| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | none | 490,128 | pass, needles at 8K and 30K (lowercase image text); a 250K-token needle passes (max-model-len 262144) | 50.9 tok/s |
-| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | none | 125,712 (4 streams, `--gpu-memory-utilization 0.97`) | pass (lowercase image text) | 48.8 tok/s |
-| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | none | 262,144 (1 stream, no prefix cache, 0.97, `--prefill-budget 2048 --activation-reserve 1.5`) | pass, a 250K-token needle passes | 49.2 tok/s |
+  YaRN applies to every request, short ones too.
 
-Flash-Next with 8 identical requests at the same time: 192 tok/s in total on 4 GPUs, all 8 texts the same. With
-the default settings, the weights and the activation reserve take 0.3 GiB more than three 32 GB GPUs have. Prefill
-of a 250K-token prompt took 307 s on 4 GPUs and 390 s on 3 GPUs (the MoE prefill runs one product per expert).
+## Results on 4 x V100-SXM2-32GB (local, 250 W)
+
+The smoke checks: greedy and sampled answers, needles at 8K and 30K or 100K tokens, an image, 8 identical greedy
+requests at the same time, one stream of 512 tokens. All pass, except where noted: the image check is
+case-sensitive, and some runs read the image text correctly in lowercase.
+
+| Model | GPUs | Settings | KV tokens | One stream | 8 identical requests |
+|---|---:|---|---:|---:|---:|
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 1 | defaults | 282,592 | 128 tok/s | 642 tok/s |
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 1 | `--draft-model mtp` | 113,184 | 177 tok/s | 639 tok/s |
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 2 | defaults | 2,837,216 | 127 tok/s | 665 tok/s |
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 3 | defaults | 3,542,448 | 135 tok/s | 731 tok/s |
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 4 | defaults | 3,940,368 | 148 tok/s | 800 tok/s |
+| `nvidia/Qwen3.6-35B-A3B-NVFP4` | 4 | `--draft-model mtp` | 3,508,096 | 261 tok/s | 1,002 tok/s |
+| `Qwen/Qwen3.6-35B-A3B` (BF16) | 3 | defaults | 405,600 | 120 tok/s | 477 tok/s |
+| `Qwen/Qwen3.6-35B-A3B` (BF16) | 4 | defaults | 1,607,696 | 132 tok/s | 578 tok/s |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | defaults | 715,504 | 68 tok/s | 362 tok/s |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | `--draft-model mtp` | 563,440 | 131 tok/s | 446 tok/s |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | `--draft-model mtp --expert-offload 0.1` | 796,208 | 66 tok/s | 199 tok/s |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 4 | `--draft-model mtp --expert-offload 0.25` | 1,128,544 | 43 tok/s | 128 tok/s |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | `--gpu-memory-utilization 0.97` | 69,392 | 65 tok/s | 362 tok/s |
+| `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 3 | `--draft-model mtp --expert-offload 0.1 --gpu-memory-utilization 0.95` | 174,368 | 64 tok/s | 217 tok/s |
+
+Prefill: a 100K-token prompt takes 14 s with the 35B-A3B NVFP4 on 4 GPUs and 24 s with Flash-Next on 4 GPUs
+(MTP). With `--yarn-factor 2 --max-model-len 524288`, a 500K-token needle passes with Flash-Next on 4 GPUs (238 s,
+before the tensor-core QSA attention kernel). On three 32 GB GPUs, Flash-Next with the default settings needs 0.4
+GiB more than the GPUs have.
+
+Flash-Next on 4 GPUs with MTP, the README sweep method (sampled, thinking on, 512 tokens per request; tok/s, two
+runs per cell):
+
+| Context | 1 stream | 4 streams (per stream) | 8 streams (total) | Cold prefill |
+|---|---:|---:|---:|---:|
+| 2,000 | 98 / 147 | 72 / 80 | 516 / 546 | 2,682 tok/s |
+| 32,000 | 124 / 107 | 101 / 83 | 507 / 507 | 3,357 tok/s |
+| 64,000 | 115 / 134 | 88 / 100 | 480 / 505 | 3,260 tok/s |
+| 100,000 | 136 / 127 | 79 / 75 | - | 3,121 tok/s |
+
+The sweep ran before the tensor-core QSA attention kernel, which made the 100K prefill about a quarter faster.
+
+Expert offload (`--expert-offload F`) keeps that share of each GPU's routed experts in pinned host memory, and the
+GPU reads them over PCIe when the router picks them. It frees GPU memory for the KV cache or lets a model run on
+GPUs that cannot hold all its experts, and it slows decoding a lot (see the table). The MTP layer's experts stay on
+the GPU.
 
 The MXFP8 weights (attention, Gated DeltaNet and shared experts) are kept as FP8 with one scale per row
 (`Checkpoint.mxfp8_rows`): each 32-value block moves by its scale's exponent below the row's largest, which rounds
@@ -68,18 +112,20 @@ The MXFP8 weights (attention, Gated DeltaNet and shared experts) are kept as FP8
 The engine option `--activation-reserve` (GiB, default 3) sets the memory each GPU keeps for activations and CUDA
 graphs; with a smaller prefill budget, less is enough.
 
-The smoke checks: greedy and sampled answers, needles at 8K and 30K or 100K tokens, an image, 8 identical greedy
-requests at the same time, one stream of 512 tokens.
-
 ## Tests
 
 - `tests/test_moe_reference.py` and `tests/test_flash_next_reference.py`: the first layers of the real checkpoints
   against transformers, in FP32 on the CPU.
-- `tests/test_moe_kernels.py`, `tests/test_checkpoint_formats.py`, `tests/test_fp8_linear.py`: the kernels and the
-  formats against PyTorch references.
+- `tests/test_flash_next_verify.py`: a speculative verify and commit on the GPU path equal one-by-one decoding.
+- `tests/test_moe_kernels.py`, `tests/test_qsa_kernels.py`, `tests/test_rope.py`, `tests/test_checkpoint_formats.py`,
+  `tests/test_fp8_linear.py`: the kernels, the formats and YaRN against PyTorch and transformers references.
 
 ## Not done
 
-- Flash-Next: its MTP layer and its DFlash2 drafter; faster prefill (grouped expert GEMMs for long chunks).
-- Faster MoE decode: the shared expert in the grouped GEMM, fewer small kernels per layer, MXFP8 GEMMs.
+- Expert offload places experts by index; the experts that the router picks most are not moved to the GPU yet.
+- The KV heads on 4 GPUs: with 2 KV heads, two GPUs keep each head's keys and values. Splitting the tokens of each
+  head between its two GPUs would nearly double the KV cache.
+- Flash-Next's DFlash2 drafter; context past 524,288 tokens (1,000,000 with `--yarn-factor 4` needs more KV cache
+  than 4 GPUs have without offload).
+- GGUF checkpoints (for example the IQ3 quantizations of Flash-Next).
 - The panel's checks for MoE checkpoints (sizes of the expert weights per GPU).
