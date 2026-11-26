@@ -44,6 +44,7 @@ class EngineConfig:
     draft_model: str | None = None
     mtp_tokens: int = 4
     yarn_factor: float | None = None
+    expert_offload: float = 0.0
 
 
 @dataclass
@@ -90,6 +91,10 @@ def _check_gpus(devices: list[int]) -> None:
 def make_drafter(spec: str, model_path: str, model, device, dtype, par):
     """The drafter of a draft spec: "mtp:K" (the model's own MTP layer, K tokens) or a DFlash2 checkpoint folder."""
     if spec.startswith("mtp:"):
+        if getattr(model.cfg, "exp", None) is not None:
+            from ..model.mtp_exp import ExpMtpDrafter
+
+            return ExpMtpDrafter(model_path, model, device, dtype, par=par, tokens=int(spec[4:]))
         from ..model.mtp import MtpDrafter
 
         return MtpDrafter(model_path, model, device, dtype, par=par, tokens=int(spec[4:]))
@@ -98,11 +103,33 @@ def make_drafter(spec: str, model_path: str, model, device, dtype, par):
     return Drafter(spec, model, device, dtype, par=par)
 
 
+def _available_host_memory() -> int:
+    """MemAvailable of /proc/meminfo in bytes (0 when unknown)."""
+    try:
+        fields = dict(row.split(":", 1) for row in Path("/proc/meminfo").read_text().splitlines() if ":" in row)
+        return int(fields["MemAvailable"].split()[0]) * 1024
+    except (OSError, KeyError, ValueError):
+        return 0
+
+
 def _check_weights_fit(config: EngineConfig, devices: list[int], cfg) -> None:
     """Stop before loading when the checkpoint files divided over the GPUs are larger than the smallest GPU: the
-    load would end in a CUDA out-of-memory error. The weights take about the size of the checkpoint files, plus the
-    copy of the output head of a model with tied embeddings."""
+    load would end in a CUDA out-of-memory error. The weights take about the size of the checkpoint files, less the
+    experts kept in host memory (--expert-offload), plus the copy of the output head of a model with tied
+    embeddings."""
+    offload = getattr(config, "expert_offload", 0.0)
+    if not 0.0 <= offload <= 1.0:
+        raise RuntimeError(f"--expert-offload is a share of the experts from 0 to 1, not {offload}")
     need = memory.checkpoint_bytes(config.model)
+    if offload > 0:
+        host = int(memory.routed_expert_bytes(config.model) * offload)
+        need -= host
+        table = memory.host_table_bytes(config.model)
+        free = _available_host_memory()
+        if free and host + table > free:
+            raise RuntimeError(f"--expert-offload {offload} keeps about {host / 2**30:.1f} GiB of "
+                               f"experts in host memory (and the model's n-gram tables take {table / 2**30:.1f} GiB), "
+                               f"but {free / 2**30:.1f} GiB is available; use a smaller share")
     if config.draft_model and config.draft_model != "mtp":
         need += memory.checkpoint_bytes(config.draft_model)
     per_gpu = need // len(devices) + memory.tied_head_bytes(cfg, len(devices))
@@ -153,7 +180,7 @@ class Engine:
                 p = ctx.Process(target=_worker_entry, daemon=True,
                                 args=(rank, tp, port, "nccl", f"cuda:{rank}", str(path), "float16",
                                       config.gpu_memory_utilization, reserve, child, None, self._draft_spec(config),
-                                      config.yarn_factor))
+                                      config.yarn_factor, config.expert_offload))
                 p.start()
                 child.close()
                 self.workers.append(p)
@@ -162,7 +189,8 @@ class Engine:
         from .worker import load_shard
 
         _stage("weights", f"loading {display_name(path)} on {tp} GPU(s)")
-        _, self.model = load_shard(str(path), 0, tp, self.device, torch.float16, yarn_factor=config.yarn_factor)
+        _, self.model = load_shard(str(path), 0, tp, self.device, torch.float16, yarn_factor=config.yarn_factor,
+                                   expert_offload=config.expert_offload)
         torch.cuda.synchronize()
         weights = torch.cuda.memory_allocated(self.device)
         self.drafter = None
@@ -185,7 +213,7 @@ class Engine:
         mtp = config.draft_model == "mtp"
         per_block = memory.kv_bytes_per_block(self.model_config, config.block_size, kv_name, tp, extra_layers=int(mtp))
         ring = self.drafter.ring_bytes_per_slot() if self.drafter is not None else 0
-        state = (total_slots + 1) * (memory.state_bytes_per_slot(self.model_config, tp) + ring)
+        state = (total_slots + 1) * (memory.state_bytes_per_slot(self.model_config, tp, extra_layers=int(mtp)) + ring)
         num_blocks = (budget_min - state) // per_block
         need = -(-config.max_model_len // config.block_size)
         if num_blocks < min(need, 64):

@@ -79,19 +79,18 @@ class ModelCache:
         self.pooled: dict[int, torch.Tensor] = {}
         e = cfg.exp
         if e is not None:
-            na_model = len(cfg.attention_layers)
             kdt = torch.float16 if device.type == "cuda" else dtype
             if device.type == "cuda":
-                self.idx_ring_all = torch.zeros(na_model, num_slots + 1, IDX_RING, e.indexer_head_dim, dtype=kdt,
+                self.idx_ring_all = torch.zeros(na, num_slots + 1, IDX_RING, e.indexer_head_dim, dtype=kdt,
                                                 device=device)
-                self.idx_ring = {layer: self.idx_ring_all[i] for i, layer in enumerate(cfg.attention_layers)}
+                self.idx_ring = {layer: self.idx_ring_all[i] for i, layer in enumerate(attn)}
             else:
-                self.idx_all = torch.zeros(na_model, num_blocks + 1, block_size, e.indexer_head_dim, dtype=kdt,
+                self.idx_all = torch.zeros(na, num_blocks + 1, block_size, e.indexer_head_dim, dtype=kdt,
                                            device=device)
-                self.idx_k = {layer: self.idx_all[i] for i, layer in enumerate(cfg.attention_layers)}
-            self.pooled_all = torch.zeros(na_model, num_blocks + 1, block_size // e.indexer_compress,
+                self.idx_k = {layer: self.idx_all[i] for i, layer in enumerate(attn)}
+            self.pooled_all = torch.zeros(na, num_blocks + 1, block_size // e.indexer_compress,
                                           e.indexer_head_dim, dtype=kdt, device=device)
-            self.pooled = {layer: self.pooled_all[i] for i, layer in enumerate(cfg.attention_layers)}
+            self.pooled = {layer: self.pooled_all[i] for i, layer in enumerate(attn)}
             self.positions = torch.zeros(num_blocks + 1, block_size, 3, dtype=torch.int32, device=device)
             self.ple_tokens = torch.zeros(num_slots + 1, e.ngram_size - 1, dtype=torch.long, device=device)
             history = (e.ple_conv_kernel - 1) * e.ngram_size

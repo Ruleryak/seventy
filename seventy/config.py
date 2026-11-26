@@ -502,8 +502,8 @@ def kernel_problems(cfg: ModelConfig) -> list[str]:
 
 
 def has_mtp(path: str | Path) -> bool:
-    """Whether a checkpoint folder holds an MTP layer (mtp.fc and mtp.layers.0), from the tensor names of its index
-    file, else of the header of its model.safetensors."""
+    """Whether a checkpoint folder holds an MTP layer (mtp.fc, or for Qwen4-Exp mtp.fc_hidden, and mtp.layers.0),
+    from the tensor names of its index file, else of the header of its model.safetensors."""
     p = Path(path)
     try:
         if (p / "model.safetensors.index.json").is_file():
@@ -515,4 +515,5 @@ def has_mtp(path: str | Path) -> bool:
         return False
     mlp = ("mtp.layers.0.mlp.down_proj.weight", "mtp.layers.0.mlp.experts.down_proj", "mtp.layers.0.mlp.experts.0.down_proj.weight",
            "mtp.layers.0.mlp.experts.0.down_proj.weight_packed")
-    return "mtp.fc.weight" in names and any(m in names for m in mlp)
+    fc = "mtp.fc.weight" in names or "mtp.fc_hidden.weight" in names
+    return fc and any(m in names for m in mlp)

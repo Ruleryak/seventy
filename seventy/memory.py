@@ -33,7 +33,8 @@ def kv_bytes_per_block(cfg: ModelConfig, block_size: int, kv_dtype: str, tp: int
     if t.exp is not None:
         e = t.exp
         per_layer = e.indexer_head_dim * 2
-        kv += block_size * 3 * 4 + len(t.attention_layers) * per_layer * (block_size // e.indexer_compress)
+        kv += block_size * 3 * 4 + (len(t.attention_layers) + extra_layers) * per_layer * (
+            block_size // e.indexer_compress)
     return kv
 
 
@@ -42,7 +43,7 @@ def prefix_entries(max_num_seqs: int, prefix_cache: bool, cache_entries: int = 0
     return (cache_entries or 3 * max_num_seqs) if prefix_cache else 0
 
 
-def state_bytes_per_slot(cfg: ModelConfig, tp: int = 1) -> int:
+def state_bytes_per_slot(cfg: ModelConfig, tp: int = 1, extra_layers: int = 0) -> int:
     """Bytes of one Gated DeltaNet state slot on one rank: the FP32 recurrent state and the FP16 convolution
     state of every linear-attention layer (Qwen4-Exp: also the PLE tokens and convolution inputs and the ring of raw
     indexer keys) (of the fullest rank when the heads do not split evenly)."""
@@ -55,7 +56,7 @@ def state_bytes_per_slot(cfg: ModelConfig, tp: int = 1) -> int:
 
         e = t.exp
         state += (e.ngram_size - 1) * 8 + len(e.ple_layers) * (e.ple_conv_kernel - 1) * e.ngram_size * e.hc_count * t.hidden_size * 4
-        state += len(t.attention_layers) * IDX_RING * e.indexer_head_dim * 2
+        state += (len(t.attention_layers) + extra_layers) * IDX_RING * e.indexer_head_dim * 2
     return state
 
 
@@ -142,9 +143,8 @@ def _shard_files(path: Path) -> list[Path]:
     return sorted(path.glob("*.safetensors"))
 
 
-def host_table_bytes(path: str | Path) -> int:
-    """Bytes of the tensors that stay in host memory: the n-gram embedding tables of Qwen4-Exp checkpoints
-    (*.ngram_embedding.shard_*), from the headers of their files."""
+def _tensor_bytes(path: str | Path, keep) -> int:
+    """Bytes of the tensors whose names keep(name) accepts, from the headers of the checkpoint's files."""
     import struct
 
     total = 0
@@ -156,8 +156,20 @@ def host_table_bytes(path: str | Path) -> int:
         except (OSError, ValueError):
             continue
         total += sum(m["data_offsets"][1] - m["data_offsets"][0] for name, m in header.items()
-                     if name != "__metadata__" and ".ngram_embedding.shard_" in name)
+                     if name != "__metadata__" and keep(name))
     return total
+
+
+def host_table_bytes(path: str | Path) -> int:
+    """Bytes of the tensors that stay in host memory: the n-gram embedding tables of Qwen4-Exp checkpoints
+    (*.ngram_embedding.shard_*), from the headers of their files."""
+    return _tensor_bytes(path, lambda name: ".ngram_embedding.shard_" in name)
+
+
+def routed_expert_bytes(path: str | Path) -> int:
+    """Bytes of the routed experts of a MoE checkpoint (*.mlp.experts.*, also the MTP layer's), from the headers of
+    its files: the part that --expert-offload can keep in host memory."""
+    return _tensor_bytes(path, lambda name: ".mlp.experts." in name)
 
 
 def checkpoint_bytes(path: str | Path) -> int:
@@ -191,7 +203,8 @@ def kv_shortage(free: int, state: int, streams: int, entries: int) -> str:
         why = (f"{free / gib:.1f} GiB is left after the weights and the activation reserve, and the state of "
                f"{streams} streams and {entries} prefix-cache entries takes {state / gib:.1f} GiB of it")
     return (f"not enough GPU memory for the KV cache: {why}. Use fewer streams (--max-num-seqs), no prefix cache "
-            f"(--no-prefix-cache), or more GPUs (--gpus)")
+            f"(--no-prefix-cache), more GPUs (--gpus), or for a mixture-of-experts model a part of the experts in "
+            f"host memory (--expert-offload)")
 
 
 @dataclass(frozen=True)

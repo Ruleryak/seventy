@@ -39,7 +39,7 @@ from ..upload import to_device
 from .layers import Linear, Source, _to_dtype
 from ..split import balanced
 from .moe import MoE
-from .qwen3_5 import FINAL, AttentionLayer, GatedDeltaNetLayer, Qwen35TextModel
+from .qwen3_5 import FINAL, GDN_COMMIT_LAYERS, AttentionLayer, GatedDeltaNetLayer, Qwen35TextModel
 
 
 def _grouped_norm_weight(ckpt: Checkpoint, name: str, device) -> torch.Tensor:
@@ -238,7 +238,7 @@ class PLE:
         torch.cuda.empty_cache()
 
     def _gpu_call(self, h: torch.Tensor, step: StepInput, cache: ModelCache, index: int,
-                  par: Parallel | None) -> torch.Tensor:
+                  par: Parallel | None, stash: list | None = None) -> torch.Tensor:
         from ..ops import kernels
 
         g = self.gpu
@@ -264,6 +264,9 @@ class PLE:
         normed = grouped_rms_norm(gated, self.norm_conv, self.hidden, self.eps).contiguous()
         out = kernels.ple_conv(gated, normed, cache.ple_conv[index], self.conv, step.state_slots_t,
                                step.query_start_t, step.context_lens_t, self.taps, self.dilation)
+        if stash is not None:
+            stash.append((self, index, step.token_ids, normed))
+            return out
         tok = cache.ple_tokens if self.last else cache.ple_tokens.clone()
         kernels.ple_state(tok, cache.ple_conv[index], step.token_ids, normed, step.state_slots_t,
                           step.query_start_t, step.context_lens_t, self.eos)
@@ -294,11 +297,14 @@ class PLE:
         return torch.cat(blocks, dim=1)
 
     def __call__(self, h: torch.Tensor, step: StepInput, cache: ModelCache, index: int,
-                 par: Parallel | None = None) -> torch.Tensor:
-        """What this layer adds to the streams h [T, hc x hidden] FP32; updates the sequences' PLE state. par: the
-        model's current layout (with the peer-to-peer all-reduce once the engine has set it up)."""
+                 par: Parallel | None = None, stash: list | None = None) -> torch.Tensor:
+        """What this layer adds to the streams h [T, hc x hidden] FP32; updates the sequences' PLE state, or with
+        stash (GPU, speculative verify) appends what commit needs instead. par: the model's current layout (with the
+        peer-to-peer all-reduce once the engine has set it up)."""
         if self.gpu is not None:
-            return self._gpu_call(h, step, cache, index, par)
+            return self._gpu_call(h, step, cache, index, par, stash)
+        if stash is not None:
+            raise NotImplementedError("the PLE layer's speculative verify runs on the GPU only")
         out = torch.empty_like(h)
         tokens = step.token_ids
         for b in range(len(step.context_lens)):
@@ -537,6 +543,7 @@ class ExpAttention:
         return a.o_proj(a._owned(o))
 
 
+STREAMS = -2
 QUERY_CHUNK = 64
 SELECT_ROWS = 256
 PREFILL_ROWS = 64
@@ -550,9 +557,12 @@ def _read_cache(c: torch.Tensor, scale: torch.Tensor | None, flat: torch.Tensor)
 
 
 class ExpLayer:
-    def __init__(self, cfg: TextConfig, ckpt: Checkpoint, index: int, par: Parallel, dtype, device, keep_dense, eos):
-        p = f"{ckpt.text_prefix}layers.{index}"
-        self.kind = cfg.layer_types[index]
+    def __init__(self, cfg: TextConfig, ckpt: Checkpoint, index: int, par: Parallel, dtype, device, keep_dense, eos,
+                 prefix: str | None = None, kind: str | None = None):
+        """Layer index of the model (prefix: the checkpoint prefix and kind of a layer outside the model's layers,
+        such as the MTP layer)."""
+        p = prefix or f"{ckpt.text_prefix}layers.{index}"
+        self.kind = kind or cfg.layer_types[index]
         if self.kind in ("full_attention", "indexed_attention"):
             self.kind = "full_attention"
             self.mixer = ExpAttention(cfg, ckpt, f"{p}.self_attn", par, dtype, device, keep_dense)
@@ -594,6 +604,14 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         for j, m in enumerate(self.gdn):
             m.gdn_index = j
         self.gdn_params = None
+        if self.gdn and self.device.type == "cuda":
+            stacked = []
+            for name in ("conv_weight", "a_log", "dt_bias", "norm"):
+                both = torch.stack([getattr(m, name) for m in self.gdn])
+                for j, m in enumerate(self.gdn):
+                    setattr(m, name, both[j])
+                stacked.append(both)
+            self.gdn_params = tuple(stacked)
         self.mixer = HyperConnection(t, ckpt, f"{p}hyper_connection_mixer", dtype, device, combine=False)
         self.lm_head_packed = None
         if ckpt.is_nvfp4("lm_head"):
@@ -629,8 +647,13 @@ class Qwen4ExpTextModel(Qwen35TextModel):
     @torch.inference_mode()
     def forward(self, step: StepInput, cache: ModelCache, capture: tuple[int, ...] = (), stash: dict | None = None,
                 top: int = 0):
-        """Run one step (CPU path, without speculative stash). Returns the logits of step.logit_rows (or head_top)
-        and the captured streams' mixes."""
+        """Run one step. Returns the logits of step.logit_rows (or head_top) and the captured streams: layer i in
+        capture gives the streams after layer i, STREAMS the streams after the last layer (before the final mix,
+        the MTP layer's input) and FINAL the final mix (the LM head's input), each for all rows.
+
+        With stash (a dict, speculative verify): the Gated DeltaNet layers leave their state unchanged and keep their
+        in_proj outputs, and the PLE layers leave their state unchanged and keep their inputs; commit() then writes
+        both states for the accepted rows."""
         t = self.cfg
         e = t.exp
         x0 = self.embed_tokens(step.token_ids).float()
@@ -650,13 +673,19 @@ class Qwen4ExpTextModel(Qwen35TextModel):
             slots = ops.kv_slots(step.query_start, step.context_lens, step.block_tables, step.block_size)
         cache.positions.view(-1, 3)[slots] = step.positions.T.to(cache.positions.dtype)
         captured = {}
+        if stash is not None and self.gdn_params is not None and GDN_COMMIT_LAYERS:
+            stash["y_all"] = torch.empty(len(self.gdn), h.shape[0], self.gdn[0].in_proj.out_features,
+                                         dtype=torch.float16, device=h.device)
+        ple_stash = [] if stash is not None else None
         for i, layer in enumerate(self.layers):
             if layer.ple is not None:
-                h = h + layer.ple(h, step, cache, e.ple_layers.index(i), self.par)
+                h = h + layer.ple(h, step, cache, e.ple_layers.index(i), self.par, ple_stash)
             x, inject = layer.attn_hc(h)
             xin = x.to(self.dtype)
             if layer.kind == "full_attention":
                 y = layer.mixer(xin, step, cache, i, rope, slots, self)
+            elif stash is not None:
+                y = layer.mixer(xin, step, cache, i, rope, slots, stash)
             else:
                 y = layer.mixer(xin, step, cache, i, rope, slots)
             h = self._inject(h, self.par.all_reduce(y), inject)
@@ -664,6 +693,10 @@ class Qwen4ExpTextModel(Qwen35TextModel):
             h = self._inject(h, self.par.all_reduce(layer.mlp(x.to(self.dtype))), inject)
             if i in capture:
                 captured[i] = h.clone()
+        if ple_stash:
+            stash["ple"] = ple_stash
+        if STREAMS in capture:
+            captured[STREAMS] = h
         x, _ = self.mixer(h)
         x = x.to(self.dtype)
         if FINAL in capture:
@@ -671,3 +704,16 @@ class Qwen4ExpTextModel(Qwen35TextModel):
         if top:
             return self.head_top(x[step.logit_rows], top), captured
         return self.logits(x[step.logit_rows]), captured
+
+    @torch.inference_mode()
+    def commit(self, step: StepInput, cache: ModelCache, stash: dict, commit_lens: torch.Tensor) -> None:
+        """After a speculative verify step: the Gated DeltaNet states (Qwen35TextModel.commit) and the PLE token and
+        convolution states as if only the first commit_lens[b] new tokens of every sequence had run."""
+        ple = stash.pop("ple", ())
+        super().commit(step, cache, stash, commit_lens)
+        from ..ops import kernels
+
+        for layer, index, tokens, normed in ple:
+            tok = cache.ple_tokens if layer.last else cache.ple_tokens.clone()
+            kernels.ple_state(tok, cache.ple_conv[index], tokens, normed, step.state_slots_t, step.query_start_t,
+                              step.context_lens_t, layer.eos, lens=commit_lens)

@@ -19,7 +19,8 @@
  * when context_lens[b] is 0); x and xn FP32 [T, channels], out FP32.
  *
  * seventy_ple_state: after the step, the token state (last n - 1 tokens) and the convolution state of each
- * sequence with new tokens.
+ * sequence with new tokens: of its first lens[b] new tokens when lens is given (after a speculative verify, the
+ * accepted rows), else of all of them.
  */
 
 namespace seventy {
@@ -115,11 +116,11 @@ __global__ void ple_conv_kernel(float *out, const float *x, const float *xn, con
 }
 
 __global__ void ple_state_kernel(int64_t *tok_state, float *conv_state, const int64_t *tokens, const float *xn,
-                                 const int *slots, const int *query_start, const int *context_lens, int n1,
-                                 int channels, int hist, int64_t eos) {
+                                 const int *slots, const int *query_start, const int *context_lens, const int *lens,
+                                 int n1, int channels, int hist, int64_t eos) {
   const int b = blockIdx.y;
   const int q0 = query_start[b], q1 = query_start[b + 1];
-  const int len = q1 - q0;
+  const int len = lens != nullptr ? min(lens[b], q1 - q0) : q1 - q0;
   if (len <= 0) return;
   const int ctx = context_lens[b];
   int64_t *ts = tok_state + static_cast<int64_t>(slots[b]) * n1;
@@ -198,12 +199,12 @@ SEVENTY_API int seventy_ple_conv(float *out, const float *x, const float *xn, co
 }
 
 SEVENTY_API int seventy_ple_state(int64_t *tok_state, float *conv_state, const int64_t *tokens, const float *xn,
-                                  const int *slots, const int *query_start, const int *context_lens, int num_seqs,
-                                  int n1, int channels, int hist, int64_t eos, cudaStream_t stream) {
+                                  const int *slots, const int *query_start, const int *context_lens, const int *lens,
+                                  int num_seqs, int n1, int channels, int hist, int64_t eos, cudaStream_t stream) {
   using namespace seventy;
   if (tok_state == nullptr || conv_state == nullptr || n1 < 1 || n1 > 8 || hist > 32 || num_seqs < 1)
     return SEVENTY_ERR_INVALID_ARGUMENT;
   ple_state_kernel<<<dim3((channels + 255) / 256, num_seqs), 256, 0, stream>>>(
-      tok_state, conv_state, tokens, xn, slots, query_start, context_lens, n1, channels, hist, eos);
+      tok_state, conv_state, tokens, xn, slots, query_start, context_lens, lens, n1, channels, hist, eos);
   return launch_status();
 }

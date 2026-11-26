@@ -36,6 +36,7 @@ from .layers import Linear, Source, _to_dtype
 
 SMALL_TOKENS = 64
 LARGE_ROWS = 8
+EXPERT_OFFLOAD = 0.0
 
 
 class ExpertStack:
@@ -45,27 +46,53 @@ class ExpertStack:
         self.packed, self.scales, self.alpha, self.weight = packed, scales, alpha, weight
 
     gemm = None
+    gemm_ptrs = None
+    host = None
 
     @property
     def nvfp4(self) -> bool:
         return self.packed is not None or self.gemm is not None
 
-    def to_gemm(self) -> None:
+    def to_gemm(self, on_gpu: int | None = None) -> None:
         """Repack the NVFP4 experts for seventy_moe_mma (each expert like a GemmWeight, stacked: wpk, wsc, alpha
-        with the experts first) and drop the plain packed form."""
+        with the experts first) and drop the plain packed form. on_gpu: keep only that many experts (the first) in
+        GPU memory and the others in pinned host memory, which the kernel reads over PCIe (expert offload); the
+        kernel then finds every expert's weights through the pointer tables gemm_ptrs."""
         experts, n, half_k = self.packed.shape
         k = half_k * 2
+        dev = self.packed.device
+        on_gpu = experts if on_gpu is None else max(0, min(experts, on_gpu))
         first = nvfp4.pack_for_gemm([nvfp4.Nvfp4Weight(self.packed[0], self.scales[0], 1.0)])
-        wpk = torch.empty((experts, *first.wpk.shape), dtype=torch.uint8, device=self.packed.device)
-        wsc = torch.empty((experts, *first.wsc.shape), dtype=torch.uint8, device=self.packed.device)
-        alpha = torch.zeros(experts, first.alpha.numel(), dtype=torch.float32, device=self.packed.device)
+        wpk = torch.empty((on_gpu, *first.wpk.shape), dtype=torch.uint8, device=dev)
+        wsc = torch.empty((on_gpu, *first.wsc.shape), dtype=torch.uint8, device=dev)
+        host = experts - on_gpu
+        if host:
+            self.host = (torch.empty((host, *first.wpk.shape), dtype=torch.uint8, pin_memory=True),
+                         torch.empty((host, *first.wsc.shape), dtype=torch.uint8, pin_memory=True))
+        alpha = torch.zeros(experts, first.alpha.numel(), dtype=torch.float32, device=dev)
         for e in range(experts):
             g = first if e == 0 else nvfp4.pack_for_gemm([nvfp4.Nvfp4Weight(self.packed[e], self.scales[e], 1.0)])
-            wpk[e], wsc[e] = g.wpk, g.wsc
+            if e < on_gpu:
+                wpk[e], wsc[e] = g.wpk, g.wsc
+            else:
+                self.host[0][e - on_gpu].copy_(g.wpk)
+                self.host[1][e - on_gpu].copy_(g.wsc)
             alpha[e, :n] = self.alpha[e] * nvfp4.GEMM_ALPHA_SHIFT
         self.gemm = nvfp4.GemmWeight(wpk, wsc, alpha.view(-1), n, k)
         self.gemm_experts = experts
+        self.gemm_strides = (first.wpk.numel() // 16, first.wsc.numel() // 4)
+        self.on_gpu = on_gpu
+        if host:
+            self.gemm_ptrs = (
+                torch.tensor([self._where(e)[0].data_ptr() for e in range(experts)], dtype=torch.int64, device=dev),
+                torch.tensor([self._where(e)[1].data_ptr() for e in range(experts)], dtype=torch.int64, device=dev))
         self.packed = self.scales = self.alpha = None
+
+    def _where(self, e: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """(wpk, wsc) of expert e after to_gemm: in GPU memory or, offloaded, in pinned host memory."""
+        if e < self.on_gpu:
+            return self.gemm.wpk[e], self.gemm.wsc[e]
+        return self.host[0][e - self.on_gpu], self.host[1][e - self.on_gpu]
 
     @property
     def n(self) -> int:
@@ -83,7 +110,8 @@ class ExpertStack:
 
             g = self.gemm
             n_padded = g.alpha.numel() // self.gemm_experts
-            one = nvfp4.GemmWeight(g.wpk[e], g.wsc[e], g.alpha[e * n_padded : (e + 1) * n_padded], g.n, g.k)
+            wpk, wsc = (t.to(g.alpha.device) for t in self._where(e))
+            one = nvfp4.GemmWeight(wpk, wsc, g.alpha[e * n_padded : (e + 1) * n_padded], g.n, g.k)
             return kernels.nvfp4_gemm_dequantize(one)[: g.n].to(dtype)
         w = nvfp4.Nvfp4Weight(self.packed[e], self.scales[e], 1.0)
         if self.packed.is_cuda:
@@ -149,8 +177,11 @@ class MoE:
             self.gate_up = ExpertStack(weight=torch.stack([self.gate_up.dense(e, dtype) for e in range(n)]))
             self.down = ExpertStack(weight=torch.stack([self.down.dense(e, dtype) for e in range(n)]))
         elif self.device.type == "cuda" and dtype == torch.float16 and self.gate_up.packed is not None:
+            n = self.e1 - self.e0
+            offload = EXPERT_OFFLOAD if not p.startswith("mtp.") else 0.0
+            on_gpu = n - int(round(n * offload)) if offload > 0 else None
             for stack in (self.gate_up, self.down):
-                stack.to_gemm()
+                stack.to_gemm(on_gpu)
             torch.cuda.empty_cache()
         self.width = cfg.moe_intermediate_size
         self.gates = None

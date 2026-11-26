@@ -127,12 +127,13 @@ def test_finish_adds_local_picks_and_the_gated_shared_expert(shared):
     torch.testing.assert_close(out.float().cpu(), want.half().float(), rtol=2e-3, atol=2e-3)
 
 
-@pytest.mark.parametrize("fmt", ["fp16", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["fp16", "nvfp4", "nvfp4-offload"])
 def test_gpu_moe_matches_the_per_expert_loop(fmt):
     """MoE._small (one product for the router and the shared gate, warp route, moe_finish) and MoE._large (the
     prefill path: compact rows, the PyTorch plan) against the per-expert loop (MoE._loop) on random experts of a
-    small config, FP16 (seventy_moe_gemm) or NVFP4 repacked for the tensor cores (seventy_moe_mma), with BF16
-    router weights that need the power-of-two scale."""
+    small config, FP16 (seventy_moe_gemm) or NVFP4 repacked for the tensor cores (seventy_moe_mma; offload: 6 of
+    the 16 experts in pinned host memory, read over PCIe), with BF16 router weights that need the power-of-two
+    scale."""
     from types import SimpleNamespace
 
     from seventy.model.moe import ExpertStack, MoE
@@ -161,8 +162,11 @@ def test_gpu_moe_matches_the_per_expert_loop(fmt):
                                alpha=(torch.rand(local, n, generator=g) * 0.002 + 0.0005).cuda())
 
         m.gate_up, m.down = nv(2 * width, hidden), nv(hidden, width)
-        m.gate_up.to_gemm()
-        m.down.to_gemm()
+        on_gpu = 10 if fmt == "nvfp4-offload" else None
+        m.gate_up.to_gemm(on_gpu)
+        m.down.to_gemm(on_gpu)
+        if on_gpu:
+            assert m.gate_up.host[0].is_pinned() and m.gate_up.gemm_ptrs is not None
     wgu = (torch.randn(2 * width, hidden, generator=g) * 0.05).half().cuda()
     wd = (torch.randn(hidden, width, generator=g) * 0.05).half().cuda()
     m.shared_gate_up = lambda x: x @ wgu.T

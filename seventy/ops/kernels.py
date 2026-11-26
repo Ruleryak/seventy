@@ -974,9 +974,12 @@ def moe_mma(x: torch.Tensor, row_div: int, stack, plan: tuple, out: torch.Tensor
     e = stack.gemm_experts
     n_padded = g.alpha.numel() // e
     order, slot_expert, slot_start, slot_count, num, max_slots = plan
+    ptrs = stack.gemm_ptrs
     check("moe_mma", lib().seventy_moe_mma(
-        out.data_ptr(), x.data_ptr(), row_div, g.wpk.data_ptr(), g.wsc.data_ptr(), g.alpha.data_ptr(),
-        g.wpk[0].numel() // 16, g.wsc[0].numel() // 4, g.n, n_padded, g.k, order.data_ptr(), slot_expert.data_ptr(),
+        out.data_ptr(), x.data_ptr(), row_div, g.wpk.data_ptr() if g.wpk.numel() else None,
+        g.wsc.data_ptr() if g.wsc.numel() else None, g.alpha.data_ptr(),
+        ptrs[0].data_ptr() if ptrs is not None else None, ptrs[1].data_ptr() if ptrs is not None else None,
+        stack.gemm_strides[0], stack.gemm_strides[1], g.n, n_padded, g.k, order.data_ptr(), slot_expert.data_ptr(),
         slot_start.data_ptr(), slot_count.data_ptr(), num.data_ptr(), max_slots, rows, warps,
         pair_weight.data_ptr() if pair_weight is not None else None, compact, _stream(x)))
     return out
@@ -1204,12 +1207,17 @@ def ple_conv(x: torch.Tensor, xn: torch.Tensor, state: torch.Tensor, w: torch.Te
 
 
 def ple_state(tok_state: torch.Tensor, conv_state: torch.Tensor, tokens: torch.Tensor, xn: torch.Tensor,
-              slots_t: torch.Tensor, query_start_t: torch.Tensor, context_lens_t: torch.Tensor, eos: int) -> None:
-    """The token and convolution states of the sequences after the step (seventy_ple_state)."""
+              slots_t: torch.Tensor, query_start_t: torch.Tensor, context_lens_t: torch.Tensor, eos: int,
+              lens: torch.Tensor | None = None) -> None:
+    """The token and convolution states of the sequences after the step (seventy_ple_state); with lens (int32 [b]),
+    after only the first lens[b] new tokens of each sequence (a speculative verify's accepted rows)."""
     n1 = tok_state.shape[1]
     hist, channels = conv_state.shape[1], conv_state.shape[2]
+    if lens is not None:
+        lens = lens.int().contiguous()
     check("ple_state", lib().seventy_ple_state(tok_state.data_ptr(), conv_state.data_ptr(),
                                                tokens.contiguous().data_ptr(), xn.contiguous().data_ptr(),
                                                slots_t.data_ptr(), query_start_t.data_ptr(), context_lens_t.data_ptr(),
+                                               lens.data_ptr() if lens is not None else None,
                                                context_lens_t.numel(), n1, channels, hist, eos, _stream(xn)))
 

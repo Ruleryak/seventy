@@ -470,7 +470,8 @@ __global__ void __launch_bounds__(256) nvfp4_gemm_dequantize_kernel(half *out, c
 /*
  * moe_mma_kernel: the grouped expert product of csrc/moe.cu (seventy_moe_gemm's plan, slots and compact rows) on the
  * tensor cores, with each expert's weight repacked like a GemmWeight (wpk, wsc, alpha of expert e at e * w_stride
- * uint4, e * s_stride words, e * n_padded floats). blockIdx.y is a slot (at most MT * 8 pairs of one expert);
+ * uint4, e * s_stride words, e * n_padded floats; or with the pointer tables wpk_ptrs and wsc_ptrs, device arrays
+ * of each expert's wpk and wsc, which may point into mapped host memory for experts kept off the GPU). blockIdx.y is a slot (at most MT * 8 pairs of one expert);
  * blockIdx.x takes W adjacent 32-column tiles; the whole k range runs in one block, with the structure of
  * nvfp4_gemm_kernel (the slot's activation rows, gathered through the order, staged per 64-k step in shared
  * memory, double buffered). Output: FP16, or with pair_weight FP32 times pair_weight[pair].
@@ -492,6 +493,8 @@ __device__ __forceinline__ void load_rows(uint4 (&r)[Stage<MT, W>::kLoads], cons
 template <int MT, int W>
 __global__ void __launch_bounds__(W * 32) moe_mma_kernel(void *out, const half *x, int row_div, const uint4 *wpk_all,
                                                          const uint32_t *wsc_all, const float *alpha_all,
+                                                         const uint4 *const *wpk_ptrs,
+                                                         const uint32_t *const *wsc_ptrs,
                                                          int64_t w_stride, int64_t s_stride, int n, int n_tiles,
                                                          int k, const int32_t *order, const int32_t *slot_expert,
                                                          const int32_t *slot_start, const int32_t *slot_count,
@@ -518,8 +521,10 @@ __global__ void __launch_bounds__(W * 32) moe_mma_kernel(void *out, const half *
   const int quad = (lane >> 2) & 3;
   const int idx = (lane & 3) + ((lane >> 4) << 2);
   const int safe_tile = active ? tile : 0;
-  const uint4 *wp = wpk_all + e * w_stride + static_cast<int64_t>(safe_tile) * (k / 32) * 32 + lane;
-  const uint32_t *sp = wsc_all + e * s_stride + static_cast<int64_t>(safe_tile) * steps * 32 + lane;
+  const uint4 *wbase = wpk_ptrs != nullptr ? wpk_ptrs[e] : wpk_all + e * w_stride;
+  const uint32_t *sbase = wsc_ptrs != nullptr ? wsc_ptrs[e] : wsc_all + e * s_stride;
+  const uint4 *wp = wbase + static_cast<int64_t>(safe_tile) * (k / 32) * 32 + lane;
+  const uint32_t *sp = sbase + static_cast<int64_t>(safe_tile) * steps * 32 + lane;
   const float *alpha = alpha_all + static_cast<int64_t>(e) * n_tiles * 32;
 
   float acc[C][MT][8];
@@ -595,7 +600,9 @@ __global__ void __launch_bounds__(W * 32) moe_mma_kernel(void *out, const half *
 template <int MT, int kW>
 __global__ void __launch_bounds__(kW * 32) moe_mma_wk_kernel(void *out, const half *x, int row_div,
                                                              const uint4 *wpk_all, const uint32_t *wsc_all,
-                                                             const float *alpha_all, int64_t w_stride,
+                                                             const float *alpha_all,
+                                                             const uint4 *const *wpk_ptrs,
+                                                             const uint32_t *const *wsc_ptrs, int64_t w_stride,
                                                              int64_t s_stride, int n, int n_tiles, int k,
                                                              const int32_t *order, const int32_t *slot_expert,
                                                              const int32_t *slot_start, const int32_t *slot_count,
@@ -626,8 +633,10 @@ __global__ void __launch_bounds__(kW * 32) moe_mma_wk_kernel(void *out, const ha
   const int steps = s1 - s0;
   const int quad = (lane >> 2) & 3;
   const int idx = (lane & 3) + ((lane >> 4) << 2);
-  const uint4 *wp = wpk_all + e * w_stride + (static_cast<int64_t>(tile) * (k / 32) + 2 * s0) * 32 + lane;
-  const uint32_t *sp = wsc_all + e * s_stride + (static_cast<int64_t>(tile) * ksteps + s0) * 32 + lane;
+  const uint4 *wbase = wpk_ptrs != nullptr ? wpk_ptrs[e] : wpk_all + e * w_stride;
+  const uint32_t *sbase = wsc_ptrs != nullptr ? wsc_ptrs[e] : wsc_all + e * s_stride;
+  const uint4 *wp = wbase + (static_cast<int64_t>(tile) * (k / 32) + 2 * s0) * 32 + lane;
+  const uint32_t *sp = sbase + (static_cast<int64_t>(tile) * ksteps + s0) * 32 + lane;
   const float *alpha = alpha_all + static_cast<int64_t>(e) * n_tiles * 32;
   const uint4 *xbase = reinterpret_cast<const uint4 *>(x) + s0 * 8 + (lane & 7);
   int64_t xrow[kLoads];
@@ -788,12 +797,14 @@ SEVENTY_API int seventy_nvfp4_gemm(void *out, const void *x, const void *wpk, co
 
 
 SEVENTY_API int seventy_moe_mma(void *out, const void *x, int row_div, const void *wpk, const void *wsc,
-                                const float *alpha, int64_t w_stride, int64_t s_stride, int n, int n_padded, int k,
+                                const float *alpha, const void *wpk_ptrs, const void *wsc_ptrs, int64_t w_stride,
+                                int64_t s_stride, int n, int n_padded, int k,
                                 const int32_t *order, const int32_t *slot_expert, const int32_t *slot_start,
                                 const int32_t *slot_count, const int32_t *num_slots, int max_slots, int rows,
                                 int warps, const float *pair_weight, int compact, cudaStream_t stream) {
   using namespace seventy;
-  if (out == nullptr || x == nullptr || wpk == nullptr || wsc == nullptr || alpha == nullptr || order == nullptr ||
+  if (out == nullptr || x == nullptr || alpha == nullptr || order == nullptr ||
+      ((wpk == nullptr || wsc == nullptr) && (wpk_ptrs == nullptr || wsc_ptrs == nullptr)) ||
       n <= 0 || n_padded < n || n_padded % 32 || k <= 0 || k % kStepK || max_slots < 1 || row_div < 1 ||
       rows < 1 || rows > 64 || rows % 8 || (warps != 2 && warps != 4 && warps != 8))
     return SEVENTY_ERR_INVALID_ARGUMENT;
@@ -802,10 +813,12 @@ SEVENTY_API int seventy_moe_mma(void *out, const void *x, int row_div, const voi
   const auto *xh = static_cast<const half *>(x);
   const auto *wp = static_cast<const uint4 *>(wpk);
   const auto *sp = static_cast<const uint32_t *>(wsc);
+  const auto *wptrs = static_cast<const uint4 *const *>(wpk_ptrs);
+  const auto *sptrs = static_cast<const uint32_t *const *>(wsc_ptrs);
 #define SEVENTY_MOE_MMA(MT, W)                                                                                    \
   moe_mma_kernel<MT, W><<<dim3((n_tiles + W - 1) / W, max_slots), W * 32, 0, stream>>>(                           \
-      out, xh, row_div, wp, sp, alpha, w_stride, s_stride, n, n_tiles, k, order, slot_expert, slot_start, slot_count, \
-      num_slots, pair_weight, compact)
+      out, xh, row_div, wp, sp, alpha, wptrs, sptrs, w_stride, s_stride, n, n_tiles, k, order, slot_expert,          \
+      slot_start, slot_count, num_slots, pair_weight, compact)
 #define SEVENTY_MOE_MMA_W(MT)          \
   if (warps == 2) SEVENTY_MOE_MMA(MT, 2); \
   else if (warps == 4) SEVENTY_MOE_MMA(MT, 4); \
@@ -813,8 +826,8 @@ SEVENTY_API int seventy_moe_mma(void *out, const void *x, int row_div, const voi
   if (rows <= 16 && k / kStepK >= 8) {
 #define SEVENTY_MOE_WK(MT)                                                                                        \
   moe_mma_wk_kernel<MT, 8><<<dim3(n_tiles, max_slots), 256, 8 * MT * 8 * kRowStride * sizeof(uint4), stream>>>( \
-      out, xh, row_div, wp, sp, alpha, w_stride, s_stride, n, n_tiles, k, order, slot_expert, slot_start, slot_count, \
-      num_slots, pair_weight, compact)
+      out, xh, row_div, wp, sp, alpha, wptrs, sptrs, w_stride, s_stride, n, n_tiles, k, order, slot_expert,          \
+      slot_start, slot_count, num_slots, pair_weight, compact)
     if (rows <= 8)
       SEVENTY_MOE_WK(1);
     else

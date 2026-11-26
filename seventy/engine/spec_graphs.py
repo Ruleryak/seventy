@@ -24,7 +24,6 @@ import numpy as np
 import torch
 
 from .cache import ModelCache
-from ..model.qwen3_5 import FINAL
 from .spec import KMAX, STOP_SLOTS, cut_at_stops, device_accept_top
 from .step import StepInput
 
@@ -132,8 +131,8 @@ class SpecGraphs:
             n = cut_at_stops(n, new, x["stop"], x["limit"])
         self.model.commit(step, self.cache, stash, (n + 1).int())
         if self.mtp:
-            d = self.drafter.after_verify(step, cap[FINAL], new, n, x["starts"], x["tables"], x["delta"], x["slots"],
-                                          self.cache)
+            d = self.drafter.after_verify(step, cap[self.layers[0]], new, n, x["starts"], x["tables"], x["delta"],
+                                          x["slots"], self.cache)
             return {"n": n, "new": new, "drafts": d.tokens, "probs": d.probs, "cand": d.candidates}
         feats = torch.cat([cap[i] for i in self.layers], dim=-1)
         self.drafter.write_context(feats, pos.reshape(-1), x["slots"].repeat_interleave(blk))
